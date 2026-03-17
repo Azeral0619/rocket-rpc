@@ -1,0 +1,11 @@
+LOG:
+  level: DEBUG
+  file_name: rpc_server.log
+  file_path: ../log
+  max_file_size: 1000000000
+  sync_interval: 500
+  queue_capacity: 16384
+
+SERVER:
+  port: 12345
+  io_threads: 4

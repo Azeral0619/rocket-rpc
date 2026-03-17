@@ -1,0 +1,14 @@
+LOG:
+  level: DEBUG
+  file_name: rpc_client.log
+  file_path: ../log
+  max_file_size: 1000000000
+  sync_interval: 500
+  queue_capacity: 16384
+
+STUBS:
+  order_server:
+    - name: order_server
+      ip: 127.0.0.1
+      port: 12345
+      timeout: 10000
