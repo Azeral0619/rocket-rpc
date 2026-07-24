@@ -80,7 +80,7 @@ class TinyPBCoder : public AbstractCoder {
      * - 多个完整包：依次解析所有完整包
      * - 格式错误：跳过当前字节，继续查找下一个起始标识
      */
-    void decode(std::vector<AbstractProtocol::s_ptr>& out_messages, TcpBuffer::s_ptr buffer) override;
+    DecodeResult decode(TcpBuffer::s_ptr buffer) override;
 
   private:
     /**

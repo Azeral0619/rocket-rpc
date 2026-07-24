@@ -2,7 +2,6 @@
 #include "rocket/net/tcp/net_addr.h"
 
 #include <arpa/inet.h>
-#include <asm-generic/socket.h>
 #include <cerrno>
 #include <fcntl.h>
 #include <memory>
@@ -19,7 +18,8 @@ namespace rocket {
 TcpAcceptor::TcpAcceptor(NetAddr::s_ptr local_addr) : TcpAcceptor(std::move(local_addr), Config{}) {}
 
 TcpAcceptor::TcpAcceptor(NetAddr::s_ptr local_addr, Config config)
-    : m_local_addr(std::move(local_addr)), m_config(config) {
+    : m_local_addr(std::move(local_addr)), m_config(config),
+      m_idle_fd(::open("/dev/null", O_RDONLY | O_CLOEXEC)) {
     if (!m_local_addr) {
         return;
     }
@@ -61,6 +61,10 @@ TcpAcceptor::~TcpAcceptor() {
         close(m_listen_fd);
         m_listen_fd = -1;
     }
+    if (m_idle_fd >= 0) {
+        close(m_idle_fd);
+        m_idle_fd = -1;
+    }
 }
 
 TcpAcceptor::AcceptResult TcpAcceptor::accept() const {
@@ -77,6 +81,21 @@ TcpAcceptor::AcceptResult TcpAcceptor::accept() const {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     int client_fd = ::accept(m_listen_fd, reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
     if (client_fd < 0) {
+        if (errno == EMFILE && m_idle_fd >= 0) {
+            // IdleFd recovery: temporarily free one fd slot to consume the
+            // pending connection, then immediately close it (sends RST as
+            // back-pressure to the peer).  Pattern from Trantor / Hical.
+            ::close(m_idle_fd);
+            m_idle_fd = -1;
+
+            client_fd = ::accept(m_listen_fd, reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
+            if (client_fd >= 0) {
+                ::close(client_fd);  // reject — we're out of fds
+            }
+
+            // Re-reserve the idle fd for the next EMFILE cycle.
+            m_idle_fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        }
         result.error_msg = std::string("Accept failed: ") + strerror(errno);
         return result;
     }

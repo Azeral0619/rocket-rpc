@@ -1,146 +1,194 @@
 #include "rocket/net/tcp/tcp_client.h"
 
-#include "rocket/common/ecode.h"
 #include "rocket/common/log.h"
-#include "rocket/net/coder/abstract_protocol.h"
-#include "rocket/net/event_loop.h"
-#include "rocket/net/fd_event.h"
-#include "rocket/net/fd_event_group.h"
 #include "rocket/net/tcp/net_addr.h"
-#include "rocket/net/tcp/tcp_connect.h"
-#include "rocket/net/timer_event.h"
 
 #include <cerrno>
 #include <cstring>
-#include <functional>
 #include <memory>
 #include <netinet/in.h>
-#include <string>
-#include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <utility>
 
 namespace rocket {
 
-namespace {
-constexpr int kDefaultBufferSize = 128;
-} // namespace
+// ── Owned mode: self-managed EventLoop ───────────────────────────────
 
-TcpClient::TcpClient(NetAddr::s_ptr peer_addr)
-    : m_peer_addr(std::move(peer_addr)), m_event_loop(EventLoop::GetCurrentEventLoop()),
-      m_fd(socket(m_peer_addr->getFamily(), SOCK_STREAM, 0)) {
+TcpClient::TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory)
+    : m_peer_addr(std::move(peer_addr)), m_coder_factory(std::move(coder_factory)),
+      m_owned_loop(std::make_unique<EventLoop>()) {
+    m_loop = m_owned_loop.get();
+}
 
-    if (m_fd < 0) {
-        ROCKET_LOG_ERROR("TcpClient::TcpClient() error, failed to create fd");
+// ── Shared mode: external EventLoop (from IOThreadGroup) ─────────────
+
+TcpClient::TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory, EventLoop* loop)
+    : m_peer_addr(std::move(peer_addr)), m_coder_factory(std::move(coder_factory)),
+      m_loop(loop) {
+}
+
+TcpClient::~TcpClient() { stop(); }
+
+
+void TcpClient::connect(std::function<void()> done) {
+    int fd = ::socket(m_peer_addr->getFamily(), SOCK_STREAM, 0);
+    if (fd < 0) {
+        m_connect_error_code = -1;
+        m_connect_error_info = "socket() failed: " + std::string(strerror(errno));
+        if (done) done();
         return;
     }
 
-    m_fd_event = FdEventGroup::getInstance().getFdEvent(m_fd);
-    m_fd_event->setNonBlock();
+    // Set non-blocking before connect so the kernel returns EINPROGRESS
+    // immediately and the event loop can poll for completion.
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    m_connection = std::make_shared<TcpConnection>(m_event_loop, m_fd, kDefaultBufferSize, m_peer_addr, nullptr,
-                                                   TcpConnectionType::TcpConnectionByClient);
-    m_connection->setConnectionType(TcpConnectionType::TcpConnectionByClient);
-}
+    int rt = ::connect(fd, m_peer_addr->getSockAddr(), m_peer_addr->getSockLen());
+    if (rt == 0 || (rt < 0 && errno == EINPROGRESS)) {
+        // Connection initiated; create TcpConnection on the event loop.
+        m_connection = std::make_shared<TcpConnection>(
+            m_loop, fd, nullptr, m_peer_addr, m_coder_factory(), TcpConnectionType::Client);
 
-TcpClient::~TcpClient() {
-    ROCKET_LOG_DEBUG("TcpClient::~TcpClient()");
-    if (m_fd > 0) {
-        close(m_fd);
-    }
-}
+        m_connection->setMessageCallback([this](const TcpConnection::s_ptr& conn,
+                                                  std::vector<AbstractProtocol::s_ptr>& msgs) {
+            onMessage(conn, msgs);
+        });
+        m_connection->setCloseCallback([this](const TcpConnection::s_ptr& conn) {
+            onClose(conn);
+        });
 
-void TcpClient::connect(const std::function<void()>& done) {
-    const int rt = ::connect(m_fd, m_peer_addr->getSockAddr(), m_peer_addr->getSockLen());
-    if (rt == 0) {
-        ROCKET_LOG_DEBUG("connect [{}] sussess", m_peer_addr->toString());
-        m_connection->setState(TcpState::Connected);
-        initLocalAddr();
-        if (done) {
-            done();
+        // Start the event loop thread if we own it; shared loops are already running.
+        if (m_owned_loop && !m_thread.joinable()) {
+            m_thread = std::thread([this] { m_loop->loop(); });
         }
-    } else if (rt == -1) {
-        if (errno == EINPROGRESS) {
-            m_fd_event->listen(FdEvent::TriggerEvent::OUT_EVENT, [this, done]() {
-                const int rt = ::connect(m_fd, m_peer_addr->getSockAddr(), m_peer_addr->getSockLen());
-                if ((rt < 0 && errno == EISCONN) || (rt == 0)) {
-                    ROCKET_LOG_DEBUG("connect [{}] sussess", m_peer_addr->toString());
-                    initLocalAddr();
-                    m_connection->setState(TcpState::Connected);
-                } else {
-                    if (errno == ECONNREFUSED) {
-                        m_connect_error_code = error::kPeerClosed;
-                        m_connect_error_info = "connect refused, sys error = " + std::string(strerror(errno));
-                    } else {
-                        m_connect_error_code = error::kFailedConnect;
-                        m_connect_error_info = "connect unkonwn error, sys error = " + std::string(strerror(errno));
-                    }
-                    ROCKET_LOG_ERROR("connect errror, errno={}, error={}", errno, strerror(errno));
-                    close(m_fd);
-                    m_fd = socket(m_peer_addr->getFamily(), SOCK_STREAM, 0);
-                }
 
-                m_event_loop->deleteEpollEvent(m_fd_event);
-                ROCKET_LOG_DEBUG("now begin to done");
-                if (done) {
-                    done();
-                }
-            });
-            m_event_loop->addEpollEvent(m_fd_event);
-
-            if (!m_event_loop->isLooping()) {
-                m_event_loop->loop();
+        // Establish on loop thread
+        m_loop->queueInLoop([this, done] {
+            if (m_connection->getState() == TcpState::NotConnected) {
+                initLocalAddr(m_connection->getFd());
+                m_connection->connectEstablished();
             }
-        } else {
-            ROCKET_LOG_ERROR("connect errror, errno={}, error={}", errno, strerror(errno));
-            m_connect_error_code = error::kFailedConnect;
-            m_connect_error_info = "connect error, sys error = " + std::string(strerror(errno));
-            if (done) {
-                done();
+            if (done) done();
+        });
+    } else {
+        m_connect_error_code = -1;
+        m_connect_error_info = "connect() failed: " + std::string(strerror(errno));
+        ::close(fd);
+        if (done) done();
+        return;
+    }
+}
+
+int TcpClient::connectSync(int timeout_ms) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done = false;
+    int err = 0;
+
+    connect([&] {
+        std::lock_guard<std::mutex> lk(mtx);
+        done = true;
+        err = m_connect_error_code;
+        cv.notify_one();
+    });
+
+    // Start the event loop if we own it; shared loops are already running.
+    if ((m_owned_loop != nullptr) && !m_thread.joinable()) {
+        m_thread = std::thread([this] { m_loop->loop(); });
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        if (!cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return done; })) {
+            return -1; // timeout
+        }
+    }
+    return err;
+}
+
+void TcpClient::send(AbstractProtocol::s_ptr msg) {
+    // Serialize through the EventLoop so multiple threads can safely share
+    // one TcpClient connection (multiplexing via msg_id routing).
+    m_loop->runInLoop([this, msg = std::move(msg)]() mutable {
+        if (m_connection) m_connection->send(std::move(msg));
+    });
+}
+
+void TcpClient::readMessage(std::string_view msg_id, ReadCallback cb) {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_read_callbacks[std::string(msg_id)] = std::move(cb);
+}
+
+AbstractProtocol::s_ptr TcpClient::requestSync(AbstractProtocol::s_ptr req, int timeout_ms) {
+    if (!m_connection || m_connection->getState() != TcpState::Connected) return nullptr;
+
+    std::string msg_id = req->m_msg_id;
+    std::mutex mtx;
+    std::condition_variable cv;
+    AbstractProtocol::s_ptr response;
+    bool done = false;
+
+    readMessage(msg_id, [&](AbstractProtocol::s_ptr rsp) {
+        std::lock_guard<std::mutex> lk(mtx);
+        response = std::move(rsp);
+        done = true;
+        cv.notify_one();
+    });
+
+    send(std::move(req));
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        if (!cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return done; })) {
+            return nullptr;
+        }
+    }
+    return response;
+}
+
+void TcpClient::stop() {
+    // Only stop the EventLoop/thread if we own them.
+    // Shared loops are managed by IOThreadGroup.
+    if ((m_owned_loop != nullptr)) {
+        if (m_loop->isLooping()) m_loop->stop();
+
+        if (m_thread.joinable()) {
+            if (m_thread.get_id() == std::this_thread::get_id()) {
+                // Called from the EventLoop thread — can't join ourselves.
+                m_thread.detach();
+            } else {
+                m_thread.join();
             }
         }
     }
 }
 
-void TcpClient::stop() const {
-    if (m_event_loop->isLooping()) {
-        m_event_loop->stop();
+void TcpClient::onMessage(const TcpConnection::s_ptr& /*conn*/, std::vector<AbstractProtocol::s_ptr>& msgs) {
+    for (auto& msg : msgs) {
+        ReadCallback cb;
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            auto it = m_read_callbacks.find(msg->m_msg_id);
+            if (it != m_read_callbacks.end()) {
+                cb = it->second;
+                m_read_callbacks.erase(it);
+            }
+        }
+        if (cb) cb(msg);
     }
 }
 
-void TcpClient::writeMessage(AbstractProtocol::s_ptr message, std::function<void(AbstractProtocol::s_ptr)> done) {
-    m_connection->pushSendMessage(std::move(message), std::move(done));
-    m_connection->listenWrite();
+void TcpClient::onClose(const TcpConnection::s_ptr& /*conn*/) {
+    ROCKET_LOG_DEBUG("TcpClient connection closed");
 }
 
-void TcpClient::readMessage(std::string_view msg_id, std::function<void(AbstractProtocol::s_ptr)> done) {
-    m_connection->pushReadMessage(msg_id, std::move(done));
-    m_connection->listenRead();
-}
-
-int TcpClient::getConnectErrorCode() const noexcept { return m_connect_error_code; }
-
-std::string TcpClient::getConnectErrorInfo() const noexcept { return m_connect_error_info; }
-
-NetAddr::s_ptr TcpClient::getPeerAddr() const noexcept { return m_peer_addr; }
-
-NetAddr::s_ptr TcpClient::getLocalAddr() const noexcept { return m_local_addr; }
-
-void TcpClient::initLocalAddr() {
+void TcpClient::initLocalAddr(int fd) {
     sockaddr_in local_addr{};
     socklen_t len = sizeof(local_addr);
-
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    const int ret = getsockname(m_fd, reinterpret_cast<sockaddr*>(&local_addr), &len);
-    if (ret != 0) {
-        ROCKET_LOG_ERROR("initLocalAddr error, getsockname error. errno={}, error={}", errno, strerror(errno));
-        return;
-    }
-
-    m_local_addr = std::make_shared<IPNetAddr>(local_addr);
+    const int ret = getsockname(fd, reinterpret_cast<sockaddr*>(&local_addr), &len);
+    if (ret == 0) m_local_addr = std::make_shared<IPNetAddr>(local_addr);
 }
-
-void TcpClient::addTimerEvent(TimerEvent::s_ptr timer_event) const { m_event_loop->addTimerEvent(timer_event); }
 
 } // namespace rocket

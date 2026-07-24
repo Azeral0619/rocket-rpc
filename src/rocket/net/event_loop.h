@@ -1,19 +1,18 @@
 #pragma once
 
+#include "rocket/net/fd_event.h"
+#include "rocket/net/poller/poller.h"
 #include "rocket/net/timer_event.h"
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <set>
-#include <sys/epoll.h>
 #include <thread>
 #include <vector>
 
 namespace rocket {
 
-class FdEvent;
-class WakeUpFdEvent;
+class WakeupChannel;
 class Timer;
 
 class EventLoop {
@@ -33,8 +32,8 @@ class EventLoop {
 
     void stop();
 
+    // Register / update / remove an fd event with the poller.
     void addEpollEvent(FdEvent* event);
-
     void deleteEpollEvent(FdEvent* event);
 
     [[nodiscard]] bool isInLoopThread() const noexcept;
@@ -47,38 +46,38 @@ class EventLoop {
 
     [[nodiscard]] std::thread::id getThreadId() const noexcept { return m_thread_id; }
 
+    void runInLoop(std::function<void()> fn);
+    void queueInLoop(std::function<void()> fn);
+    void assertInLoopThread() const noexcept;
+
     [[nodiscard]] static EventLoop* GetCurrentEventLoop();
 
   private:
-    void dealWakeup();
-
-    void initWakeUpFdEvent();
-
-    void initTimer();
-
-    void processEvents(const std::vector<epoll_event>& events, int nfds);
-
+    void initWakeup();
+    void processEvents(const std::vector<Poller::ActiveEvent>& events);
     void processPendingTasks();
+    void processTimerEvents();
 
     std::thread::id m_thread_id;
 
-    int m_epoll_fd{-1};
-
-    int m_wakeup_fd{-1};
-
-    std::unique_ptr<WakeUpFdEvent> m_wakeup_fd_event;
+    std::unique_ptr<Poller> m_poller;
+    std::unique_ptr<WakeupChannel> m_wakeup_channel;
+    std::unique_ptr<FdEvent> m_wakeup_fd_event;
 
     bool m_stop_flag{false};
 
-    std::set<int> m_listen_fds;
-
     std::queue<std::function<void()>> m_pending_tasks;
-
     mutable std::mutex m_mutex;
 
     std::unique_ptr<Timer> m_timer;
 
     bool m_is_looping{false};
+    bool m_valid{false};
+
+  public:
+    // Connection count for least-connections load balancing (Hical pattern).
+    // Updated by the pool when creating/destroying TcpClients on this loop.
+    std::atomic<std::size_t> m_connection_count{0};
 };
 
 } // namespace rocket

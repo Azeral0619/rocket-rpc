@@ -1,117 +1,97 @@
 #include "rocket/net/event_loop.h"
+
 #include "rocket/common/log.h"
-#include "rocket/net/fd_event.h"
 #include "rocket/net/timer.h"
-#include "rocket/net/timer_event.h"
-#include "rocket/net/wakeup_fd_event.h"
-#include <cerrno>
-#include <cstddef>
+#include "rocket/net/poller/wakeup_channel.h"
+
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <queue>
-#include <sys/epoll.h>
 #include <thread>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
 namespace rocket {
 
 namespace {
-thread_local EventLoop* t_current_event_loop = nullptr; // NOLINT
-constexpr int kMaxEvents = 10;
+constexpr int kEpollWaitTimeoutMs = -1; // infinite
+thread_local EventLoop* t_current_event_loop = nullptr;
 } // namespace
 
-EventLoop::EventLoop() : m_thread_id(std::this_thread::get_id()) {
-    ROCKET_LOG_DEBUG("EventLoop");
-    if (t_current_event_loop != nullptr) {
-        return;
-    }
-    t_current_event_loop = this;
-
-    m_epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
-    if (m_epoll_fd < 0) {
+EventLoop::EventLoop() {
+    m_poller = Poller::createDefault();
+    if (!m_poller) {
+        ROCKET_LOG_ERROR("EventLoop: Poller::createDefault() failed");
         return;
     }
 
-    initWakeUpFdEvent();
-    initTimer();
+    initWakeup();
+    m_timer = std::make_unique<Timer>();
+    m_valid = true;
 }
 
 EventLoop::~EventLoop() {
-    ROCKET_LOG_DEBUG("~EventLoop");
-    if (t_current_event_loop == this) {
-        t_current_event_loop = nullptr;
-    }
-
-    if (m_epoll_fd >= 0) {
-        ::close(m_epoll_fd);
-    }
-
-    if (m_wakeup_fd >= 0) {
-        ::close(m_wakeup_fd);
-    }
+    if (t_current_event_loop == this) t_current_event_loop = nullptr;
 }
 
-void EventLoop::initWakeUpFdEvent() {
-    m_wakeup_fd_event = std::make_unique<WakeUpFdEvent>();
-    m_wakeup_fd = m_wakeup_fd_event->getFd();
-
-    addEpollEvent(m_wakeup_fd_event.get());
-}
-
-void EventLoop::initTimer() {
-    m_timer = std::make_unique<Timer>();
-    addEpollEvent(m_timer.get());
+void EventLoop::initWakeup() {
+    m_wakeup_channel = WakeupChannel::create();
+    if (!m_wakeup_channel) return;
+    m_wakeup_fd_event = std::make_unique<FdEvent>(m_wakeup_channel->readFd());
+    m_wakeup_fd_event->listen(FdEvent::TriggerEvent::IN_EVENT, [this] { m_wakeup_channel->drain(); });
+    m_poller->updateFdEvent(m_wakeup_fd_event.get());
 }
 
 void EventLoop::loop() {
+    if (!m_valid) {
+        ROCKET_LOG_ERROR("EventLoop::loop() called on invalid (failed-construction) loop");
+        return;
+    }
+    m_thread_id = std::this_thread::get_id();  // set to the thread that actually runs the loop
+    t_current_event_loop = this;
     m_is_looping = true;
 
-    static thread_local std::vector<epoll_event> events(kMaxEvents);
+    std::vector<Poller::ActiveEvent> active;
 
     while (!m_stop_flag) {
-        const int nfds = ::epoll_wait(m_epoll_fd, events.data(), kMaxEvents, -1);
+        int timeout_ms = kEpollWaitTimeoutMs;
+        if (m_timer) {
+            auto ms = m_timer->msUntilNextExpire();
+            timeout_ms = ms.has_value() ? static_cast<int>(ms.value()) : kEpollWaitTimeoutMs;
+            if (timeout_ms == 0) timeout_ms = 1;
+        }
 
-        if (nfds < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+        int num_events = m_poller->poll(timeout_ms, active);
+        if (num_events < 0) {
+            ROCKET_LOG_ERROR("EventLoop: poll returned fatal error, exiting loop");
             break;
         }
 
-        processEvents(events, nfds);
+        processEvents(active);
+        processTimerEvents();
         processPendingTasks();
     }
 
     m_is_looping = false;
 }
 
-void EventLoop::processEvents(const std::vector<epoll_event>& events, int nfds) {
-    for (int i = 0; i < nfds; ++i) {
-        const epoll_event& ev = events[static_cast<std::size_t>(i)];
-        auto* fd_event = static_cast<FdEvent*>(ev.data.ptr);
+void EventLoop::processEvents(const std::vector<Poller::ActiveEvent>& events) {
+    for (const auto& ae : events) {
+        auto* fd_event = ae.fd_event;
+        if (!fd_event) continue;
 
-        if ((ev.events & EPOLLIN) != 0) {
+        if ((ae.event_mask & toMask(FdEvent::TriggerEvent::IN_EVENT)) != 0) {
             const auto& handler = fd_event->handler(FdEvent::TriggerEvent::IN_EVENT);
-            if (handler) {
-                handler();
-            }
+            if (handler) handler();
         }
-
-        if ((ev.events & EPOLLOUT) != 0) {
+        if ((ae.event_mask & toMask(FdEvent::TriggerEvent::OUT_EVENT)) != 0) {
             const auto& handler = fd_event->handler(FdEvent::TriggerEvent::OUT_EVENT);
-            if (handler) {
-                handler();
-            }
+            if (handler) handler();
         }
-
-        if ((ev.events & EPOLLERR) != 0) {
+        if ((ae.event_mask & toMask(FdEvent::TriggerEvent::ERROR_EVENT)) != 0) {
             const auto& handler = fd_event->handler(FdEvent::TriggerEvent::ERROR_EVENT);
-            if (handler) {
-                handler();
-            }
+            if (handler) handler();
         }
     }
 }
@@ -122,20 +102,22 @@ void EventLoop::processPendingTasks() {
         std::lock_guard<std::mutex> lock(m_mutex);
         tasks.swap(m_pending_tasks);
     }
-
     while (!tasks.empty()) {
         auto& task = tasks.front();
-        if (task) {
-            task();
-        }
+        if (task) task();
         tasks.pop();
     }
 }
 
+void EventLoop::processTimerEvents() {
+    if (!m_timer) return;
+    auto now = std::chrono::steady_clock::now();
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    m_timer->fireExpired(now_ms);
+}
+
 void EventLoop::wakeup() {
-    if (m_wakeup_fd_event) {
-        m_wakeup_fd_event->wakeup();
-    }
+    if (m_wakeup_channel) m_wakeup_channel->wakeup();
 }
 
 void EventLoop::stop() {
@@ -144,68 +126,43 @@ void EventLoop::stop() {
 }
 
 void EventLoop::addEpollEvent(FdEvent* event) {
-    if (event == nullptr || event->getFd() < 0) {
-        return;
-    }
-
-    epoll_event ev = event->getEpollEvent();
-    ev.data.ptr = event;
-
-    const int fd = event->getFd();
-
-    if (!m_listen_fds.contains(fd)) {
-        // 新增
-        if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            // 错误处理
-            return;
-        }
-        m_listen_fds.insert(fd);
-    } else {
-        // 修改
-        if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0) {
-            // 错误处理
-        }
-    }
+    if (m_poller && event) m_poller->updateFdEvent(event);
 }
 
 void EventLoop::deleteEpollEvent(FdEvent* event) {
-    if (event == nullptr || event->getFd() < 0) {
-        return;
-    }
-
-    const int fd = event->getFd();
-
-    if (m_listen_fds.contains(fd)) {
-        if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0) {
-            // 错误处理
-        }
-        m_listen_fds.erase(fd);
-    }
+    if (m_poller && event) m_poller->removeFdEvent(event);
 }
 
-bool EventLoop::isInLoopThread() const noexcept { return m_thread_id == std::this_thread::get_id(); }
+bool EventLoop::isInLoopThread() const noexcept {
+    return m_thread_id == std::this_thread::get_id();
+}
 
 void EventLoop::addTask(std::function<void()> cb, bool is_wake_up) {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pending_tasks.push(std::move(cb));
     }
-
-    if (is_wake_up) {
-        wakeup();
-    }
+    if (is_wake_up) wakeup();
 }
 
 void EventLoop::addTimerEvent(const TimerEvent::s_ptr& event) {
-    if (m_timer) {
-        m_timer->addTimerEvent(event);
-    }
+    if (m_timer) m_timer->addTimerEvent(event);
 }
 
 bool EventLoop::isLooping() const noexcept { return m_is_looping; }
 
-void EventLoop::dealWakeup() {
-    // WakeUpFdEvent 会自动读取清除事件
+void EventLoop::runInLoop(std::function<void()> fn) {
+    if (isInLoopThread()) { fn(); }
+    else { queueInLoop(std::move(fn)); }
+}
+
+void EventLoop::queueInLoop(std::function<void()> fn) { addTask(std::move(fn), true); }
+
+void EventLoop::assertInLoopThread() const noexcept {
+    if (!isInLoopThread()) {
+        ROCKET_LOG_ERROR("assertInLoopThread() failed: loop belongs to thread {}", m_thread_id);
+        std::abort();
+    }
 }
 
 EventLoop* EventLoop::GetCurrentEventLoop() { return t_current_event_loop; }

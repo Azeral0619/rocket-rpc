@@ -27,6 +27,9 @@ inline constexpr std::int32_t kMethodNotFound = SYS_ERROR_PREFIX(0009);   // 方
 inline constexpr std::int32_t kParseServiceName = SYS_ERROR_PREFIX(0010); // 服务名解析失败
 inline constexpr std::int32_t kRpcChannelInit = SYS_ERROR_PREFIX(0011);   // RPC channel 初始化失败
 inline constexpr std::int32_t kRpcPeerAddr = SYS_ERROR_PREFIX(0012);      // RPC 调用对端地址异常
+inline constexpr std::int32_t kRpcBackpressure = SYS_ERROR_PREFIX(0013);  // RPC 背压（high water mark）
+inline constexpr std::int32_t kRpcPoolExhausted = SYS_ERROR_PREFIX(0014); // 连接池耗尽
+inline constexpr std::int32_t kRpcShutdown = SYS_ERROR_PREFIX(0015);      // 服务器正在关闭
 
 } // namespace error
 } // namespace rocket

@@ -24,6 +24,21 @@ inline void writeInt32(std::string& buffer, std::int32_t value) {
     buffer.append(static_cast<const char*>(bytes), sizeof(net_value));
 }
 
+// Raw-pointer variants for stack-buffer encoding (Hical FixedBuffer pattern).
+inline char* writeInt32To(char* p, std::int32_t value) {
+    std::uint32_t net = htonl(static_cast<std::uint32_t>(value));
+    std::memcpy(p, &net, sizeof(net));
+    return p + sizeof(net);
+}
+
+inline char* appendTo(char* p, const char* data, std::size_t len) {
+    if (len > 0) {
+        std::memcpy(p, data, len);
+        return p + len;
+    }
+    return p;
+}
+
 inline std::int32_t readInt32(const char* data) {
     std::uint32_t net_value = 0;
     std::memcpy(&net_value, data, sizeof(net_value));
@@ -48,11 +63,13 @@ void TinyPBCoder::encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuff
     }
 }
 
-void TinyPBCoder::decode(std::vector<AbstractProtocol::s_ptr>& out_messages, TcpBuffer::s_ptr buffer) {
+DecodeResult TinyPBCoder::decode(TcpBuffer::s_ptr buffer) {
+    DecodeResult result;
+
     while (true) {
         const std::size_t readable = buffer->readAble();
         if (readable == 0) {
-            return;
+            return result;
         }
 
         std::vector<char> tmp;
@@ -73,7 +90,7 @@ void TinyPBCoder::decode(std::vector<AbstractProtocol::s_ptr>& out_messages, Tcp
         for (std::size_t i = start_index; i < write_index; ++i) {
             if (tmp[i] == TinyPBProtocol::PB_START) {
                 if (i + 1 + sizeof(std::int32_t) > write_index) {
-                    return;
+                    return result;
                 }
 
                 pk_len = readInt32(&tmp[i + 1]);
@@ -82,13 +99,13 @@ void TinyPBCoder::decode(std::vector<AbstractProtocol::s_ptr>& out_messages, Tcp
                 if (pk_len <= 0 || static_cast<std::size_t>(pk_len) > kMaxPacketSize) {
                     ROCKET_LOG_WARN("Invalid pk_len={}, skip byte", pk_len);
                     buffer->moveReadIndex(1);
-                    break; // 重新读取 buffer
+                    break;
                 }
 
                 const std::size_t pk_end_pos = i + static_cast<std::size_t>(pk_len) - 1;
                 if (pk_end_pos >= write_index) {
                     ROCKET_LOG_DEBUG("Incomplete packet, need {} bytes", pk_len);
-                    return;
+                    return result;
                 }
 
                 if (tmp[pk_end_pos] == TinyPBProtocol::PB_END) {
@@ -103,13 +120,13 @@ void TinyPBCoder::decode(std::vector<AbstractProtocol::s_ptr>& out_messages, Tcp
                 ROCKET_LOG_WARN("PB_END not found at expected position {}, byte=0x{:02x}, skip byte", pk_end_pos,
                                 static_cast<unsigned char>(tmp[pk_end_pos]));
                 buffer->moveReadIndex(1);
-                break; // 重新读取 buffer
+                break;
             }
         }
 
         if (!found_valid_packet) {
             ROCKET_LOG_DEBUG("No valid packet found, waiting");
-            return;
+            return result;
         }
 
         auto message = std::make_shared<TinyPBProtocol>();
@@ -200,7 +217,7 @@ void TinyPBCoder::decode(std::vector<AbstractProtocol::s_ptr>& out_messages, Tcp
 
         buffer->moveReadIndex(pk_end_index - pk_start_index + 1);
         message->parse_success = true;
-        out_messages.push_back(message);
+        result.messages.push_back(message);
 
         ROCKET_LOG_INFO("Decoded message [{}], method: {}", message->m_msg_id, message->m_method_name);
     }
@@ -219,39 +236,54 @@ std::string TinyPBCoder::encodeTinyPB(const TinyPBProtocol::s_ptr& message) {
                                                   message->m_method_name.length() + message->m_err_info.length() +
                                                   message->m_pb_data.length());
 
-    std::string buffer;
-    buffer.reserve(pk_len);
+    // Stack buffer for the common case (most RPC messages are < 512 bytes).
+    // Avoids heap allocation on the encode hot path.  Pattern from Hical's
+    // FixedBuffer used for HTTP response serialization.
+    constexpr std::size_t kStackCapacity = 512;
+    char stack_buf[kStackCapacity];
+    char* buf;
+    std::string heap_buf;
+
+    if (static_cast<std::size_t>(pk_len) <= kStackCapacity) {
+        buf = stack_buf;
+    } else {
+        heap_buf.reserve(pk_len);
+        buf = heap_buf.data();
+    }
+
+    char* p = buf;
 
     // 1. START
-    buffer.push_back(TinyPBProtocol::PB_START);
+    *p++ = TinyPBProtocol::PB_START;
 
     // 2. pk_len
-    writeInt32(buffer, pk_len);
+    p = writeInt32To(p, pk_len);
 
     // 3. msg_id
-    writeInt32(buffer, static_cast<std::int32_t>(message->m_msg_id.length()));
-    buffer.append(message->m_msg_id);
+    p = writeInt32To(p, static_cast<std::int32_t>(message->m_msg_id.length()));
+    p = appendTo(p, message->m_msg_id.data(), message->m_msg_id.length());
 
     // 4. method_name
-    writeInt32(buffer, static_cast<std::int32_t>(message->m_method_name.length()));
-    buffer.append(message->m_method_name);
+    p = writeInt32To(p, static_cast<std::int32_t>(message->m_method_name.length()));
+    p = appendTo(p, message->m_method_name.data(), message->m_method_name.length());
 
     // 5. err_code
-    writeInt32(buffer, message->m_err_code);
+    p = writeInt32To(p, message->m_err_code);
 
     // 6. err_info
-    writeInt32(buffer, static_cast<std::int32_t>(message->m_err_info.length()));
-    buffer.append(message->m_err_info);
+    p = writeInt32To(p, static_cast<std::int32_t>(message->m_err_info.length()));
+    p = appendTo(p, message->m_err_info.data(), message->m_err_info.length());
 
     // 7. pb_data
-    buffer.append(message->m_pb_data);
+    p = appendTo(p, message->m_pb_data.data(), message->m_pb_data.length());
 
     // 8. checksum
-    const std::uint32_t checksum = calculateChecksum(buffer.data(), buffer.size());
-    writeInt32(buffer, static_cast<std::int32_t>(checksum));
+    const std::size_t body_len = static_cast<std::size_t>(p - buf);
+    const std::uint32_t checksum = calculateChecksum(buf, body_len);
+    p = writeInt32To(p, static_cast<std::int32_t>(checksum));
 
     // 9. END
-    buffer.push_back(TinyPBProtocol::PB_END);
+    *p++ = TinyPBProtocol::PB_END;
 
     // 更新协议字段
     message->m_pk_len = pk_len;
@@ -261,7 +293,12 @@ std::string TinyPBCoder::encodeTinyPB(const TinyPBProtocol::s_ptr& message) {
     message->m_check_sum = static_cast<std::int32_t>(checksum);
     message->parse_success = true;
 
-    return buffer;
+    const std::size_t total_len = static_cast<std::size_t>(p - buf);
+    if (static_cast<std::size_t>(pk_len) <= kStackCapacity) {
+        return std::string(stack_buf, total_len);
+    }
+    heap_buf.resize(total_len);
+    return heap_buf;
 }
 
 std::uint32_t TinyPBCoder::calculateChecksum(const char* data, std::size_t len) {

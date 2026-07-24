@@ -1,18 +1,19 @@
 #pragma once
 
-#include "fd_event.h"
-#include "timer_event.h"
-#include <cstddef>
+#include "rocket/net/timer_event.h"
+#include "rocket/net/timing_wheel.h"
 #include <cstdint>
-#include <map>
-#include <mutex>
+#include <memory>
+#include <optional>
 
 namespace rocket {
 
-class Timer : public FdEvent {
+// Heap/wheel-based timer — no timerfd dependency.
+// Owned by EventLoop; EventLoop polls msUntilNextExpire() for the epoll_wait
+// timeout and calls fireExpired() after each poll cycle.
+class Timer {
   public:
-    Timer();
-
+    Timer() = default;
     ~Timer() = default;
 
     Timer(const Timer&) = delete;
@@ -24,15 +25,14 @@ class Timer : public FdEvent {
 
     void deleteTimerEvent(const TimerEvent::s_ptr& event);
 
-    void onTimer();
+    [[nodiscard]] std::optional<std::int64_t> msUntilNextExpire() const;
+
+    void fireExpired(std::int64_t now_ms);
 
     [[nodiscard]] std::size_t pendingCount() const;
 
   private:
-    void resetArriveTime();
-
-    std::multimap<std::int64_t, TimerEvent::s_ptr> m_pending_events;
-    mutable std::mutex m_mutex;
+    TimingWheel m_wheel;
 };
 
 } // namespace rocket

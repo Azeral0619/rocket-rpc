@@ -1,17 +1,16 @@
 #include "rocket/common/log.h"
 #include "rocket/common/config.h"
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
+#include <csignal>
 #include <cstdint>
 #include <ctime>
-#include <emmintrin.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <fmt/base.h>
-#include <fstream>
-#include <ios>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -19,431 +18,437 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unistd.h>
 #include <utility>
-
 #include <fmt/format.h>
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
-
 #if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
 #define cpu_pause() _mm_pause();
 #elif defined(__aarch64__)
 #define cpu_pause() asm volatile("yield" ::: "memory");
+#else
+#define cpu_pause()
 #endif
 
 namespace rocket {
 namespace {
 
-constexpr int kShift1 = 1;
-constexpr int kShift2 = 2;
-constexpr int kShift4 = 4;
-constexpr int kShift8 = 8;
-constexpr int kShift16 = 16;
-constexpr int kShift32 = 32;
-constexpr std::uint64_t kNanosPerSecond = 1'000'000'000ULL;
-constexpr std::uint64_t kNanosPerMilli = 1'000'000ULL;
+constexpr int K1=1,K2=2,K4=4,K8=8,K16=16,K32=32;
 
 LogLevel ParseLogLevel(std::string_view level) {
-    if (level == "DEBUG" || level == "debug" || level == "Debug") {
-        return LogLevel::Debug;
-    }
-    if (level == "INFO" || level == "info" || level == "Info") {
-        return LogLevel::Info;
-    }
-    if (level == "WARN" || level == "warn" || level == "Warn") {
-        return LogLevel::Warn;
-    }
-    if (level == "ERROR" || level == "error" || level == "Error") {
-        return LogLevel::Error;
-    }
+    if (level == "DEBUG" || level == "debug" || level == "Debug") return LogLevel::Debug;
+    if (level == "INFO"  || level == "info"  || level == "Info")  return LogLevel::Info;
+    if (level == "WARN"  || level == "warn"  || level == "Warn")  return LogLevel::Warn;
+    if (level == "ERROR" || level == "error" || level == "Error") return LogLevel::Error;
     return LogLevel::Debug;
 }
 
 Logger::Options BuildOptionsFromConfig() {
-    Logger::Options options;
-    const auto cfg = Config::getInstance().getConfig();
-    if (!cfg) {
-        return options;
-    }
-
+    Logger::Options opts;
+    auto cfg = Config::getInstance().getConfig();
+    if (!cfg) return opts;
     if (!cfg->log_file_name.empty()) {
-        const std::filesystem::path file_name{cfg->log_file_name};
-        if (!cfg->log_file_path.empty() && !file_name.is_absolute()) {
-            const std::filesystem::path file_path{cfg->log_file_path};
-            options.file_path = file_path / file_name;
-        } else {
-            options.file_path = file_name;
-        }
+        std::filesystem::path fn{cfg->log_file_name};
+        opts.file_path = (!cfg->log_file_path.empty() && !fn.is_absolute())
+            ? std::filesystem::path{cfg->log_file_path} / fn : fn;
     }
-
-    options.level = ParseLogLevel(cfg->log_level);
-
-    if (cfg->log_sync_interval > 0) {
-        options.flush_interval_ms = static_cast<std::size_t>(cfg->log_sync_interval);
-    }
-
-    if (cfg->log_max_file_size > 0) {
-        options.max_file_size = static_cast<std::size_t>(cfg->log_max_file_size);
-    }
-
-    if (cfg->log_queue_capacity > 0) {
-        options.queue_capacity = static_cast<std::size_t>(cfg->log_queue_capacity);
-    }
-
-    return options;
+    opts.level = ParseLogLevel(cfg->log_level);
+    if (cfg->log_sync_interval > 0) opts.flush_interval_ms = static_cast<std::size_t>(cfg->log_sync_interval);
+    if (cfg->log_max_file_size > 0) opts.max_file_size = static_cast<std::size_t>(cfg->log_max_file_size);
+    if (cfg->log_queue_capacity > 0) opts.per_thread_queue_bytes = static_cast<std::size_t>(cfg->log_queue_capacity);
+    return opts;
 }
 
-[[nodiscard]] std::size_t NextPow2(std::size_t value) {
-    if (value < 2) {
-        return 2;
-    }
-
-    value--;
-    value |= value >> kShift1;
-    value |= value >> kShift2;
-    value |= value >> kShift4;
-    value |= value >> kShift8;
-    value |= value >> kShift16;
-    if constexpr (sizeof(std::size_t) >= sizeof(std::uint64_t)) {
-        value |= value >> kShift32;
-    }
-    return value + 1;
+std::size_t NextPow2(std::size_t v) {
+    if (v < 2) return 2;
+    v--; v|=v>>K1; v|=v>>K2; v|=v>>K4; v|=v>>K8; v|=v>>K16;
+    if constexpr (sizeof(std::size_t) >= sizeof(std::uint64_t)) v|=v>>K32;
+    return v + 1;
 }
 
 } // namespace
 
 // ============================================================================
-// MPSC Ring Queue 实现
+// SPSC Bounded Queue
 // ============================================================================
 
 template <typename T>
-Logger::MpscRingQueue<T>::MpscRingQueue(std::size_t capacity) {
-    const std::size_t actual = NextPow2(std::max<std::size_t>(capacity, 2));
-    m_capacity = actual;
-    m_buffer.resize(actual);
-    m_mask = actual - 1;
-
-    for (std::size_t i = 0; i < actual; ++i) {
+Logger::SpscBoundedQueue<T>::SpscBoundedQueue(std::size_t cap) {
+    auto n = NextPow2(std::max<std::size_t>(cap, 2));
+    m_capacity = n; m_mask = n - 1;
+    m_buffer.reset(new Cell[n]);
+    for (std::size_t i = 0; i < n; ++i)
         m_buffer[i].sequence.store(i, std::memory_order_relaxed);
-    }
 }
 
 template <typename T>
-bool Logger::MpscRingQueue<T>::enqueue(T&& item) {
-    std::size_t pos = m_enqueue_pos.load(std::memory_order_relaxed);
-    for (;;) {
-        Cell& cell = m_buffer[pos & m_mask];
-        const std::size_t seq = cell.sequence.load(std::memory_order_acquire);
-        const auto diff = static_cast<std::intptr_t>(seq) - static_cast<std::intptr_t>(pos);
-
-        if (diff == 0) [[likely]] {
-            if (m_enqueue_pos.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                cell.storage = std::move(item);
-                cell.sequence.store(pos + 1, std::memory_order_release);
-                return true;
-            }
-            continue;
-        }
-        if (diff < 0) [[unlikely]] {
-            return false;
-        }
-
-        pos = m_enqueue_pos.load(std::memory_order_relaxed);
-    }
+T* Logger::SpscBoundedQueue<T>::tryClaim() {
+    std::size_t pos = m_pos;
+    Cell& c = m_buffer[pos & m_mask];
+    if (static_cast<std::intptr_t>(c.sequence.load(std::memory_order_acquire)) < static_cast<std::intptr_t>(pos))
+        return nullptr;
+    m_pos = pos + 1;
+    return &c.storage;
 }
 
 template <typename T>
-bool Logger::MpscRingQueue<T>::tryDequeue(T& out) {
-    const std::size_t pos = m_dequeue_pos; // 单消费者，无需atomic
-    Cell& cell = m_buffer[pos & m_mask];
+void Logger::SpscBoundedQueue<T>::publish() {
+    std::size_t pos = m_pos - 1;
+    m_buffer[pos & m_mask].sequence.store(pos + 1, std::memory_order_release);
+}
 
-    const std::size_t seq = cell.sequence.load(std::memory_order_acquire);
-    const auto diff = static_cast<std::intptr_t>(seq) - static_cast<std::intptr_t>(pos + 1);
-
-    if (diff < 0) {
-        return false;
-    }
-
-    out = std::move(cell.storage);
-    cell.sequence.store(pos + m_capacity, std::memory_order_release);
-    m_dequeue_pos = pos + 1;
+template <typename T>
+bool Logger::SpscBoundedQueue<T>::tryDequeue(T& out) {
+    std::size_t pos = m_dq;
+    Cell& c = m_buffer[pos & m_mask];
+    auto diff = static_cast<std::intptr_t>(c.sequence.load(std::memory_order_acquire))
+              - static_cast<std::intptr_t>(pos + 1);
+    if (diff < 0) return false;
+    out = std::move(c.storage);
+    c.sequence.store(pos + m_capacity, std::memory_order_release);
+    m_dq = pos + 1;
     return true;
 }
 
-template class Logger::MpscRingQueue<Logger::LogEntry>;
+template <typename T>
+bool Logger::SpscBoundedQueue<T>::empty() const noexcept {
+    return m_buffer[m_dq & m_mask].sequence.load(std::memory_order_acquire) != m_dq + 1;
+}
+
+template class Logger::SpscBoundedQueue<Logger::LogEntry>;
 
 // ============================================================================
-// Logger 实现
+// Logger
 // ============================================================================
 
 Logger::~Logger() { stop(); }
-
 void Logger::start() { start(BuildOptionsFromConfig()); }
 
-void Logger::start(const Options& options) {
-    std::lock_guard<std::mutex> lock(m_lifecycle_mutex);
-    if (m_running.load(std::memory_order_acquire)) {
-        return;
-    }
+void Logger::start(const Options& opts) {
+    std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
+    if (m_running.load(std::memory_order_acquire)) return;
 
-    m_file_path = options.file_path;
-    m_flush_interval_ms = std::max<std::size_t>(1, options.flush_interval_ms);
-    m_max_file_size = std::max<std::size_t>(1, options.max_file_size);
-    m_level.store(options.level, std::memory_order_release);
+    m_slots.clear();
+    m_poll_index = 0;
+    m_generation.fetch_add(1, std::memory_order_release);
+    auto now_sys = std::chrono::system_clock::now();
+    m_base_steady = std::chrono::steady_clock::now();
+    m_epoch_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now_sys.time_since_epoch()).count());
+
+    m_file_path = opts.file_path;
+    m_per_thread_bytes = std::max<std::size_t>(4096, opts.per_thread_queue_bytes);
+    m_flush_interval_ms = std::max<std::size_t>(1, opts.flush_interval_ms);
+    m_max_file_size = std::max<std::size_t>(1, opts.max_file_size);
+    m_level.store(opts.level, std::memory_order_release);
     m_dropped_count.store(0, std::memory_order_release);
     m_enqueue_notify_counter.store(0, std::memory_order_release);
 
-    const std::size_t capacity = options.queue_capacity;
-    m_queue = std::make_unique<MpscRingQueue<LogEntry>>(capacity);
-
-    // {
-    //     std::lock_guard<std::mutex> file_lock(m_file_mutex);
-    //     closeLogFile();
-    //     openLogFile();
-    // }
-
     m_running.store(true, std::memory_order_release);
-    m_consumer = std::jthread([this] { consumerRun(); });
+    m_fmt_buf.reserve(kWriteBufferReserve);
+    m_write_buf.reserve(kWriteBufferReserve);
+    m_consumer = std::jthread([this]{ consumerRun(); });
+    m_writer = std::jthread([this]{ writeThreadRun(); });
 }
 
 void Logger::stop() {
-    std::lock_guard<std::mutex> lock(m_lifecycle_mutex);
-    if (!m_running.exchange(false, std::memory_order_acq_rel)) {
-        return;
-    }
-
+    std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
+    if (!m_running.exchange(false, std::memory_order_acq_rel)) return;
     m_consumer_cv.notify_one();
-    // m_consumer_signal.fetch_add(1, std::memory_order_release);
-    // m_consumer_signal.notify_one();
-
-    if (m_consumer.joinable()) {
-        m_consumer.join();
-    }
-
-    // {
-    //     std::lock_guard<std::mutex> file_lock(m_file_mutex);
-    //     closeLogFile();
-    // }
-
-    const auto dropped = m_dropped_count.load(std::memory_order_relaxed);
-    if (dropped > 0) {
-        std::cerr << "[Logger] total dropped logs=" << dropped << '\n';
-    }
+    m_write_cv.notify_one();
+    if (m_consumer.joinable()) m_consumer.join();
+    if (m_writer.joinable()) m_writer.join();
+    if (auto d = m_dropped_count.load(std::memory_order_relaxed))
+        std::cerr << "[Logger] total dropped logs=" << d << '\n';
 }
 
 void Logger::reloadFromConfig() {
-    const Options options = BuildOptionsFromConfig();
-
-    std::lock_guard<std::mutex> lock(m_lifecycle_mutex);
-    m_level.store(options.level, std::memory_order_release);
-    m_flush_interval_ms = std::max<std::size_t>(1, options.flush_interval_ms);
-    m_max_file_size = std::max<std::size_t>(1, options.max_file_size);
-
-    const bool path_changed = (m_file_path != options.file_path);
-    m_file_path = options.file_path;
-
-    // if (m_running.exchange(false, std::memory_order_acq_rel)) {
-    //     // m_consumer_signal.fetch_add(1, std::memory_order_release);
-    //     // m_consumer_signal.notify_one();
-    //     m_consumer_cv.notify_one();
-    //     if (m_consumer.joinable()) {
-    //         m_consumer.join();
-    //     }
-    // }
-
-    if (!m_running.load(std::memory_order_acquire)) { // false
-        // m_consumer_signal.fetch_add(1, std::memory_order_release);
-        // m_consumer_signal.notify_one();
-        m_consumer_cv.notify_one();
-        if (m_consumer.joinable()) {
-            m_consumer.join();
-        }
-        m_running.store(true, std::memory_order_release);
-        m_consumer = std::jthread([this] { consumerRun(); });
-    } else { // true
-        if (path_changed) {
-            m_running.store(false, std::memory_order_release);
-            // m_consumer_signal.fetch_add(1, std::memory_order_release);
-            // m_consumer_signal.notify_one();
-            m_consumer_cv.notify_one();
-            if (m_consumer.joinable()) {
-                m_consumer.join();
-            }
-            m_running.store(true, std::memory_order_release);
-            m_consumer = std::jthread([this] { consumerRun(); });
-        }
-    }
-
-    // if (path_changed) {
-    //     // std::lock_guard<std::mutex> file_lock(m_file_mutex);
-    //     // closeLogFile();
-    //     // openLogFile();
-    // }
+    auto opts = BuildOptionsFromConfig();
+    std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
+    m_level.store(opts.level, std::memory_order_release);
+    m_flush_interval_ms = std::max<std::size_t>(1, opts.flush_interval_ms);
+    m_max_file_size = std::max<std::size_t>(1, opts.max_file_size);
+    m_file_path = opts.file_path;
 }
 
-void Logger::ensureStarted() {
-    if (!m_running.load(std::memory_order_acquire)) {
-        start();
+void Logger::ensureStarted() { if (!m_running.load(std::memory_order_acquire)) start(); }
+
+void Logger::flushAll() {
+    if (m_log_fd < 0) return;
+
+    // Try-lock the write mutex — in a signal handler we can't block.
+    std::unique_lock<std::mutex> lk(m_write_mutex, std::try_to_lock);
+
+    // Write any buffered data from the format thread's buffer.
+    if (!m_fmt_buf.empty()) {
+        auto* data = m_fmt_buf.data();
+        auto size = m_fmt_buf.size();
+        auto written = ::write(m_log_fd, data, size);
+        if (written > 0) {
+            m_current_file_size += static_cast<std::size_t>(written);
+            m_fmt_buf.erase(0, static_cast<std::size_t>(written));
+        }
     }
+
+    // Write any pending write-thread buffer.
+    if (!m_write_buf.empty()) {
+        auto* data = m_write_buf.data();
+        auto size = m_write_buf.size();
+        auto written = ::write(m_log_fd, data, size);
+        if (written > 0) {
+            m_current_file_size += static_cast<std::size_t>(written);
+            m_write_buf.erase(0, static_cast<std::size_t>(written));
+        }
+    }
+
+    ::fsync(m_log_fd);
 }
 
 void Logger::flush() {
-    if (!m_running.load(std::memory_order_acquire)) {
-        return;
+    if (m_running.load(std::memory_order_acquire)) {
+        m_need_flush.store(true, std::memory_order_release);
+        m_consumer_cv.notify_one();
     }
-    m_need_flush.store(true, std::memory_order_release);
-    // m_consumer_signal.fetch_add(1, std::memory_order_release);
-    // m_consumer_signal.notify_one();
-    m_consumer_cv.notify_one();
 }
-
-void Logger::setLevel(LogLevel level) noexcept { m_level.store(level, std::memory_order_release); }
-
+void Logger::setLevel(LogLevel l) noexcept { m_level.store(l, std::memory_order_release); }
 LogLevel Logger::level() const noexcept { return m_level.load(std::memory_order_acquire); }
-
 bool Logger::isRunning() const noexcept { return m_running.load(std::memory_order_acquire); }
 
+std::shared_ptr<Logger::ThreadSlot> Logger::registerThisThread() {
+    auto slot = std::make_shared<ThreadSlot>();
+    slot->queue = std::make_unique<SpscBoundedQueue<LogEntry>>(m_per_thread_bytes / sizeof(LogEntry));
+    slot->tid = std::this_thread::get_id();
+    slot->generation = m_generation.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lk(m_slot_mutex);
+    m_slots.push_back(slot);
+    return slot;
+}
+
+
 void Logger::consumerRun() {
-    closeLogFile();
-    openLogFile();
-
-    std::string write_buffer;
-    write_buffer.reserve(kWriteBufferReserve);
-
+    closeLogFile(); openLogFile();
+    std::string& wb = m_fmt_buf;
     LogEntry entry;
+    auto last_flush = std::chrono::steady_clock::now();
 
-    auto last_flush_time = std::chrono::steady_clock::now();
+    // Second-level cache for localtime_r.
+    struct {
+        std::time_t last_sec{0};
+        std::array<char, 20> buf{};
+        std::size_t len{0};
+    } dtc;
+
+    auto formatLine = [&](LogEntry& e) {
+        constexpr std::uint64_t NS = 1'000'000'000ULL;
+        auto secs = static_cast<std::time_t>(e.timestamp_ns / NS);
+        int ms = static_cast<int>((e.timestamp_ns % NS) / 1'000'000ULL);
+        if (secs != dtc.last_sec) {
+            std::tm tm_buf{};
+            localtime_r(&secs, &tm_buf);
+            auto r = fmt::format_to_n(dtc.buf.data(), dtc.buf.size(),
+                "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}",
+                tm_buf.tm_year+1900, tm_buf.tm_mon+1, tm_buf.tm_mday,
+                tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+            dtc.len = r.size; dtc.last_sec = secs;
+        }
+        fmt::format_to(std::back_inserter(wb), "{}.{:03d} [{}] [tid={}]",
+            std::string_view(dtc.buf.data(), dtc.len), ms,
+            LogLevelToString(static_cast<LogLevel>(e.level)), e.thread_id);
+        if (!e.msgid.empty())
+            fmt::format_to(std::back_inserter(wb), " [msgid={}]", e.msgid);
+        if (!e.method_name.empty())
+            fmt::format_to(std::back_inserter(wb), " [method={}]", e.method_name);
+        wb.push_back(' ');
+        e.runFormat(wb);
+        wb.push_back('\n');
+    };
+
+    auto swapBuffer = [&] {
+        std::lock_guard<std::mutex> lk(m_write_mutex);
+        if (wb.size() >= kWriteThreshold) {
+            m_write_buf.swap(wb);
+            m_write_ready = true;
+            m_write_cv.notify_one();
+        }
+    };
+
+    auto batch = std::make_unique<LogEntry[]>(kMaxDequeuePerRound);
 
     while (m_running.load(std::memory_order_acquire)) {
-        std::size_t dequeued = 0;
-
-        while (m_queue && dequeued < kMaxDequeuePerRound && m_queue->tryDequeue(entry)) {
-            ++dequeued;
-            write_buffer.append(entry.data.data(), entry.size);
-        }
-
-        const bool has_data = !write_buffer.empty();
-
-        if (has_data) {
-            if (m_log_file.is_open()) [[likely]] {
-                rotateIfNeeded();
-                m_log_file.write(write_buffer.data(), static_cast<std::streamsize>(write_buffer.size()));
-
-                m_current_file_size += write_buffer.size();
-            } else {
-                std::cerr.write(write_buffer.data(), static_cast<std::streamsize>(write_buffer.size()));
+        std::size_t total = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_slot_mutex);
+            std::size_t polled = 0;
+            std::size_t idx = m_poll_index % (m_slots.empty() ? 1 : m_slots.size());
+            while (!m_slots.empty() && polled < m_slots.size() && total < kMaxDequeuePerRound) {
+                auto& slp = m_slots[idx];
+                if (slp && !slp->dead) {
+                    while (total < kMaxDequeuePerRound && slp->queue->tryDequeue(batch[total]))
+                        ++total;
+                }
+                idx = (idx + 1) % m_slots.size();
+                ++polled;
             }
-            write_buffer.clear();
+            m_poll_index = idx;
         }
 
-        const bool flush = m_need_flush.exchange(false, std::memory_order_acq_rel);
+        for (std::size_t i = 0; i < total; ++i)
+            formatLine(batch[i]);
 
-        auto now = std::chrono::steady_clock::now();
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time);
-        const bool timeout_flush = elapsed.count() >= static_cast<long long>(m_flush_interval_ms);
+        if (total > 0) swapBuffer();
 
-        if (flush || timeout_flush) {
-            // std::lock_guard<std::mutex> file_lock(m_file_mutex);
-            if (m_log_file.is_open()) [[likely]] {
-                m_log_file.flush();
-                last_flush_time = now;
+        if (total == 0) {
+            // Going idle — flush any buffered output.
+            {
+                std::lock_guard<std::mutex> lk(m_write_mutex);
+                if (!wb.empty()) {
+                    m_write_buf.swap(wb);
+                    m_write_ready = true;
+                    m_write_cv.notify_one();
+                }
             }
-        }
 
-        if (dequeued == 0) {
-            if (!m_queue->empty() || !m_running.load(std::memory_order_acquire) ||
-                m_need_flush.load(std::memory_order_acquire)) {
+            bool has_data = false;
+            {
+                std::lock_guard<std::mutex> lk(m_slot_mutex);
+                for (auto& slp : m_slots)
+                    if (slp && !slp->dead && !slp->queue->empty())
+                        { has_data = true; break; }
+            }
+            if (has_data || !m_running.load(std::memory_order_acquire) ||
+                m_need_flush.load(std::memory_order_acquire))
                 continue;
-            }
-            // constexpr auto kSpinL1 = 32;
-            // constexpr auto kSpinL2 = 200;
-            // bool continue_flag = false;
-            // for (int i = 0; i < kSpinL2; ++i) {
-            //     if (!m_queue->empty() || !m_running.load(std::memory_order_acquire) ||
-            //         m_need_flush.load(std::memory_order_acquire)) {
-            //         continue_flag = true;
-            //         break;
-            //     }
-            //     if (i < kSpinL1) {
-            //         cpu_pause();
-            //     } else {
-            //         std::this_thread::yield();
-            //     }
-            // }
-            // if (continue_flag) {
-            //     continue;
-            // }
 
-            std::unique_lock<std::mutex> cv_lock(m_consumer_mutex);
-            // m_consumer_signal.wait(std::memory_order_acquire);
-            now = std::chrono::steady_clock::now();
-            auto next_deadline = last_flush_time + std::chrono::milliseconds(m_flush_interval_ms);
-            auto remaining = next_deadline - now;
-            if (remaining < std::chrono::milliseconds(0)) {
-                // remaining = std::chrono::milliseconds(0);
-                continue;
-            }
-            m_consumer_cv.wait_for(cv_lock, remaining, [this] {
-                return !m_queue->empty() || !m_running.load(std::memory_order_acquire) ||
-                       m_need_flush.load(std::memory_order_acquire);
+            std::unique_lock<std::mutex> cvlk(m_consumer_mutex);
+            auto now = std::chrono::steady_clock::now();
+            auto rem = last_flush + std::chrono::milliseconds(m_flush_interval_ms) - now;
+            if (rem < std::chrono::milliseconds(0)) continue;
+            m_consumer_cv.wait_for(cvlk, rem, [this]{
+                if (!m_running.load(std::memory_order_acquire) ||
+                    m_need_flush.load(std::memory_order_acquire)) return true;
+                std::lock_guard<std::mutex> lk(m_slot_mutex);
+                for (auto& slp : m_slots)
+                    if (slp && !slp->dead && !slp->queue->empty()) return true;
+                return false;
             });
         }
     }
 
-    while (m_queue && m_queue->tryDequeue(entry)) {
-        write_buffer.append(entry.data.data(), entry.size);
-    }
-
-    if (!write_buffer.empty()) {
-        // std::lock_guard<std::mutex> file_lock(m_file_mutex);
-        if (m_log_file.is_open()) {
-            m_log_file.write(write_buffer.data(), static_cast<std::streamsize>(write_buffer.size()));
-            m_log_file.flush();
+    // Final drain
+    {
+        std::lock_guard<std::mutex> lk(m_slot_mutex);
+        for (auto& slp : m_slots) {
+            if (!slp) continue;
+            for (;;) {
+                std::size_t n = 0;
+                while (n < kMaxDequeuePerRound && slp->queue->tryDequeue(batch[n])) ++n;
+                if (n == 0) break;
+                for (std::size_t i = 0; i < n; ++i) formatLine(batch[i]);
+            }
         }
     }
+    {
+        std::lock_guard<std::mutex> lk(m_write_mutex);
+        if (!wb.empty()) {
+            m_write_buf.swap(wb);
+            m_write_ready = true;
+        }
+        m_write_cv.notify_one();
+    }
+}
+
+void Logger::writeThreadRun() {
+    std::string buf;
+    buf.reserve(kWriteBufferReserve);
+    auto last_flush = std::chrono::steady_clock::now();
+
+    while (m_running.load(std::memory_order_acquire) || m_write_ready) {
+        {
+            std::unique_lock<std::mutex> lk(m_write_mutex);
+            m_write_cv.wait(lk, [this]{
+                return m_write_ready || !m_running.load(std::memory_order_acquire);
+            });
+            if (m_write_ready) {
+                buf.swap(m_write_buf);
+                m_write_ready = false;
+            } else if (!m_running.load(std::memory_order_acquire)) {
+                break;
+            }
+        }
+
+        if (!buf.empty()) {
+            if (m_log_fd >= 0) [[likely]] {
+                rotateIfNeeded();
+                auto* data = buf.data();
+                auto size = buf.size();
+                auto written = ::write(m_log_fd, data, size);
+                if (written > 0) m_current_file_size += static_cast<std::size_t>(written);
+            } else std::cerr.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+            buf.clear();
+        }
+
+        bool f = m_need_flush.exchange(false, std::memory_order_acq_rel);
+        auto now = std::chrono::steady_clock::now();
+        bool tf = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush).count()
+                  >= static_cast<long long>(m_flush_interval_ms);
+        if ((f || tf) && m_log_fd >= 0) [[likely]] { fsync(m_log_fd); last_flush = now; }
+    }
+
+    // Final flush
+    if (!buf.empty() && m_log_fd >= 0) {
+        ::write(m_log_fd, buf.data(), buf.size());
+        fsync(m_log_fd);
+    }
     closeLogFile();
+}
+
+// ── Crash handler ───────────────────────────────────────────────────
+namespace {
+std::atomic<int> g_crash_installed{0};
+} // namespace
+
+extern "C" void rocketCrashHandler(int sig) {
+    rocket::Logger::getInstance().flushAll();
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+
+namespace {
+void atexitFlush() { rocket::Logger::getInstance().flushAll(); }
+} // namespace
+
+void Logger::installCrashHandler() {
+    if (g_crash_installed.exchange(1)) return; // once
+
+    struct sigaction sa{};
+    sa.sa_handler = rocketCrashHandler;
+    sigemptyset(&sa.sa_mask);
+
+    for (int sig : {SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL}) {
+        sigaction(sig, &sa, nullptr);
+    }
+    std::atexit(atexitFlush);
 }
 
 void Logger::openLogFile() {
     std::error_code ec;
-    const auto parent = m_file_path.parent_path();
-    if (!parent.empty()) {
-        std::filesystem::create_directories(parent, ec);
-    }
-
-    m_log_file.open(m_file_path, std::ios::app);
-    if (!m_log_file.is_open()) {
-        return;
-    }
-
-    m_current_file_size = 0;
-    if (std::filesystem::exists(m_file_path, ec)) {
+    auto p = m_file_path.parent_path();
+    if (!p.empty()) std::filesystem::create_directories(p, ec);
+    m_log_fd = ::open(m_file_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (m_log_fd >= 0 && std::filesystem::exists(m_file_path, ec))
         m_current_file_size = std::filesystem::file_size(m_file_path, ec);
-    }
 }
-
 void Logger::closeLogFile() {
-    if (m_log_file.is_open()) {
-        m_log_file.flush();
-        m_log_file.close();
-    }
+    if (m_log_fd >= 0) { fsync(m_log_fd); ::close(m_log_fd); m_log_fd = -1; }
 }
-
 void Logger::rotateIfNeeded() {
-    if (m_max_file_size == 0 || m_current_file_size < m_max_file_size) {
-        return;
-    }
-
+    if (m_max_file_size == 0 || m_current_file_size < m_max_file_size) return;
     closeLogFile();
-
-    const auto now = std::chrono::system_clock::now();
-    const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-    const auto rotated = m_file_path.string() + "." + std::to_string(stamp);
-
+    auto ts = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     std::error_code ec;
-    std::filesystem::rename(m_file_path, rotated, ec);
+    std::filesystem::rename(m_file_path, m_file_path.string() + "." + std::to_string(ts), ec);
     openLogFile();
 }
 

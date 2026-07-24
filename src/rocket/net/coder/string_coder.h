@@ -89,10 +89,11 @@ class StringCoder : public AbstractCoder {
      *
      * 注意：这会清空缓冲区的所有数据
      */
-    void decode(std::vector<AbstractProtocol::s_ptr>& out_messages, TcpBuffer::s_ptr buffer) override {
+    DecodeResult decode(TcpBuffer::s_ptr buffer) override {
+        DecodeResult result;
         const std::size_t readable = buffer->readAble();
         if (readable == 0) {
-            return;
+            return result;
         }
 
         std::vector<char> data;
@@ -102,7 +103,8 @@ class StringCoder : public AbstractCoder {
         msg->info.assign(data.begin(), data.end());
         msg->m_msg_id = "string_msg";
 
-        out_messages.push_back(msg);
+        result.messages.push_back(msg);
+        return result;
     }
 };
 

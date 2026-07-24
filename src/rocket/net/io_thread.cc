@@ -5,6 +5,10 @@
 #include <mutex>
 #include <thread>
 
+#ifdef __linux__
+#include <pthread.h>
+#endif
+
 namespace rocket {
 
 IOThread::IOThread() = default;
@@ -14,12 +18,34 @@ IOThread::~IOThread() {
         m_event_loop->stop();
     }
     if (m_thread && m_thread->joinable()) {
-        m_thread->join();
+        if (m_thread->get_id() == std::this_thread::get_id()) {
+            m_thread->detach();
+        } else {
+            m_thread->join();
+        }
     }
 }
 
 void IOThread::threadFunc() {
     EventLoop loop;
+
+#ifdef __linux__
+    // Pin IO thread to a dedicated core (skip core 0 for the main thread).
+    // Hical / brpc pattern: prevents TLB flush and cache-line ping-pong
+    // caused by the kernel migrating the thread across cores.
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        unsigned int ncpus = std::thread::hardware_concurrency();
+        if (ncpus > 1) {
+            CPU_SET((m_index + 1) % ncpus, &cpuset);
+        } else {
+            CPU_SET(0, &cpuset);
+        }
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        ROCKET_LOG_DEBUG("IOThread [{}] pinned to cpu {}", m_index, (m_index + 1) % ncpus);
+    }
+#endif
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -46,7 +72,8 @@ void IOThread::threadFunc() {
 
 EventLoop* IOThread::getEventLoop() const noexcept { return m_event_loop; }
 
-void IOThread::start() {
+void IOThread::start(std::size_t index) {
+    m_index = index;
     m_thread = std::make_unique<std::thread>(&IOThread::threadFunc, this);
 
     {
@@ -67,7 +94,11 @@ void IOThread::join() {
         m_event_loop->stop();
     }
     if (m_thread && m_thread->joinable()) {
-        m_thread->join();
+        if (m_thread->get_id() == std::this_thread::get_id()) {
+            m_thread->detach();
+        } else {
+            m_thread->join();
+        }
     }
 }
 

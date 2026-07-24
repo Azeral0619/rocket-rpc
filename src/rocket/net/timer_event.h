@@ -17,8 +17,12 @@ class TimerEvent {
 
     TimerEvent(const TimerEvent&) = delete;
     TimerEvent& operator=(const TimerEvent&) = delete;
-    TimerEvent(TimerEvent&&) noexcept = default;
-    TimerEvent& operator=(TimerEvent&&) noexcept = default;
+    TimerEvent(TimerEvent&&) noexcept = delete;
+    TimerEvent& operator=(TimerEvent&&) noexcept = delete;
+
+    // Pooled factory — prefer over make_shared for short-lived events.
+    // Returns a shared_ptr with a custom deleter that recycles the memory.
+    static s_ptr create(std::int64_t interval, bool is_repeated, std::function<void()> cb);
 
     [[nodiscard]] std::int64_t getArriveTime() const noexcept { return m_arrive_time; }
 

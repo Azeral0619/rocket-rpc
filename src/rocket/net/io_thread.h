@@ -22,7 +22,7 @@ class IOThread {
 
     [[nodiscard]] EventLoop* getEventLoop() const noexcept;
 
-    void start();
+    void start(std::size_t index = 0);
 
     void join();
 
@@ -36,6 +36,7 @@ class IOThread {
     std::unique_ptr<std::thread> m_thread;
     std::thread::id m_thread_id;
     EventLoop* m_event_loop{nullptr};
+    std::size_t m_index{0};
 
     std::mutex m_mutex;
     std::condition_variable m_init_cv;

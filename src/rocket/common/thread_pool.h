@@ -34,6 +34,8 @@ class ThreadPool {
 
     void execute(std::function<void()> task);
 
+    void stopAndDrain();
+
     [[nodiscard]] std::size_t threadCount() const noexcept { return m_workers.size(); }
     [[nodiscard]] std::size_t pendingCount() const;
 
@@ -113,6 +115,18 @@ inline void ThreadPool::execute(std::function<void()> task) {
 inline std::size_t ThreadPool::pendingCount() const {
     std::lock_guard lock(m_mutex);
     return m_tasks.size();
+}
+
+inline void ThreadPool::stopAndDrain() {
+    {
+        std::lock_guard lock(m_mutex);
+        m_stop = true;
+    }
+    m_cv.notify_all();
+    // Join all workers — they will exit once the task queue is empty.
+    for (auto& worker : m_workers) {
+        if (worker.joinable()) worker.join();
+    }
 }
 
 } // namespace rocket

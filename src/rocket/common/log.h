@@ -14,13 +14,12 @@
 #include <ctime>
 #include <filesystem>
 #include <fmt/base.h>
-#include <fstream>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <string_view>
-#include <sys/types.h>
 #include <thread>
-#include <vector>
+#include <deque>
 
 #include <fmt/format.h>
 #include <fmt/std.h>
@@ -30,34 +29,28 @@
 #include <unistd.h>
 #elif defined(_WIN32)
 #include <windows.h>
-#else
-#include <functional>
+#elif defined(__APPLE__)
+#include <pthread.h>
 #endif
 
 namespace rocket {
 
 #ifndef ROCKET_MIN_LOG_LEVEL
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define ROCKET_MIN_LOG_LEVEL 0
+#ifdef NDEBUG
+#define ROCKET_MIN_LOG_LEVEL 1   // release: strip DEBUG
+#else
+#define ROCKET_MIN_LOG_LEVEL 0   // debug: keep all
+#endif
 #endif
 
-enum class LogLevel : std::uint8_t {
-    Debug = 0,
-    Info = 1,
-    Warn = 2,
-    Error = 3,
-};
+enum class LogLevel : std::uint8_t { Debug = 0, Info = 1, Warn = 2, Error = 3 };
 
 [[nodiscard]] constexpr std::string_view LogLevelToString(LogLevel level) {
     switch (level) {
-    case LogLevel::Debug:
-        return "DEBUG";
-    case LogLevel::Info:
-        return "INFO";
-    case LogLevel::Warn:
-        return "WARN";
-    case LogLevel::Error:
-        return "ERROR";
+    case LogLevel::Debug: return "DEBUG";
+    case LogLevel::Info:  return "INFO";
+    case LogLevel::Warn:  return "WARN";
+    case LogLevel::Error: return "ERROR";
     }
     return "UNKNOWN";
 }
@@ -65,23 +58,225 @@ enum class LogLevel : std::uint8_t {
 class Logger final : public Singleton<Logger> {
   public:
     static constexpr std::size_t kDefaultQueueCapacity = 1U << 14;
-    static constexpr std::size_t kLogDataSize = 1024;
+    // Queue capacity in *bytes* (not entries), Quill-style.
+    // 256 KB ≅ 3500 entries @ 72 B/entry — plenty for burst absorption.
+    static constexpr std::size_t kPerThreadQueueBytes = 256 * 1024;
     static constexpr std::size_t kDefaultFlushIntervalMs = 50;
     static constexpr std::size_t kDefaultMaxFileSize = 1024ULL * 1024ULL * 1024ULL;
-    static constexpr std::size_t kCacheLineSize = 64;
 
     struct LogEntry {
+        // Per-arg codec: encode arguments with type tag + compact value inline.
+        // Consumer reconstructs fmt::format_args via a switch.  No fmt internals.
+        static constexpr std::size_t kFmtStorageSize = 80;
+
+        enum class ArgType : std::uint8_t {
+            Int = 0, Uint, Int64, Uint64, Double, Bool,
+            Cstring, StringView, Ptr
+        };
+
+        template <typename... Args>
+        void setArgs(fmt::string_view fmt, Args&&... args) {
+            constexpr int N = static_cast<int>(sizeof...(Args));
+            num_args = static_cast<std::uint8_t>(N);
+            fmt_ptr = fmt.data();
+            fmt_len = static_cast<std::uint16_t>(fmt.size());
+
+            if constexpr (N == 0) return;
+
+            auto store = fmt::make_format_args(args...);
+            auto fargs = fmt::format_args(store);
+
+            // ── Pass 1: measure total size ──────────────────────────
+            // Layout: [num_args=1B] [N×tag] [values…] [string data…]
+            uint8_t tags[15];
+            const char* str_datas[16];
+            size_t str_sizes[16];
+            int nf = 0;
+            size_t total = 1 + static_cast<size_t>(N);          // header + tags
+            total = (total + 7) & ~static_cast<size_t>(7);      // align values to 8B
+
+            for (int i = 0; i < N; ++i) {
+                ArgType tag = ArgType::Int;
+                fargs.get(i).visit([&](auto val) {
+                    using T = std::decay_t<decltype(val)>;
+                    if constexpr (std::is_same_v<T, int>) {
+                        tag = ArgType::Int; total += 4;
+                    } else if constexpr (std::is_same_v<T, unsigned int>) {
+                        tag = ArgType::Uint; total += 4;
+                    } else if constexpr (std::is_same_v<T, long long>) {
+                        tag = ArgType::Int64; total += 8;
+                    } else if constexpr (std::is_same_v<T, unsigned long long>) {
+                        tag = ArgType::Uint64; total += 8;
+                    } else if constexpr (std::is_same_v<T, double>) {
+                        tag = ArgType::Double; total += 8;
+                    } else if constexpr (std::is_same_v<T, bool>) {
+                        tag = ArgType::Bool; total += 1;
+                    } else if constexpr (std::is_same_v<T, const char*>) {
+                        tag = ArgType::Cstring;
+                        total += 2;  // offset
+                        if (val) {
+                            str_datas[nf] = val;
+                            str_sizes[nf] = strlen(val) + 1;
+                            total += str_sizes[nf];
+                            ++nf;
+                        }
+                    } else if constexpr (std::is_same_v<T, fmt::string_view>) {
+                        tag = ArgType::StringView;
+                        total += 2 + 8;  // offset + size
+                        str_datas[nf] = val.data();
+                        str_sizes[nf] = val.size();
+                        total += str_sizes[nf];
+                        ++nf;
+                    } else {
+                        tag = ArgType::Ptr;
+                        total += sizeof(val);
+                    }
+                });
+                tags[i] = static_cast<uint8_t>(tag);
+            }
+
+            // ── Allocate (inline or heap) ──────────────────────────
+            char* dst;
+            if (total <= kFmtStorageSize) {
+                heap_allocated = false;
+                dst = fmt_data;
+            } else {
+                heap_allocated = true;
+                dst = new char[total];
+                arg_data = dst;
+            }
+
+            // ── Pass 2: encode ─────────────────────────────────────
+            dst[0] = static_cast<char>(N);
+            for (int i = 0; i < N; ++i) dst[1 + i] = static_cast<char>(tags[i]);
+            char* p = dst + 1 + N;
+            p = alignPtr(p, 8);
+
+            uint16_t* off_buf[16];
+            nf = 0;
+            for (int i = 0; i < N; ++i) {
+                encodeOneArg(p, fargs.get(i), str_datas, str_sizes, off_buf, nf);
+            }
+            for (int j = 0; j < nf; ++j) {
+                *off_buf[j] = static_cast<uint16_t>(p - dst);
+                memcpy(p, str_datas[j], str_sizes[j]);
+                p += str_sizes[j];
+            }
+        }
+
+        void runFormat(std::string& out) {
+            if (num_args == 0) return;
+            auto* data = heap_allocated ? arg_data : fmt_data;
+            auto* base = data;
+            int n = static_cast<int>(*data++);
+            const auto* tags = reinterpret_cast<const uint8_t*>(data);
+            const char* p = alignPtr(data + n, 8);
+
+            fmt::basic_format_arg<fmt::format_context> decoded[15];
+            for (int i = 0; i < n; ++i)
+                p = decodeOneArg(base, p, static_cast<ArgType>(tags[i]), decoded[i]);
+
+            fmt::basic_format_args<fmt::format_context> fargs(decoded, n);
+            fmt::vformat_to(std::back_inserter(out),
+                fmt::string_view(fmt_ptr, fmt_len), fargs);
+
+            if (heap_allocated) delete[] arg_data;
+        }
+
+      private:
+        static const char* alignPtr(const char* p, int a) {
+            auto v = reinterpret_cast<uintptr_t>(p);
+            return reinterpret_cast<const char*>((v + a - 1) & ~static_cast<uintptr_t>(a - 1));
+        }
+        static char* alignPtr(char* p, int a) {
+            auto v = reinterpret_cast<uintptr_t>(p);
+            return reinterpret_cast<char*>((v + a - 1) & ~static_cast<uintptr_t>(a - 1));
+        }
+
+        static ArgType encodeOneArg(char*& p, fmt::basic_format_arg<fmt::format_context> arg,
+                                    const char* datas[], size_t sizes[], uint16_t* offs[], int& nf) {
+            ArgType tag = ArgType::Int;
+            arg.visit([&](auto val) {
+                using T = std::decay_t<decltype(val)>;
+                if constexpr (std::is_same_v<T, int>) {
+                    tag = ArgType::Int; memcpy(p, &val, 4); p += 4;
+                } else if constexpr (std::is_same_v<T, unsigned int>) {
+                    tag = ArgType::Uint; memcpy(p, &val, 4); p += 4;
+                } else if constexpr (std::is_same_v<T, long long>) {
+                    tag = ArgType::Int64; memcpy(p, &val, 8); p += 8;
+                } else if constexpr (std::is_same_v<T, unsigned long long>) {
+                    tag = ArgType::Uint64; memcpy(p, &val, 8); p += 8;
+                } else if constexpr (std::is_same_v<T, double>) {
+                    tag = ArgType::Double; memcpy(p, &val, 8); p += 8;
+                } else if constexpr (std::is_same_v<T, bool>) {
+                    tag = ArgType::Bool; *p++ = val ? 1 : 0;
+                } else if constexpr (std::is_same_v<T, const char*>) {
+                    tag = ArgType::Cstring;
+                    offs[nf] = reinterpret_cast<uint16_t*>(p); p += 2;
+                    if (val) { datas[nf] = val; sizes[nf] = strlen(val) + 1; ++nf; }
+                } else if constexpr (std::is_same_v<T, fmt::string_view>) {
+                    tag = ArgType::StringView;
+                    offs[nf] = reinterpret_cast<uint16_t*>(p); p += 2;
+                    reinterpret_cast<size_t*>(p)[0] = val.size(); p += 8;
+                    datas[nf] = val.data(); sizes[nf] = val.size(); ++nf;
+                } else if constexpr (std::is_same_v<T, const void*>) {
+                    tag = ArgType::Ptr; memcpy(p, &val, 8); p += 8;
+                } else {
+                    tag = ArgType::Ptr; // fallback
+                    memcpy(p, &val, sizeof(val)); p += sizeof(val);
+                }
+            });
+            return tag;
+        }
+
+        static const char* decodeOneArg(const char* base, const char* p, ArgType tag,
+                                        fmt::basic_format_arg<fmt::format_context>& out) {
+            switch (tag) {
+            case ArgType::Int:    { int v; memcpy(&v, p, 4); p += 4; out = farg(v); break; }
+            case ArgType::Uint:   { unsigned v; memcpy(&v, p, 4); p += 4; out = farg(v); break; }
+            case ArgType::Int64:  { long long v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
+            case ArgType::Uint64: { unsigned long long v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
+            case ArgType::Double: { double v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
+            case ArgType::Bool:   { bool v = *p++; out = farg(v); break; }
+            case ArgType::Cstring:{
+                uint16_t off; memcpy(&off, p, 2); p += 2;
+                out = farg(off ? reinterpret_cast<const char*>(base + off) : ""); break;
+            }
+            case ArgType::StringView: {
+                uint16_t off; memcpy(&off, p, 2); p += 2;
+                size_t sz; memcpy(&sz, p, 8); p += 8;
+                out = farg(fmt::string_view(reinterpret_cast<const char*>(base + off), sz)); break;
+            }
+            case ArgType::Ptr:    { const void* v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
+            default:              { const void* v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
+            }
+            return p;
+        }
+
+        template <typename T>
+        static fmt::basic_format_arg<fmt::format_context> farg(T&& v) {
+            return fmt::basic_format_arg<fmt::format_context>(static_cast<T&&>(v));
+        }
+
+      public:
         std::uint64_t thread_id{0};
         std::uint64_t timestamp_ns{0};
-        std::uint32_t level{0};
-        std::uint32_t size{0};
-        bool truncated{false};
-        std::array<char, kLogDataSize> data{};
+        std::uint8_t level{0};
+        // RunTime metadata — copied eagerly to avoid dangling pointers to
+        // thread-local std::string data.  SSO covers the common case.
+        std::string msgid;
+        std::string method_name;
+        std::uint8_t num_args{0};
+        bool heap_allocated{false};
+        const char* fmt_ptr{nullptr};
+        std::uint16_t fmt_len{0};
+        char* arg_data{fmt_data};
+        alignas(std::max_align_t) char fmt_data[kFmtStorageSize];
     };
 
     struct Options {
         std::filesystem::path file_path{"./rocket_rpc.log"};
-        std::size_t queue_capacity{kDefaultQueueCapacity};
+        std::size_t per_thread_queue_bytes{kPerThreadQueueBytes};
         std::size_t flush_interval_ms{kDefaultFlushIntervalMs};
         std::size_t max_file_size{kDefaultMaxFileSize};
         LogLevel level{LogLevel::Debug};
@@ -101,196 +296,172 @@ class Logger final : public Singleton<Logger> {
 
     void flush();
 
+    // Emergency flush: attempt to write all buffered data to disk.
+    // Async-signal-safe-ish: avoids heap allocation, uses try_lock.
+    // Call from signal handlers (SIGSEGV/SIGABRT) or atexit hooks.
+    void flushAll();
+
+    // Install signal handlers that call flushAll() on SIGSEGV/SIGABRT/SIGBUS/SIGFPE.
+    // Registers with atexit as well.  Idempotent (install once).
+    static void installCrashHandler();
+
     void setLevel(LogLevel level) noexcept;
     [[nodiscard]] LogLevel level() const noexcept;
     [[nodiscard]] bool isRunning() const noexcept;
+    [[nodiscard]] std::uint64_t getDroppedCount() const noexcept {
+        return m_dropped_count.load(std::memory_order_relaxed);
+    }
 
   private:
+    // ── SPSC bounded ring queue (one per thread, single producer, no CAS) ──
     template <typename T>
-    class MpscRingQueue {
+    class SpscBoundedQueue {
       public:
-        explicit MpscRingQueue(std::size_t capacity);
-
-        [[nodiscard]] bool enqueue(T&& item);
+        static constexpr std::size_t kCacheLine = 64;
+        explicit SpscBoundedQueue(std::size_t cap);
+        [[nodiscard]] T* tryClaim();
+        void publish();
         [[nodiscard]] bool tryDequeue(T& out);
-        bool empty() { return m_enqueue_pos.load(std::memory_order_acquire) == m_dequeue_pos; }
-
+        [[nodiscard]] bool empty() const noexcept;
       private:
-
-        struct alignas(kCacheLineSize) Cell {
+        struct alignas(kCacheLine) Cell {
             std::atomic<std::size_t> sequence;
             T storage;
-
             Cell() noexcept : sequence(0), storage() {}
-            ~Cell() = default;
-            Cell(const Cell&) = delete;
-            Cell& operator=(const Cell&) = delete;
-            Cell(Cell&& other) noexcept
-                : sequence(other.sequence.load(std::memory_order_relaxed)), storage(std::move(other.storage)) {}
-
-            Cell& operator=(Cell&& other) noexcept {
-                if (this != &other) {
-                    sequence.store(other.sequence.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    storage = std::move(other.storage);
-                }
-                return *this;
-            }
+            Cell(Cell&&) = delete;
         };
+        std::size_t m_mask, m_capacity;
+        std::unique_ptr<Cell[]> m_buffer;
+        std::size_t m_pos{0};              // producer only
+        alignas(kCacheLine) std::size_t m_dq{0};  // consumer only, no atomic needed
+    };
 
-        std::size_t m_mask{0};
-        std::size_t m_capacity{0};
-        std::vector<Cell> m_buffer;
-        alignas(kCacheLineSize) std::atomic<std::size_t> m_enqueue_pos{0};
-        alignas(kCacheLineSize) std::size_t m_dequeue_pos{0};
+    // ── Per-thread state ────────────────────────────────────────────────
+    struct ThreadSlot {
+        std::unique_ptr<SpscBoundedQueue<LogEntry>> queue;
+        std::thread::id tid;
+        std::uint64_t generation{0};
+        bool dead{false}; // guarded by m_slot_mutex
     };
 
     friend class Singleton<Logger>;
     Logger() = default;
     ~Logger();
-
     void consumerRun();
+    void writeThreadRun();
     void ensureStarted();
+    std::shared_ptr<ThreadSlot> registerThisThread();
     void openLogFile();
     void closeLogFile();
     void rotateIfNeeded();
 
-    static constexpr std::size_t kMaxDequeuePerRound = 256;
-    static constexpr std::size_t kWriteBufferReserve = 64ULL * 1024;
-    static constexpr int kYearBase = 1900;
-    static constexpr std::uint32_t kNotifyEveryNEnqueue = 32;
+    static constexpr std::size_t kMaxDequeuePerRound = 1024;       // ~150KB per round
+    static constexpr std::size_t kWriteThreshold = 256ULL * 1024;  // batch to this size before ::write
+    static constexpr std::size_t kWriteBufferReserve = 256ULL * 1024;
+    static constexpr std::uint32_t kNotifyEveryNEnqueue = 16;
     static constexpr std::uint32_t kNotifyMask = kNotifyEveryNEnqueue - 1;
 
-    std::unique_ptr<MpscRingQueue<LogEntry>> m_queue;
-
-    std::jthread m_consumer;
+    // config
+    std::size_t m_per_thread_bytes{kPerThreadQueueBytes};
+    std::filesystem::path m_file_path;
+    std::size_t m_flush_interval_ms{kDefaultFlushIntervalMs};
+    std::size_t m_max_file_size{kDefaultMaxFileSize};
     std::atomic<bool> m_running{false};
     std::atomic<LogLevel> m_level{LogLevel::Debug};
     std::atomic<bool> m_need_flush{false};
 
-    std::filesystem::path m_file_path;
-    std::size_t m_flush_interval_ms{kDefaultFlushIntervalMs};
-    std::size_t m_max_file_size{kDefaultMaxFileSize};
+    // clock calibration
+    std::uint64_t m_epoch_ns{0};
+    std::chrono::steady_clock::time_point m_base_steady{};
 
+    // sync (destroyed AFTER thread/queues)
     std::mutex m_lifecycle_mutex;
-    // std::mutex m_file_mutex;
     std::condition_variable m_consumer_cv;
     std::mutex m_consumer_mutex;
-    // alignas(kCacheLineSize) std::atomic<std::uint32_t> m_consumer_signal{0};
-    // std::atomic<bool> m_data_ready{false};
 
-    std::ofstream m_log_file;
+    // per-thread queue registry
+    std::atomic<std::uint64_t> m_generation{0};
+    std::mutex m_slot_mutex;
+    std::deque<std::shared_ptr<ThreadSlot>> m_slots;
+    std::size_t m_poll_index{0};
+
+    // consumer (format thread)
+    std::jthread m_consumer;
+
+    // write thread (I/O, separate from format thread)
+    std::jthread m_writer;
+    std::string m_fmt_buf; // format thread writes here
+    std::string m_write_buf; // handed to write thread
+    std::mutex m_write_mutex;
+    std::condition_variable m_write_cv;
+    bool m_write_ready{false};
+
+    // file (raw fd — no stdio overhead)
+    int m_log_fd{-1};
     std::size_t m_current_file_size{0};
 
+    // counters
     std::atomic<std::uint64_t> m_dropped_count{0};
-    alignas(kCacheLineSize) std::atomic<std::uint32_t> m_enqueue_notify_counter{0};
+    alignas(SpscBoundedQueue<LogEntry>::kCacheLine) std::atomic<std::uint32_t> m_enqueue_notify_counter{0};
 };
 
 template <typename... Args>
 void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args) {
-    if (static_cast<std::uint8_t>(level) < static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed))) {
+    if (static_cast<std::uint8_t>(level) < static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed)))
         return;
-    }
-
     ensureStarted();
 
-    static thread_local LogEntry entry;
     static thread_local std::uint64_t cached_tid = []() {
 #if defined(__linux__)
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
         return static_cast<std::uint64_t>(::syscall(SYS_gettid));
 #elif defined(_WIN32)
         return static_cast<std::uint64_t>(::GetCurrentThreadId());
+#elif defined(__APPLE__)
+        std::uint64_t tid{0}; ::pthread_threadid_np(nullptr, &tid); return tid;
 #else
         return std::hash<std::thread::id>{}(std::this_thread::get_id());
 #endif
     }();
-    entry.thread_id = cached_tid;
-    entry.timestamp_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    entry.level = static_cast<std::uint32_t>(level);
 
-    constexpr std::uint64_t kNanosPerSecond = 1'000'000'000ULL;
-    constexpr std::uint64_t kNanosPerMilli = 1'000'000ULL;
-    constexpr int kYearBase = 1900;
+    // ── steady_clock based timestamp (saves ~30ns vs system_clock) ──────
+    const auto now_steady = std::chrono::steady_clock::now();
+    const std::uint64_t now_ns = m_epoch_ns +
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now_steady - m_base_steady).count());
 
-    const auto secs = static_cast<std::time_t>(entry.timestamp_ns / kNanosPerSecond);
-    const auto millis = static_cast<int>((entry.timestamp_ns % kNanosPerSecond) / kNanosPerMilli);
+    constexpr std::uint64_t NS_PER_SEC = 1'000'000'000ULL;
+    const auto secs = static_cast<std::time_t>(now_ns / NS_PER_SEC);
+    const auto millis = static_cast<int>((now_ns % NS_PER_SEC) / 1'000'000ULL);
 
-    constexpr std::size_t kDateTimeBufferSize = 32;
-    static thread_local struct {
-        std::time_t last_sec{0};
-        std::array<char, kDateTimeBufferSize> datetime_buf{};
-        std::size_t len{0};
-    } time_cache;
+    // ── lazy-init per-thread SPSC queue ──────────────────────────────────
+    static thread_local std::shared_ptr<ThreadSlot> t_slot;
+    if (!t_slot || t_slot->generation != m_generation.load(std::memory_order_acquire)) [[unlikely]]
+        t_slot = registerThisThread();
 
-    if (secs != time_cache.last_sec) {
-        std::tm tm_buf{};
-#if defined(_WIN32)
-        localtime_s(&tm_buf, &secs);
-#else
-        localtime_r(&secs, &tm_buf);
-#endif
-        auto result = fmt::format_to_n(time_cache.datetime_buf.data(), time_cache.datetime_buf.size() - 1,
-                                       "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", tm_buf.tm_year + kYearBase,
-                                       tm_buf.tm_mon + 1, tm_buf.tm_mday, tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-        time_cache.len = result.size;
-        time_cache.last_sec = secs;
-    }
-
-    auto prefix_result = fmt::format_to_n(entry.data.data(), kLogDataSize - 1, "{}.{:03d} [{}] [tid={}]",
-                                          std::string_view(time_cache.datetime_buf.data(), time_cache.len), millis,
-                                          LogLevelToString(level), entry.thread_id);
-
-    auto& msgId = RunTime::GetRunTime()->m_msgid;
-    auto& methodName = RunTime::GetRunTime()->m_method_name;
-
-    auto prefix_len = std::min(prefix_result.size, kLogDataSize - 1);
-
-    if (!msgId.empty()) {
-        auto msgid_result =
-            fmt::format_to_n(entry.data.data() + prefix_len, kLogDataSize - prefix_len - 1, " [msgid={}]", msgId);
-        prefix_len = std::min(prefix_len + msgid_result.size, kLogDataSize - 1);
-    }
-
-    if (!methodName.empty()) {
-        auto method_result =
-            fmt::format_to_n(entry.data.data() + prefix_len, kLogDataSize - prefix_len - 1, " [method={}]", methodName);
-        prefix_len = std::min(prefix_len + method_result.size, kLogDataSize - 1);
-    }
-
-    if (prefix_len < kLogDataSize - 1) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
-        entry.data[prefix_len++] = ' ';
-    }
-
-    const auto remaining = kLogDataSize - prefix_len - 5;
-    auto msg_result = fmt::format_to_n(entry.data.data() + prefix_len, remaining, fmt, std::forward<Args>(args)...);
-
-    const bool msg_truncated = msg_result.size >= remaining;
-    auto total_len = prefix_len + std::min(msg_result.size, remaining);
-
-    if (msg_truncated) {
-        entry.data[total_len] = '.';
-        entry.data[total_len + 1] = '.';
-        entry.data[total_len + 2] = '.';
-        total_len += 3;
-    }
-
-    entry.data[total_len++] = '\n';
-
-    entry.size = static_cast<std::uint32_t>(total_len);
-    entry.truncated = msg_truncated;
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
-    entry.data[entry.size] = '\0';
-
-    if (!m_queue->enqueue(LogEntry{entry})) {
+    auto slot = t_slot->queue->tryClaim();
+    if (!slot) [[unlikely]] {
         m_dropped_count.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if ((m_enqueue_notify_counter.fetch_add(1, std::memory_order_relaxed) & kNotifyMask) == kNotifyMask) {
-            m_consumer_cv.notify_one();
-        }
+        return;
     }
+
+    // ── capture metadata ───────────────────────────────────────────────
+    auto& entry = *slot;
+    entry.thread_id = cached_tid;
+    entry.timestamp_ns = now_ns;
+    entry.level = static_cast<std::uint8_t>(level);
+    auto* rt = RunTime::GetRunTime();
+    // Copy into std::string — SSO avoids heap allocation for short values,
+    // and ownership is cleanly transferred to the consumer thread.
+    entry.msgid = rt->m_msgid;
+    entry.method_name = rt->m_method_name;
+
+    // ── deferred format: consumer calls this to emit the user message ───
+    entry.setArgs(fmt.str, std::forward<Args>(args)...);
+
+    t_slot->queue->publish();
+
+    if ((m_enqueue_notify_counter.fetch_add(1, std::memory_order_relaxed) & kNotifyMask) == kNotifyMask)
+        m_consumer_cv.notify_one();
 }
 
 } // namespace rocket
@@ -300,19 +471,16 @@ void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args
 #else
 #define ROCKET_LOG_DEBUG(fmt, ...) (void)0
 #endif
-
 #if ROCKET_MIN_LOG_LEVEL <= 1
-#define ROCKET_LOG_INFO(fmt, ...) ::rocket::Logger::getInstance().log(::rocket::LogLevel::Info, fmt, ##__VA_ARGS__)
+#define ROCKET_LOG_INFO(fmt, ...)  ::rocket::Logger::getInstance().log(::rocket::LogLevel::Info, fmt, ##__VA_ARGS__)
 #else
 #define ROCKET_LOG_INFO(fmt, ...) (void)0
 #endif
-
 #if ROCKET_MIN_LOG_LEVEL <= 2
-#define ROCKET_LOG_WARN(fmt, ...) ::rocket::Logger::getInstance().log(::rocket::LogLevel::Warn, fmt, ##__VA_ARGS__)
+#define ROCKET_LOG_WARN(fmt, ...)  ::rocket::Logger::getInstance().log(::rocket::LogLevel::Warn, fmt, ##__VA_ARGS__)
 #else
 #define ROCKET_LOG_WARN(fmt, ...) (void)0
 #endif
-
 #if ROCKET_MIN_LOG_LEVEL <= 3
 #define ROCKET_LOG_ERROR(fmt, ...) ::rocket::Logger::getInstance().log(::rocket::LogLevel::Error, fmt, ##__VA_ARGS__)
 #else

@@ -23,6 +23,8 @@ class IOThreadGroup {
 
     [[nodiscard]] IOThread* getIOThread() noexcept;
 
+    [[nodiscard]] IOThread* getIOThreadAt(std::size_t i) noexcept;
+
     [[nodiscard]] std::size_t getIOThreadSize() const noexcept;
 
   private:

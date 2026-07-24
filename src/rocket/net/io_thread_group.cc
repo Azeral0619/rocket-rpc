@@ -17,8 +17,8 @@ IOThreadGroup::IOThreadGroup(std::size_t size) : m_size(size) {
 IOThreadGroup::~IOThreadGroup() { ROCKET_LOG_DEBUG("IOThreadGroup destroyed"); }
 
 void IOThreadGroup::start() {
-    for (const auto& thread : m_io_threads) {
-        thread->start();
+    for (std::size_t i = 0; i < m_io_threads.size(); ++i) {
+        m_io_threads[i]->start(i);
     }
     ROCKET_LOG_INFO("IOThreadGroup started {} threads", m_size);
 }
@@ -37,6 +37,11 @@ IOThread* IOThreadGroup::getIOThread() noexcept {
     auto* thread = m_io_threads[m_index].get();
     m_index = (m_index + 1) % m_size;
     return thread;
+}
+
+IOThread* IOThreadGroup::getIOThreadAt(std::size_t i) noexcept {
+    if (i >= m_io_threads.size()) return nullptr;
+    return m_io_threads[i].get();
 }
 
 std::size_t IOThreadGroup::getIOThreadSize() const noexcept { return m_size; }

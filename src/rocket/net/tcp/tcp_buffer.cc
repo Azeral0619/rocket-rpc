@@ -1,7 +1,7 @@
 #include "tcp_buffer.h"
 #include <algorithm>
 #include <array>
-#include <bits/types/struct_iovec.h>
+#include <sys/uio.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -285,7 +285,27 @@ ssize_t TcpBuffer::readFromFd(int fd, int* saved_errno) {
 }
 
 ssize_t TcpBuffer::writeToFd(int fd, int* saved_errno) {
-    const ssize_t n = ::write(fd, peek(), readAble());
+    // Use writev with up to 2 iovecs: one for the front segment
+    // [read_index, end), and optionally a second for the wrapped
+    // segment [0, write_index).
+    const std::size_t len = readAble();
+    if (len == 0) return 0;
+
+    std::size_t first = std::min(m_buffer.size() - m_read_index, len);
+    std::size_t second = len - first;
+
+    iovec iov[2];
+    iov[0].iov_base = const_cast<char*>(begin()) + m_read_index;
+    iov[0].iov_len = first;
+    int iovcnt = 1;
+
+    if (second > 0) {
+        iov[1].iov_base = const_cast<char*>(begin());
+        iov[1].iov_len = second;
+        iovcnt = 2;
+    }
+
+    const ssize_t n = ::writev(fd, iov, iovcnt);
     if (n < 0) {
         *saved_errno = errno;
     } else {

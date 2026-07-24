@@ -95,7 +95,10 @@ void Config::reload(std::string_view yamlfile) {
             }
         }
     }
-    m_config.store(new_config, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_config = std::move(new_config);
+    }
     Logger::getInstance().reloadFromConfig();
 }
 

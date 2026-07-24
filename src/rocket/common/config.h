@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -49,7 +50,8 @@ class Config final : public Singleton<Config> {
     void reload(std::string_view yamlfile);
 
     [[nodiscard]] std::shared_ptr<const ConfigData> getConfig() const noexcept {
-        return m_config.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
     }
 
   private:
@@ -57,7 +59,8 @@ class Config final : public Singleton<Config> {
 
     Config();
 
-    std::atomic<std::shared_ptr<ConfigData>> m_config;
+    mutable std::mutex m_mutex;
+    std::shared_ptr<const ConfigData> m_config;
 };
 
 } // namespace rocket

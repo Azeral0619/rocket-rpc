@@ -112,7 +112,7 @@ void TestConcurrentLogging() {
 
     rocket::Logger::Options options;
     options.file_path = "./test_logs/concurrent.log";
-    options.queue_capacity = 1U << 14;
+    options.per_thread_queue_bytes = 1U << 20;  // 1MB
 
     auto& logger = rocket::Logger::getInstance();
     logger.start(options);
@@ -192,7 +192,7 @@ void TestPerformance() {
 
     rocket::Logger::Options options;
     options.file_path = "./test_logs/perf.log";
-    options.queue_capacity = 1U << 14;
+    options.per_thread_queue_bytes = 1U << 20;  // 1MB
     options.flush_interval_ms = 50;
 
     auto& logger = rocket::Logger::getInstance();
@@ -305,7 +305,7 @@ void TestStressTest() {
 
     rocket::Logger::Options options;
     options.file_path = "./test_logs/stress.log";
-    options.queue_capacity = 1U << 18; // 256K队列
+    options.per_thread_queue_bytes = 1U << 20;  // 1MB queue
     options.flush_interval_ms = 50;
     options.max_file_size = 100 * 1024 * 1024; // 100MB
 
@@ -387,7 +387,7 @@ void TestMemoryLeak() {
 
     rocket::Logger::Options options;
     options.file_path = "./test_logs/memleak.log";
-    options.queue_capacity = 1U << 16;
+    options.per_thread_queue_bytes = 1U << 20;  // 1MB
     options.flush_interval_ms = 50;
 
     constexpr int kNumIterations = 10;

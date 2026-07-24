@@ -1,5 +1,12 @@
-#include <cstddef>
-#include <cstdint>
+#include "rocket/net/rpc/rpc_dispatcher.h"
+
+#include "rocket/common/ecode.h"
+#include "rocket/common/log.h"
+#include "rocket/common/runtime.h"
+#include "rocket/net/rpc/rpc_closure.h"
+#include "rocket/net/rpc/rpc_controller.h"
+#include "rocket/net/tcp/tcp_connection.h"
+
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
@@ -9,24 +16,22 @@
 #include <utility>
 #include <vector>
 
-#include "rocket/common/ecode.h"
-#include "rocket/common/log.h"
-#include "rocket/common/runtime.h"
-#include "rocket/common/thread_pool.h"
-#include "rocket/net/coder/abstract_protocol.h"
-#include "rocket/net/coder/tinypb_protocol.h"
-#include "rocket/net/rpc/rpc_closure.h"
-#include "rocket/net/rpc/rpc_controller.h"
-#include "rocket/net/rpc/rpc_dispatcher.h"
-#include "rocket/net/tcp/tcp_connect.h"
-
 namespace rocket {
 
+RpcDispatcher::RpcDispatcher(std::size_t worker_threads)
+    : m_worker_pool(worker_threads) {
+}
+
 void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::s_ptr response,
-                             TcpConnection* connection) {
+                             const TcpConnection::s_ptr& conn) {
 
     auto req_protocol = std::dynamic_pointer_cast<TinyPBProtocol>(request);
     auto rsp_protocol = std::dynamic_pointer_cast<TinyPBProtocol>(response);
+
+    if (!req_protocol || !rsp_protocol) {
+        // Not a TinyPB message — can't handle
+        return;
+    }
 
     std::string method_full_name = req_protocol->m_method_name;
     std::string_view service_name;
@@ -35,54 +40,59 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
     rsp_protocol->m_msg_id = req_protocol->m_msg_id;
     rsp_protocol->m_method_name = req_protocol->m_method_name;
 
+    auto sendError = [&](int32_t err_code, std::string_view err_info) {
+        setTinyPBError(rsp_protocol, err_code, err_info);
+        conn->send(rsp_protocol);
+    };
+
     if (!parseServiceFullName(method_full_name, service_name, method_name)) {
-        setTinyPBError(rsp_protocol, error::kParseServiceName, "parse service name error");
+        sendError(error::kParseServiceName, "parse service name error");
         return;
     }
 
     auto it = m_service_map.find(service_name);
     if (it == m_service_map.end()) {
         ROCKET_LOG_ERROR("{} | service name[{}] not found", req_protocol->m_msg_id, service_name);
-        setTinyPBError(rsp_protocol, error::kServiceNotFound, "service not found");
+        sendError(error::kServiceNotFound, "service not found");
         return;
     }
 
     const auto& service = it->second;
-
     const auto* method = service->GetDescriptor()->FindMethodByName(method_name);
     if (method == nullptr) {
         ROCKET_LOG_ERROR("{} | method name[{}] not found in service[{}]", req_protocol->m_msg_id, method_name,
                          service_name);
-        setTinyPBError(rsp_protocol, error::kMethodNotFound, "method not found");
+        sendError(error::kMethodNotFound, "method not found");
         return;
     }
 
-    std::unique_ptr<google::protobuf::Message> req_msg(service->GetRequestPrototype(method).New());
-
-    if (!req_msg->ParseFromString(req_protocol->m_pb_data)) {
+    // shared_ptr directly from prototype (avoid unique_ptr → shared_ptr conversion).
+    auto req_msg_ptr = std::shared_ptr<google::protobuf::Message>(service->GetRequestPrototype(method).New());
+    if (!req_msg_ptr->ParseFromString(req_protocol->m_pb_data)) {
         ROCKET_LOG_ERROR("{} | deserialize error", req_protocol->m_msg_id);
-        setTinyPBError(rsp_protocol, error::kFailedDeserialize, "deserialize error");
+        sendError(error::kFailedDeserialize, "deserialize error");
         return;
     }
 
-    ROCKET_LOG_INFO("{} | get rpc request[{}]", req_protocol->m_msg_id, req_msg->ShortDebugString());
+    ROCKET_LOG_INFO("{} | get rpc request[{}]", req_protocol->m_msg_id, req_msg_ptr->ShortDebugString());
 
-    std::unique_ptr<google::protobuf::Message> rsp_msg(service->GetResponsePrototype(method).New());
+    auto rsp_msg_ptr = std::shared_ptr<google::protobuf::Message>(service->GetResponsePrototype(method).New());
 
-    auto rpc_controller = std::make_unique<RpcController>();
-    rpc_controller->SetLocalAddr(connection->getLocalAddr());
-    rpc_controller->SetPeerAddr(connection->getPeerAddr());
-    rpc_controller->SetMsgId(req_protocol->m_msg_id);
+    auto controller_ptr = std::make_shared<RpcController>();
+    controller_ptr->SetLocalAddr(conn->getLocalAddr());
+    controller_ptr->SetPeerAddr(conn->getPeerAddr());
+    controller_ptr->SetMsgId(req_protocol->m_msg_id);
 
     RunTime::GetRunTime()->m_msgid = req_protocol->m_msg_id;
     RunTime::GetRunTime()->m_method_name = method_name;
 
-    auto req_msg_ptr = std::shared_ptr<google::protobuf::Message>(req_msg.release());
-    auto rsp_msg_ptr = std::shared_ptr<google::protobuf::Message>(rsp_msg.release());
-    auto controller_ptr = std::shared_ptr<RpcController>(rpc_controller.release());
+    // Track in-flight for graceful shutdown.
+    conn->incrInFlight();
 
     auto closure = std::make_shared<RpcClosure>(
-        nullptr, [req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, connection, controller_ptr, this]() mutable {
+        nullptr, [req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn, controller_ptr, this]() mutable {
+            conn->decrInFlight();
+
             if (!rsp_msg_ptr->SerializeToString(&(rsp_protocol->m_pb_data))) {
                 ROCKET_LOG_ERROR("{} | serialize error, origin message [{}]", req_protocol->m_msg_id,
                                  rsp_msg_ptr->ShortDebugString());
@@ -93,14 +103,13 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
                 ROCKET_LOG_INFO("{} | dispatch success, request[{}], response[{}]", req_protocol->m_msg_id,
                                 req_msg_ptr->ShortDebugString(), rsp_msg_ptr->ShortDebugString());
             }
-            std::vector<AbstractProtocol::s_ptr> replay_messages;
-            replay_messages.emplace_back(rsp_protocol);
-            connection->reply(replay_messages);
+            conn->send(rsp_protocol);
         });
 
-    m_worker_pool.execute([service, method, controller_ptr, req_msg_ptr, rsp_msg_ptr, closure]() mutable {
-        service->CallMethod(method, controller_ptr.get(), req_msg_ptr.get(), rsp_msg_ptr.get(), closure.get());
-    });
+    // Fast path: run directly on the IO thread (brpc/gRPC style).
+    // Slow methods can offload themselves by not calling done->Run()
+    // synchronously — the framework waits for the callback.
+    service->CallMethod(method, controller_ptr.get(), req_msg_ptr.get(), rsp_msg_ptr.get(), closure.get());
 }
 
 bool RpcDispatcher::parseServiceFullName(std::string_view full_name, std::string_view& service_name,
@@ -116,17 +125,15 @@ bool RpcDispatcher::parseServiceFullName(std::string_view full_name, std::string
     }
     service_name = full_name.substr(0, i);
     method_name = full_name.substr(i + 1, full_name.length() - i - 1);
-
-    ROCKET_LOG_INFO("parse service_name[{}] and method_name[{}] from full name [{}]", service_name, method_name,
-                    full_name);
-
     return true;
 }
 
 void RpcDispatcher::registerService(Services_ptr service) {
     std::string service_name(service->GetDescriptor()->full_name());
-    m_service_map[service_name] = service;
+    m_service_map[service_name] = std::move(service);
 }
+
+void RpcDispatcher::stop() { m_worker_pool.stopAndDrain(); }
 
 void RpcDispatcher::setTinyPBError(TinyPBProtocol::s_ptr msg, int32_t err_code, std::string_view err_info) {
     msg->m_err_code = err_code;

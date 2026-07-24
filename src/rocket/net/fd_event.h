@@ -3,16 +3,16 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <functional>
-#include <sys/epoll.h>
 
 namespace rocket {
 
 class FdEvent {
   public:
+    // Platform-independent trigger event values (NOT epoll flags).
     enum class TriggerEvent : std::uint8_t {
-        IN_EVENT = EPOLLIN,
-        OUT_EVENT = EPOLLOUT,
-        ERROR_EVENT = EPOLLERR,
+        IN_EVENT = 1,
+        OUT_EVENT = 2,
+        ERROR_EVENT = 3,
     };
 
     explicit FdEvent(int fd);
@@ -40,22 +40,31 @@ class FdEvent {
 
     [[nodiscard]] int getFd() const noexcept { return m_fd; }
 
-    [[nodiscard]] const epoll_event& getEpollEvent() const noexcept { return m_listen_events; }
-
-    [[nodiscard]] epoll_event& getEpollEvent() noexcept { return m_listen_events; }
-
     [[nodiscard]] bool isListening(TriggerEvent event_type) const noexcept;
 
     [[nodiscard]] bool isValid() const noexcept { return m_fd >= 0; }
 
-    void updateEpollEvents();
+    // Returns a platform-independent bitmask of TriggerEvent values.
+    [[nodiscard]] std::uint32_t listenMask() const noexcept;
 
   protected:
     int m_fd{-1};
-    epoll_event m_listen_events{};
     std::function<void()> m_read_callback;
     std::function<void()> m_write_callback;
     std::function<void()> m_error_callback;
 };
+
+// Convert TriggerEvent to a bitmask bit (platform-independent).
+[[nodiscard]] constexpr std::uint32_t toMask(FdEvent::TriggerEvent e) noexcept {
+    switch (e) {
+    case FdEvent::TriggerEvent::IN_EVENT:
+        return 1U << 0;
+    case FdEvent::TriggerEvent::OUT_EVENT:
+        return 1U << 1;
+    case FdEvent::TriggerEvent::ERROR_EVENT:
+        return 1U << 2;
+    }
+    return 0;
+}
 
 } // namespace rocket

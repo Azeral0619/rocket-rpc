@@ -1,6 +1,8 @@
 #pragma once
 
+#include "rocket/net/rpc/rpc_connection_pool.h"
 #include "rocket/net/tcp/net_addr.h"
+#include "rocket/net/timer_event.h"
 #include <google/protobuf/service.h>
 #include <google/protobuf/stubs/callback.h>
 #include <memory>
@@ -35,6 +37,14 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
 
     explicit RpcChannel(NetAddr::s_ptr peer_addr);
 
+    // Channel with shared connection pool (one TcpClient per addr, reused).
+    RpcChannel(NetAddr::s_ptr peer_addr, RpcConnectionPool::s_ptr pool);
+
+    // Service-aware channel: discovers addresses via registry + load-balances.
+    // The registry pointer must outlive the channel.
+    RpcChannel(std::string_view service_name, RpcConnectionPool::s_ptr pool,
+               ServiceRegistry* registry);
+
     ~RpcChannel() override;
 
     RpcChannel(const RpcChannel&) = delete;
@@ -58,8 +68,18 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
 
     TcpClient* getTcpClient();
 
+    // Synchronous call: blocks until response or timeout. Returns 0 on success.
+    // Uses the underlying CallMethod async path + promise/future internally.
+    int CallMethodBlocking(const google::protobuf::MethodDescriptor* method,
+                           google::protobuf::RpcController* controller,
+                           const google::protobuf::Message* request,
+                           google::protobuf::Message* response,
+                           int timeout_ms = 3000);
+
   private:
-    void callBack();
+    // Called from response/timer callbacks (EventLoop thread).  Atomic flag
+    // ensures the RPC closure runs at most once regardless of race.
+    void finishRpc();
 
     std::shared_ptr<NetAddr> m_peer_addr{nullptr};
     std::shared_ptr<NetAddr> m_local_addr{nullptr};
@@ -71,8 +91,25 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
 
     bool m_is_init{false};
 
+    // Set to true by the first finisher (response or timer) — ensures
+    // the RPC closure runs exactly once regardless of race.
+    std::atomic<bool> m_rpc_finished{false};
+
     std::shared_ptr<TcpClient> m_client{nullptr};
+    RpcConnectionPool::s_ptr m_pool;      // optional shared pool
+    std::string m_service_name;            // service-aware mode: name to discover
+    ServiceRegistry* m_registry{nullptr};  // service-aware mode: registry for discovery
+    NetAddr::s_ptr m_actual_peer;          // addr actually used for this call (for release)
+
+    // Hold the current timer so we can cancel it before starting a new
+    // request.  This prevents a stale timer callback (from the previous
+    // CallMethod) from accessing a freed controller after m_rpc_finished
+    // is reset by the next request.
+    TimerEvent::s_ptr m_timer_event;
 };
+
+// Global default connection pool (lazy-init, thread-safe).
+RpcConnectionPool::s_ptr GetDefaultPool();
 
 inline std::shared_ptr<RpcController> NewRpcController() { return std::make_shared<RpcController>(); }
 

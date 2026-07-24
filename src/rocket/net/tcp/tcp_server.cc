@@ -2,94 +2,101 @@
 
 #include "rocket/common/config.h"
 #include "rocket/common/log.h"
-#include "rocket/net/event_loop.h"
-#include "rocket/net/fd_event.h"
 #include "rocket/net/io_thread.h"
-#include "rocket/net/io_thread_group.h"
-#include "rocket/net/tcp/net_addr.h"
-#include "rocket/net/tcp/tcp_acceptor.h"
-#include "rocket/net/tcp/tcp_connect.h"
-#include "rocket/net/timer_event.h"
 
 #include <memory>
 #include <utility>
 
 namespace rocket {
 
-namespace {
-constexpr int kClearClientTimerInterval = 5000; // ms
-} // namespace
-
-TcpServer::TcpServer(NetAddr::s_ptr local_addr) : m_local_addr(std::move(local_addr)) {
-
+TcpServer::TcpServer(NetAddr::s_ptr local_addr, CoderFactory coder_factory)
+    : m_local_addr(std::move(local_addr)), m_coder_factory(std::move(coder_factory)) {
     init();
-
-    ROCKET_LOG_INFO("rocket TcpServer listen sucess on [{}]", m_local_addr->toString());
+    ROCKET_LOG_INFO("TcpServer listening on [{}]", m_local_addr->toString());
 }
 
 TcpServer::~TcpServer() = default;
 
 void TcpServer::init() {
-
     m_acceptor = std::make_shared<TcpAcceptor>(m_local_addr);
+    m_main_loop = std::make_unique<EventLoop>();
 
-    m_main_event_loop = std::make_unique<EventLoop>();
-
-    const auto config = Config::getInstance().getConfig();
-    m_io_thread_group = std::make_unique<IOThreadGroup>(config->io_threads);
+    auto cfg = Config::getInstance().getConfig();
+    m_io_group = std::make_unique<IOThreadGroup>(cfg->io_threads);
 
     m_listen_fd_event = std::make_unique<FdEvent>(m_acceptor->getListenFd());
     m_listen_fd_event->listen(FdEvent::TriggerEvent::IN_EVENT, [this] { onAccept(); });
-
-    m_main_event_loop->addEpollEvent(m_listen_fd_event.get());
-
-    m_clear_client_timer_event =
-        std::make_shared<TimerEvent>(kClearClientTimerInterval, true, [this] { clearClientTimerFunc(); });
-    m_main_event_loop->addTimerEvent(m_clear_client_timer_event);
+    m_main_loop->addEpollEvent(m_listen_fd_event.get());
 }
 
 void TcpServer::onAccept() {
     auto re = m_acceptor->accept();
-
     if (!re.isValid()) {
-        ROCKET_LOG_ERROR("accept client failed: {}", re.error_msg);
+        ROCKET_LOG_ERROR("accept failed: {}", re.error_msg);
         return;
     }
 
-    const int client_fd = re.client_fd;
+    int client_fd = re.client_fd;
     auto peer_addr = std::move(re.peer_addr);
+    IOThread* io_thread = m_io_group->getIOThread();
 
-    m_client_counts++;
+    auto conn = std::make_shared<TcpConnection>(
+        io_thread->getEventLoop(), client_fd,
+        m_local_addr, peer_addr,
+        m_coder_factory(),
+        TcpConnectionType::Server);
 
-    IOThread* io_thread = m_io_thread_group->getIOThread();
+    conn->setMessageCallback(m_message_cb);
+    conn->setConnectionCallback(m_connection_cb);
+    if (m_hwm_cb) conn->setHighWaterMarkCallback(m_hwm_cb, m_high_water_mark);
 
-    constexpr int kDefaultBufferSize = 128;
-    auto connetion =
-        std::make_shared<TcpConnection>(io_thread->getEventLoop(), client_fd, kDefaultBufferSize, std::move(peer_addr),
-                                        m_local_addr, TcpConnectionType::TcpConnectionByServer);
-    connetion->setState(TcpState::Connected);
+    conn->setCloseCallback([this](const TcpConnection::s_ptr& c) {
+        removeConnection(c);
+    });
 
-    m_client.insert(connetion);
+    // Register with the IO thread's loop, then establish.
+    io_thread->getEventLoop()->queueInLoop([conn] {
+        conn->connectEstablished();
+    });
 
-    ROCKET_LOG_INFO("TcpServer succ get client, fd={}", client_fd);
+    m_connections.insert(conn);
+    ROCKET_LOG_INFO("TcpServer new client fd={} peer={}", client_fd, peer_addr->toString());
+}
+
+void TcpServer::removeConnection(const TcpConnection::s_ptr& conn) {
+    m_connections.erase(conn);
+    conn->getLoop()->queueInLoop([conn] {
+        conn->connectDestroyed();
+    });
 }
 
 void TcpServer::start() {
-    m_io_thread_group->start();
-    m_main_event_loop->loop();
+    if (m_ready_cb) m_ready_cb();
+    m_running = true;
+    m_io_group->start();
+    m_main_loop->loop();
 }
 
-void TcpServer::clearClientTimerFunc() {
-    auto it = m_client.begin();
-    for (it = m_client.begin(); it != m_client.end();) {
-        if ((*it) != nullptr && (*it).use_count() > 0 && (*it)->getState() == TcpState::Closed) {
-            ROCKET_LOG_DEBUG("TcpConection [fd:{}] will delete, state={}", (*it)->getFd(),
-                             static_cast<int>((*it)->getState()));
-            it = m_client.erase(it);
-        } else {
-            it++;
-        }
+void TcpServer::stop() {
+    if (!m_running) return;
+    m_running = false;
+
+    // Copy connection set — IO threads may call removeConnection() concurrently
+    // while we iterate, which would invalidate iterators.
+    auto connections = m_connections;
+    for (auto& conn : connections) {
+        conn->getLoop()->queueInLoop([conn] {
+            conn->shutdownGracefully();
+        });
     }
+
+    // Stop IO thread group (joins all IO threads)
+    m_io_group.reset();
+
+    // Stop main loop
+    m_main_loop->stop();
+
+    ROCKET_LOG_INFO("TcpServer stopped");
 }
 
 } // namespace rocket

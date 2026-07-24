@@ -1,129 +1,161 @@
 add_rules("mode.debug", "mode.release")
-
 set_languages("cxx23")
-set_toolchains("gcc-12")
 add_requires("protobuf-cpp", "yaml-cpp")
 add_requires("fmt", {configs = {header_only = true}})
 
-target("main")
-    set_kind("binary")
-    add_files("src/main.cpp|src/main.cc")
-    add_files("src/rocket/**.cc")
-    add_includedirs("src")
+-- Release mode: strip DEBUG logs at compile time (can override via -DROCKET_MIN_LOG_LEVEL=N)
+if is_mode("release") then
+    add_defines("ROCKET_MIN_LOG_LEVEL=1")
+end
+
+target("rocket")
+    set_kind("static")
+    add_includedirs("proto")
+    -- common
+    add_files("src/rocket/common/log.cc")
+    add_files("src/rocket/common/config.cc")
+    add_files("src/rocket/common/runtime.cc")
+    add_files("src/rocket/common/msg_id_util.cc")
+    add_files("src/rocket/common/etcd_registry.cc")
+    -- net core
+    add_files("src/rocket/net/fd_event.cc")
+    add_files("src/rocket/net/event_loop.cc")
+    add_files("src/rocket/net/timer.cc")
+    add_files("src/rocket/net/timer_event.cc")
+    add_files("src/rocket/net/timing_wheel.cc")
+    add_files("src/rocket/net/io_thread.cc")
+    add_files("src/rocket/net/io_thread_group.cc")
+    -- net/poller (cross-platform)
+    add_files("src/rocket/net/poller/poller.cc")
+    add_files("src/rocket/net/poller/wakeup_channel.cc")
+    add_files("src/rocket/net/poller/epoll_poller.cc")
+    add_files("src/rocket/net/poller/kqueue_poller.cc")
+    -- net/tcp
+    add_files("src/rocket/net/tcp/net_addr.cc")
+    add_files("src/rocket/net/tcp/tcp_buffer.cc")
+    add_files("src/rocket/net/tcp/tcp_connection.cc")
+    add_files("src/rocket/net/tcp/tcp_acceptor.cc")
+    add_files("src/rocket/net/tcp/tcp_server.cc")
+    add_files("src/rocket/net/tcp/tcp_client.cc")
+    -- net/coder
+    add_files("src/rocket/net/coder/tinypb_coder.cc")
+    -- net/rpc
+    add_files("proto/order.pb.cc")
+    add_files("src/rocket/net/rpc/rpc_dispatcher.cc")
+    add_files("src/rocket/net/rpc/rpc_server.cc")
+    add_files("src/rocket/net/rpc/rpc_channel.cc")
+    add_files("src/rocket/net/rpc/rpc_connection_pool.cc")
+    add_files("src/rocket/net/rpc/rpc_controller.cc")
+    add_files("src/rocket/net/rpc/rpc_interface.cc")
+    add_includedirs("src", {public = true})
+    add_includedirs("src/test", {public = true})
     add_cxflags("-pthread")
-    add_ldflags("-pthread")
-    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+    add_ldflags("-pthread", {public = true})
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt", {public = true})
 
--- Common source files (exclude main.cpp and test files)
-local rocket_common_files = {
-    "src/rocket/common/log.cc",
-    "src/rocket/common/config.cc",
-    "src/rocket/common/runtime.cc",
-    "src/rocket/common/msg_id_util.cc"
-}
-
-local rocket_net_files = {
-    "src/rocket/net/fd_event.cc",
-    "src/rocket/net/fd_event_group.cc",
-    "src/rocket/net/timer.cc",
-    "src/rocket/net/timer_event.cc",
-    "src/rocket/net/wakeup_fd_event.cc",
-    "src/rocket/net/event_loop.cc",
-    "src/rocket/net/io_thread.cc",
-    "src/rocket/net/io_thread_group.cc"
-}
-
-local rocket_tcp_files = {
-    "src/rocket/net/tcp/net_addr.cc",
-    "src/rocket/net/tcp/tcp_buffer.cc",
-    "src/rocket/net/tcp/tcp_connect.cc",
-    "src/rocket/net/tcp/tcp_acceptor.cc",
-    "src/rocket/net/tcp/tcp_client.cc",
-    "src/rocket/net/tcp/tcp_server.cc"
-}
-
-local rocket_coder_files = {
-    "src/rocket/net/coder/tinypb_coder.cc"
-}
-
-local rocket_rpc_files = {
-    "src/rocket/net/rpc/rpc_controller.cc",
-    "src/rocket/net/rpc/rpc_dispatcher.cc",
-    "src/rocket/net/rpc/rpc_interface.cc",
-    "src/rocket/net/rpc/rpc_channel.cc"
-}
-
+-- Logger test / benchmark
 target("test_log")
     set_kind("binary")
     add_files("src/test/test_log.cc")
-    add_files(rocket_common_files)
-    add_files("src/rocket/net/tcp/net_addr.cc")
-    add_includedirs("src")
-    add_cxflags("-pthread")
-    add_ldflags("-pthread")
-    add_packages("yaml-cpp", "fmt")
-
-target("test_tcp")
-    set_kind("binary")
-    add_files("src/test/test_tcp.cc")
-    add_files(rocket_common_files)
-    add_files(rocket_net_files)
-    add_files(rocket_tcp_files)
-    add_files(rocket_coder_files)
-    add_files(rocket_rpc_files)
-    add_includedirs("src")
-    add_cxflags("-pthread")
-    add_ldflags("-pthread")
+    add_deps("rocket")
     add_packages("protobuf-cpp", "yaml-cpp", "fmt")
 
-target("test_client")
+target("bench_log")
     set_kind("binary")
-    add_files("src/test/test_client.cc")
-    add_files(rocket_common_files)
-    add_files(rocket_net_files)
-    add_files(rocket_tcp_files)
-    add_files(rocket_coder_files)
-    add_files(rocket_rpc_files)
-    add_includedirs("src")
-    add_cxflags("-pthread")
-    add_ldflags("-pthread")
+    add_files("src/test/bench_log.cc")
+    add_deps("rocket")
     add_packages("protobuf-cpp", "yaml-cpp", "fmt")
 
-target("test_eventloop")
+target("quick_bench")
     set_kind("binary")
-    add_files("src/test/test_eventloop.cc")
-    add_files(rocket_common_files)
-    add_files(rocket_net_files)
-    add_files("src/rocket/net/tcp/net_addr.cc")
-    add_includedirs("src")
-    add_cxflags("-pthread")
-    add_ldflags("-pthread")
-    add_packages("yaml-cpp", "fmt")
-
-target("test_rpc_client")
-    set_kind("binary")
-    add_files("src/test/test_rpc_client.cc")
-    add_files("src/test/order.pb.cc")
-    add_files(rocket_common_files)
-    add_files(rocket_net_files)
-    add_files(rocket_tcp_files)
-    add_files(rocket_coder_files)
-    add_files(rocket_rpc_files)
-    add_includedirs("src")
-    add_cxflags("-pthread")
-    add_ldflags("-pthread")
+    add_files("src/test/quick_bench.cc")
+    add_deps("rocket")
     add_packages("protobuf-cpp", "yaml-cpp", "fmt")
 
-target("test_rpc_server")
+target("max_throughput")
     set_kind("binary")
-    add_files("src/test/test_rpc_server.cc")
-    add_files("src/test/order.pb.cc")
-    add_files(rocket_common_files)
-    add_files(rocket_net_files)
-    add_files(rocket_tcp_files)
-    add_files(rocket_coder_files)
-    add_files(rocket_rpc_files)
-    add_includedirs("src")
-    add_cxflags("-pthread")
-    add_ldflags("-pthread")
+    add_files("src/test/max_throughput.cc")
+    add_deps("rocket")
     add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("micro_bench")
+    set_kind("binary")
+    add_files("src/test/micro_bench.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("mem_usage")
+    set_kind("binary")
+    add_files("src/test/mem_usage.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("rpc_bench")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("src/test/rpc_bench.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("shared_pool_bench")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("src/test/shared_pool_bench.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("async_bench")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("src/test/async_bench.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("profile_log")
+    set_kind("binary")
+    add_files("src/test/profile_log.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("capacity_test")
+    set_kind("binary")
+    add_files("src/test/capacity_test.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+-- Examples (all need proto/ on include path)
+target("echo_server")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("examples/echo_server.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("echo_client")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("examples/echo_client.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("rpc_server_example")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("examples/rpc_server.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("coroutine_client")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("examples/coroutine_client.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
+target("rpc_client_example")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("examples/rpc_client.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+

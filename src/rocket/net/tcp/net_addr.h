@@ -45,6 +45,11 @@ class IPNetAddr final : public NetAddr {
 
     explicit IPNetAddr(const sockaddr_in& addr);
 
+    // Factory: create from "ip:port" or "ip", port
+    static NetAddr::s_ptr Make(std::string_view ip, uint16_t port) {
+        return std::make_shared<IPNetAddr>(ip, port);
+    }
+
     [[nodiscard]] const sockaddr* getSockAddr() const noexcept override;
 
     [[nodiscard]] socklen_t getSockLen() const noexcept override;

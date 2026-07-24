@@ -43,3 +43,9 @@
 .xmake
 build
 .vscode
+.cache/
+.claude/
+bench_logs/
+profile_logs/
+test_logs/
+CLAUDE.md

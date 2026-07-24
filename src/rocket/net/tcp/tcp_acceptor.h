@@ -49,6 +49,7 @@ class TcpAcceptor {
     Config m_config;
     int m_family{-1};
     int m_listen_fd{-1};
+    mutable int m_idle_fd{-1};  // /dev/null fd for EMFILE recovery (modifiable in const accept)
 };
 
 } // namespace rocket
