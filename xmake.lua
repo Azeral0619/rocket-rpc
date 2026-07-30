@@ -1,4 +1,7 @@
 add_rules("mode.debug", "mode.release")
+-- Keep symbols in release for profiling
+set_symbols("debug")
+set_strip("none")
 set_languages("cxx23")
 add_requires("protobuf-cpp", "yaml-cpp")
 add_requires("fmt", {configs = {header_only = true}})

@@ -74,19 +74,45 @@ void TcpBuffer::ensureWritable(std::size_t len) {
 }
 
 void TcpBuffer::makeSpace(std::size_t len) {
-    if (writeAble() + prependAble() < len + kPrependSize) {
-        const std::size_t new_size = std::min(m_write_index + len, kMaxBufferSize);
-        m_buffer.resize(new_size);
-    } else {
+    if (len == 0) return;
+
+    if (writeAble() + prependAble() >= len + kPrependSize) {
+        // Enough total space after compaction.
         const std::size_t readable = readAble();
-        std::memmove(begin() + kPrependSize, begin() + m_read_index, readable);
+        if (readable > 0) {
+            std::memmove(begin() + kPrependSize, begin() + m_read_index, readable);
+        }
+        m_read_index = kPrependSize;
+        m_write_index = m_read_index + readable;
+        return;
+    }
+
+    // Need more buffer — try to grow.
+    const std::size_t new_size = std::min(m_write_index + len, kMaxBufferSize);
+    m_buffer.resize(new_size);
+
+    // If resize hit the ceiling and there's still not enough contiguous
+    // writable space, compact (move readable data to the front).
+    if (writeAble() < len && prependAble() + writeAble() >= len + kPrependSize) {
+        const std::size_t readable = readAble();
+        if (readable > 0) {
+            std::memmove(begin() + kPrependSize, begin() + m_read_index, readable);
+        }
         m_read_index = kPrependSize;
         m_write_index = m_read_index + readable;
     }
 }
 
 void TcpBuffer::append(const void* data, std::size_t len) {
+    if (len == 0) return;
     ensureWritable(len);
+    // Safety: if buffer is at hard ceiling and can't expand, clip to
+    // available space so we never write past m_buffer's end.
+    std::size_t avail = writeAble();
+    if (avail < len) {
+        len = avail;
+        if (len == 0) return;
+    }
     std::memcpy(beginWrite(), data, len);
     m_write_index += len;
 }

@@ -60,7 +60,8 @@ void RpcChannel::finishRpc() {
         return;  // already finished
     }
     if (m_closure) {
-        m_closure->Run();
+        auto pin = m_closure;  // keep alive across re-entrant Init() in Run()
+        pin->Run();
     }
 }
 
@@ -80,6 +81,14 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
         }
         finishRpc();
         return;
+    }
+
+    // Cancel the PREVIOUS timer *before* resetting m_rpc_finished.
+    // Otherwise the old timer can fire in the window between the reset and
+    // the cancel below, spuriously invoking the new callback.
+    if (m_timer_event) {
+        m_timer_event->cancel();
+        m_timer_event.reset();
     }
 
     // Reset the per-request finish flag BEFORE starting the new request.
@@ -157,26 +166,26 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
 
     auto channel = shared_from_this();
 
-    // Cancel any pending timer from a previous request (prevents stale
-    // callback from accessing a freed controller when the old timer fires
-    // after m_rpc_finished has been reset by a new CallMethod).
-    if (m_timer_event) {
-        m_timer_event->cancel();
-        m_timer_event.reset();
-    }
-
     // ── Timer: fires finishRpc() with timeout error ──────────────────
-    m_timer_event = TimerEvent::create(
-        my_controller->GetTimeout(), false, [my_controller, channel]() mutable {
-            if (channel->m_rpc_finished.load(std::memory_order_acquire)) return;  // response beat us
+    // Capture controller as shared_ptr so the timer is safe even if
+    // the channel is re-init'd with a different controller before this fires.
+    {
+        auto ctrl = m_controller;  // shared_ptr pin
+        int timeout_ms = my_controller->GetTimeout();
+        m_timer_event = TimerEvent::create(
+            timeout_ms, false, [ctrl, channel]() mutable {
+                if (channel->m_rpc_finished.load(std::memory_order_acquire)) return;
 
-            ROCKET_LOG_INFO("{} | call rpc timeout arrive", my_controller->GetMsgId());
-            my_controller->StartCancel();
-            my_controller->SetError(error::kRpcCallTimeout,
-                                    "rpc call timeout " + std::to_string(my_controller->GetTimeout()));
-            channel->finishRpc();
-            channel.reset();
-        });
+                auto* mc = static_cast<RpcController*>(ctrl.get());
+                ROCKET_LOG_INFO("{} | call rpc timeout arrive", mc->GetMsgId());
+                mc->StartCancel();
+                mc->SetError(error::kRpcCallTimeout,
+                             "rpc call timeout " + std::to_string(mc->GetTimeout()));
+                channel->finishRpc();
+                channel.reset();
+                ctrl.reset();
+            });
+    }
 
     client->getLoop()->addTimerEvent(m_timer_event);
 

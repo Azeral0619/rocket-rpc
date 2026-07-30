@@ -1,7 +1,7 @@
 // True async benchmark: all channels driven by IO-thread callbacks.
 // No per-channel blocking threads — one callback fires the next request.
 //
-// Usage: async_bench [channels] [duration_s] [timeout_ms]
+// Usage: async_bench [connections] [duration_s] [pipeline] [timeout_ms] [server_io]
 #include "order.pb.h"
 #include "rocket/common/config.h"
 #include "rocket/common/log.h"
@@ -11,11 +11,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 class LatencyRecorder {
@@ -97,7 +100,16 @@ struct BenchCallback : public google::protobuf::Closure {
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t_send).count();
         state->latency.record(static_cast<int64_t>(us));
-        state->total.fetch_add(1);
+
+        // Validate the response is a real RPC result.
+        bool ok = (ch.ctrl->GetErrorCode() == 0)
+               && (ch.rsp->ret_code() == 0)
+               && (!ch.rsp->order_id().empty());
+        if (ok) {
+            state->total.fetch_add(1);
+        } else {
+            state->errors.fetch_add(1);
+        }
 
         if (state->stop.load(std::memory_order_relaxed)) return;
 
@@ -145,25 +157,41 @@ BenchCallback* allocCallback() {
 }
 
 int main(int argc, char* argv[]) {
-    int n_channels  = argc > 1 ? std::atoi(argv[1]) : 100;
+    int n_conns     = argc > 1 ? std::atoi(argv[1]) : 100;
     int duration_s  = argc > 2 ? std::atoi(argv[2]) : 10;
-    int timeout_ms  = argc > 3 ? std::atoi(argv[3]) : 5000;
+    int pipeline    = argc > 3 ? std::atoi(argv[3]) : 1;
+    int timeout_ms  = argc > 4 ? std::atoi(argv[4]) : 5000;
+    int server_io   = argc > 5 ? std::atoi(argv[5]) : 4;
+
+    int n_channels = n_conns * pipeline;
 
     setbuf(stdout, nullptr);
     rocket::Logger::Options opts; opts.file_path = "/dev/null";
     rocket::Logger::getInstance().start(opts);
 
+    // Set server IO threads via temp config (default 4 from ConfigData).
+    if (server_io > 0) {
+        std::string yaml = "LOG:\n  file_name: /dev/null\nSERVER:\n  port: 12998\n  io_threads: "
+                         + std::to_string(server_io) + "\n";
+        std::string path = "/tmp/bench_config_" + std::to_string(getpid()) + ".yaml";
+        std::ofstream ofs(path);
+        ofs << yaml;
+        ofs.close();
+        rocket::Config::getInstance().reload(path);
+    }
+
     auto addr = std::make_shared<rocket::IPNetAddr>("127.0.0.1", 12998);
-    rocket::RpcServer server(addr, 1);  // 1=dispatcher threads (unused, IO thread runs directly)
+    rocket::RpcServer server(addr, 1);
     server.registerService(std::make_shared<OrderImpl>());
     std::thread svr([&] { server.start(); });
     svr.detach();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    printf("async_bench (callback): channels=%d duration=%ds\n", n_channels, duration_s);
+    printf("async_bench: c=%d pipeline=%d channels=%d duration=%ds server_io=%d\n",
+           n_conns, pipeline, n_channels, duration_s, server_io);
 
-    // 1 connection per channel = fair comparison with Hical's c=N connections.
-    auto pool = std::make_shared<rocket::RpcConnectionPool>(4, n_channels);
+    // c connections, each shared by pipeline channels (Hical-style pipelining).
+    auto pool = std::make_shared<rocket::RpcConnectionPool>(4, n_conns);
     auto method = Order::descriptor()->FindMethodByName("makeOrder");
 
     BenchState state;
@@ -212,5 +240,6 @@ int main(int argc, char* argv[]) {
            (long long)state.total.load(), (long long)state.errors.load(),
            state.total.load()/elapsed);
     state.latency.print(state.total.load(), elapsed);
+    // Keep alive for profiling
     _exit(0);
 }

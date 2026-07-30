@@ -142,7 +142,9 @@ void TimingWheel::cascadeL2() {
 void TimingWheel::collectExpired(Slot& slot, std::vector<TimerEvent::s_ptr>& out) {
     for (auto& ev : slot)
         if (!ev->isCancelled()) out.push_back(ev);
-    // Don't clear slot — tickL1 does it.
+    // Remove cancelled events that would otherwise linger in the slot,
+    // causing msUntilNextExpire to return small timeouts → 100% CPU busy-loop.
+    std::erase_if(slot, [](const TimerEvent::s_ptr& ev) { return ev->isCancelled(); });
 }
 
 } // namespace rocket

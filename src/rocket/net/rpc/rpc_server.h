@@ -4,6 +4,7 @@
 #include "rocket/net/rpc/rpc_dispatcher.h"
 #include "rocket/net/tcp/net_addr.h"
 #include "rocket/net/tcp/tcp_server.h"
+#include <atomic>
 #include <google/protobuf/service.h>
 #include <memory>
 #include <thread>
@@ -39,6 +40,7 @@ class RpcServer {
 
     TcpServer m_server;
     RpcDispatcher m_dispatcher;
+    std::atomic<bool> m_stopping{false};
 };
 
 } // namespace rocket
