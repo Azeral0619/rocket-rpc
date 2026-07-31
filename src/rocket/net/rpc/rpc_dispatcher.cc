@@ -3,6 +3,7 @@
 #include "rocket/common/ecode.h"
 #include "rocket/common/log.h"
 #include "rocket/common/runtime.h"
+#include "rocket/net/event_loop.h"
 #include "rocket/net/rpc/rpc_controller.h"
 #include "rocket/net/tcp/tcp_connection.h"
 
@@ -112,7 +113,15 @@ class ServerCallState final : public google::protobuf::Closure {
         std::unique_ptr<ServerCallState> self(this);
         finishInFlight();
 
-        if (!m_response->SerializeToString(&m_response_protocol->m_pb_data)) {
+        const bool direct_encode =
+            m_connection->getLoop()->isInLoopThread() &&
+            m_response->IsInitialized();
+        if (direct_encode) {
+            m_response_protocol->setProtobufMessage(m_response.get());
+            m_response_protocol->m_err_code = 0;
+            m_response_protocol->m_err_info.clear();
+        } else if (!m_response->SerializeToString(
+                       &m_response_protocol->m_pb_data)) {
             ROCKET_LOG_ERROR("{} | serialize error, origin message [{}]",
                              m_request_protocol->m_msg_id,
                              m_response->ShortDebugString());
@@ -124,6 +133,8 @@ class ServerCallState final : public google::protobuf::Closure {
         } else {
             m_response_protocol->m_err_code = 0;
             m_response_protocol->m_err_info.clear();
+        }
+        if (m_response_protocol->m_err_code == 0) {
             ROCKET_LOG_INFO(
                 "{} | dispatch success, request[{}], response[{}]",
                 m_request_protocol->m_msg_id, m_request->ShortDebugString(),
@@ -216,7 +227,9 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
 
     auto request_message = std::unique_ptr<google::protobuf::Message>(
         service->GetRequestPrototype(method).New());
-    if (!request_message->ParseFromString(req_protocol->m_pb_data)) {
+    const std::string_view request_payload = req_protocol->pbDataView();
+    if (!request_message->ParseFromArray(
+            request_payload.data(), static_cast<int>(request_payload.size()))) {
         ROCKET_LOG_ERROR("{} | deserialize error", req_protocol->m_msg_id);
         sendError(error::kFailedDeserialize, "deserialize error");
         return;

@@ -2,7 +2,7 @@
 // No per-request blocking threads — one callback fires the next request.
 //
 // Usage: async_bench [connections] [duration_s] [pipeline] [timeout_ms]
-//                    [server_io] [server_workers]
+//                    [server_io] [server_workers] [payload_bytes]
 // server_workers=0 keeps the inline IO-thread fast path (default).
 #include "order.pb.h"
 #include "rocket/common/config.h"
@@ -45,7 +45,8 @@ class OrderImpl : public Order {
   public:
     void makeOrder(::google::protobuf::RpcController*, const ::makeOrderRequest* req,
                    ::makeOrderResponse* rsp, ::google::protobuf::Closure* done) override {
-        rsp->set_ret_code(0); rsp->set_res_info("OK");
+        rsp->set_ret_code(0);
+        rsp->set_res_info(req->goods());
         rsp->set_order_id("ORD-" + std::to_string(req->price()));
         if (done) done->Run();
     }
@@ -126,9 +127,9 @@ struct BenchCallback : public google::protobuf::Closure {
         }
 
         // Reuse req/rsp/ctrl — Clear() instead of NewMessage (Hical pattern).
-        ch.req->Clear();
+        // The request object and its potentially large payload stay allocated;
+        // only the field that changes between calls is updated.
         ch.req->set_price(static_cast<int>(state->total.load()));
-        ch.req->set_goods("async");
         ch.rsp->Clear();
         ch.ctrl->Reset();
         ch.ctrl->SetTimeout(ch.timeout_ms);
@@ -172,6 +173,7 @@ int main(int argc, char* argv[]) {
     int timeout_ms  = argc > 4 ? std::atoi(argv[4]) : 5000;
     int server_io   = argc > 5 ? std::atoi(argv[5]) : 4;
     int server_workers = argc > 6 ? std::atoi(argv[6]) : 0;
+    int payload_bytes = argc > 7 ? std::max(0, std::atoi(argv[7])) : 5;
 
     int n_inflight = n_conns * pipeline;
 
@@ -210,9 +212,10 @@ int main(int argc, char* argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     printf("async_bench: connections=%d pipeline=%d inflight=%d duration=%ds "
-           "server_io=%d execution=%s workers=%d\n",
+           "server_io=%d execution=%s workers=%d payload=%dB\n",
            n_conns, pipeline, n_inflight, duration_s, server_io,
-           server_workers > 0 ? "worker" : "inline", server_workers);
+           server_workers > 0 ? "worker" : "inline", server_workers,
+           payload_bytes);
 
     // c connections, each shared by pipeline channels (Hical-style pipelining).
     auto pool = std::make_shared<rocket::RpcConnectionPool>(4, n_conns);
@@ -228,6 +231,8 @@ int main(int argc, char* argv[]) {
     auto method = Order::descriptor()->FindMethodByName("makeOrder");
 
     BenchState state;
+    std::string payload(static_cast<std::size_t>(payload_bytes), 'x');
+    if (payload_bytes == 5) payload = "async";
     std::vector<std::shared_ptr<rocket::RpcChannel>> connection_channels;
     connection_channels.reserve(n_conns);
     for (int i = 0; i < n_conns; ++i) {
@@ -251,7 +256,7 @@ int main(int argc, char* argv[]) {
     for (int cid = 0; cid < n_inflight; ++cid) {
         auto& ch = state.chans[cid];
         ch.req->set_price(cid * 1000);
-        ch.req->set_goods("async");
+        ch.req->set_goods(payload);
         ch.ctrl->SetTimeout(timeout_ms);
 
         auto* cb = allocCallback();

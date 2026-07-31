@@ -119,6 +119,49 @@ void testTinyPBNumericMessageIdFormat() {
             "encoder did not assign a non-zero numeric message ID");
 }
 
+void testTinyPBDirectAndBorrowedProtobufPayload() {
+    makeOrderRequest request;
+    request.set_price(2026);
+    request.set_goods("direct-payload");
+    const std::string expected = request.SerializeAsString();
+
+    auto message = std::make_shared<rocket::TinyPBProtocol>();
+    message->m_msg_id = 2001;
+    message->m_method_name = "Order.makeOrder";
+    message->setProtobufMessage(&request);
+
+    rocket::TinyPBCoder encoder;
+    rocket::TcpBuffer encoded;
+    std::vector<rocket::AbstractProtocol::s_ptr> messages{message};
+    require(encoder.encode(messages, encoded),
+            "direct protobuf TinyPB encode failed");
+    require(message->m_pb_data.empty(),
+            "direct protobuf encode populated the intermediate string");
+
+    rocket::TcpBuffer input;
+    require(input.append(encoded.readableView()),
+            "failed to append direct protobuf frame");
+    rocket::TinyPBCoder decoder(
+        rocket::TinyPBCoder::PayloadMode::Borrowed);
+    std::vector<rocket::AbstractProtocol::s_ptr> decoded;
+    require(decoder.decode(input, decoded) && decoded.size() == 1,
+            "borrowed protobuf TinyPB decode failed");
+
+    auto result = std::dynamic_pointer_cast<rocket::TinyPBProtocol>(
+        decoded.front());
+    require(result && result->m_pb_data.empty() &&
+                result->pbDataView() == expected,
+            "borrowed protobuf payload did not reference the encoded bytes");
+
+    makeOrderRequest parsed;
+    const auto payload = result->pbDataView();
+    require(parsed.ParseFromArray(payload.data(),
+                                  static_cast<int>(payload.size())) &&
+                parsed.price() == request.price() &&
+                parsed.goods() == request.goods(),
+            "borrowed protobuf payload could not be parsed directly");
+}
+
 void testTinyPBRejectsMalformedFrames() {
     auto message = std::make_shared<rocket::TinyPBProtocol>();
     message->m_msg_id = 1002;
@@ -850,6 +893,7 @@ int main() {
     try {
         testTinyPBLargeFrameAndPrefix();
         testTinyPBNumericMessageIdFormat();
+        testTinyPBDirectAndBorrowedProtobufPayload();
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
         testBufferWritesContiguousBytesToFd();

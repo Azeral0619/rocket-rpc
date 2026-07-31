@@ -218,7 +218,10 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
             }
         } else {
             client = std::make_shared<TcpClient>(m_peer_addr,
-                [] { return std::make_unique<TinyPBCoder>(); });
+                [] {
+                    return std::make_unique<TinyPBCoder>(
+                        TinyPBCoder::PayloadMode::Borrowed);
+                });
             std::atomic_store_explicit(&m_client, client, std::memory_order_release);
         }
     }
@@ -233,7 +236,14 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
     req_protocol->m_method_name = method->full_name();
     RunTime::GetRunTime()->m_method_name = req_protocol->m_method_name;
 
-    if (!request->SerializeToString(&(req_protocol->m_pb_data))) {
+    const bool direct_encode =
+        m_pool && client->getLoop()->isInLoopThread() &&
+        request->IsInitialized();
+    if (direct_encode) {
+        // sendRequest() executes inline on this same IO thread, so the
+        // borrowed protobuf pointer is consumed before CallMethod returns.
+        req_protocol->setProtobufMessage(request);
+    } else if (!request->SerializeToString(&(req_protocol->m_pb_data))) {
         std::string err_info = "failed to serialize";
         ROCKET_LOG_ERROR("{} | {}, origin requeset [{}] ", req_protocol->m_msg_id, err_info,
                          request->ShortDebugString());
@@ -287,7 +297,11 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                         return;
                     }
 
-                    if (!state->response->ParseFromString(rsp_protocol->m_pb_data)) {
+                    const std::string_view response_payload =
+                        rsp_protocol->pbDataView();
+                    if (!state->response->ParseFromArray(
+                            response_payload.data(),
+                            static_cast<int>(response_payload.size()))) {
                         ROCKET_LOG_ERROR("{} | deserialize error", rsp_protocol->m_msg_id);
                         state->controller->SetError(error::kFailedDeserialize,
                                                     "response deserialize error");

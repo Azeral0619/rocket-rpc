@@ -39,7 +39,13 @@ namespace rocket {
 class TinyPBCoder : public AbstractCoder {
   public:
     using s_ptr = std::shared_ptr<TinyPBCoder>;
-    TinyPBCoder() = default;
+    enum class PayloadMode : std::uint8_t {
+        Owned,
+        Borrowed,
+    };
+
+    explicit TinyPBCoder(PayloadMode payload_mode = PayloadMode::Owned)
+        : m_payload_mode(payload_mode) {}
     ~TinyPBCoder() override = default;
 
     TinyPBCoder(const TinyPBCoder&) = delete;
@@ -97,6 +103,8 @@ class TinyPBCoder : public AbstractCoder {
      * @return CRC32 校验和
      */
     static std::uint32_t calculateChecksum(const char* data, std::size_t len);
+
+    PayloadMode m_payload_mode{PayloadMode::Owned};
 };
 
 } // namespace rocket

@@ -155,7 +155,10 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
             TcpConnection::kDirectFlushConnectionThreshold * io_thread_count;
     auto client = std::make_shared<TcpClient>(
         std::move(addr),
-        [] { return std::make_unique<TinyPBCoder>(); },
+        [] {
+            return std::make_unique<TinyPBCoder>(
+                TinyPBCoder::PayloadMode::Borrowed);
+        },
         loop,
         direct_output_flush);
 

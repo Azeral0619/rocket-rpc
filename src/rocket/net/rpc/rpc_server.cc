@@ -29,7 +29,10 @@ extern "C" void requestShutdown(int signal_number) {
 RpcServer::RpcServer(NetAddr::s_ptr local_addr, std::size_t worker_threads,
                      bool handle_process_signals,
                      std::size_t max_pending_tasks)
-    : m_server(std::move(local_addr), [] { return std::make_unique<TinyPBCoder>(); }),
+    : m_server(std::move(local_addr), [] {
+          return std::make_unique<TinyPBCoder>(
+              TinyPBCoder::PayloadMode::Borrowed);
+      }),
       m_dispatcher(worker_threads, max_pending_tasks),
       m_handle_process_signals(handle_process_signals) {
 

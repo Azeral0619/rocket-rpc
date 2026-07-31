@@ -6,6 +6,11 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+
+namespace google::protobuf {
+class Message;
+}
 
 namespace rocket {
 
@@ -59,6 +64,38 @@ struct TinyPBProtocol : public AbstractProtocol {
 
     [[nodiscard]] std::string_view getProtocolType() const override { return "TinyPB"; }
 
+    // Incoming RPC frames can borrow their payload from TcpBuffer until the
+    // connection's message callback returns. Generic TinyPBCoder users remain
+    // in owned mode by default.
+    void setBorrowedPbData(std::string_view payload) noexcept {
+        m_pb_data.clear();
+        m_borrowed_pb_data = payload;
+        m_pb_message = nullptr;
+        m_pb_data_is_borrowed = true;
+    }
+
+    void setOwnedPbData(std::string payload) {
+        m_pb_data = std::move(payload);
+        m_borrowed_pb_data = {};
+        m_pb_message = nullptr;
+        m_pb_data_is_borrowed = false;
+    }
+
+    [[nodiscard]] std::string_view pbDataView() const noexcept {
+        return m_pb_data_is_borrowed ? m_borrowed_pb_data
+                                     : std::string_view(m_pb_data);
+    }
+
+    // Valid only for a synchronous encode on the thread calling send(). The
+    // coder never retains this pointer after encode() returns.
+    void setProtobufMessage(const google::protobuf::Message* message) noexcept {
+        m_pb_message = message;
+    }
+
+    [[nodiscard]] const google::protobuf::Message* protobufMessage() const noexcept {
+        return m_pb_message;
+    }
+
     // 协议字段
     std::int32_t m_pk_len{0}; ///< 整包长度
     // m_msg_id 继承自 AbstractProtocol
@@ -74,6 +111,11 @@ struct TinyPBProtocol : public AbstractProtocol {
     std::int32_t m_check_sum{0}; ///< 校验和
 
     bool parse_success{false}; ///< 解析是否成功
+
+  private:
+    std::string_view m_borrowed_pb_data;
+    const google::protobuf::Message* m_pb_message{nullptr};
+    bool m_pb_data_is_borrowed{false};
 };
 
 } // namespace rocket

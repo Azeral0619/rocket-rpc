@@ -12,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <netinet/in.h>
+#include <google/protobuf/message.h>
 #include <span>
 #include <string>
 #include <vector>
@@ -76,9 +77,21 @@ bool TinyPBCoder::encode(
             msg->m_msg_id = MsgIDUtil::GenMsgID();
         }
 
-        const std::size_t packet_size =
+        const auto* protobuf_message = msg->protobufMessage();
+        const std::string_view protobuf_bytes = msg->pbDataView();
+        const std::size_t protobuf_size =
+            protobuf_message != nullptr ? protobuf_message->ByteSizeLong()
+                                        : protobuf_bytes.size();
+        const std::size_t fields_size =
             TinyPBProtocol::HEADER_SIZE + msg->m_method_name.length() +
-            msg->m_err_info.length() + msg->m_pb_data.length();
+            msg->m_err_info.length();
+        if (fields_size > kMaxPacketSize ||
+            protobuf_size > kMaxPacketSize - fields_size) {
+            ROCKET_LOG_ERROR("TinyPB packet too large: {} bytes",
+                             fields_size + protobuf_size);
+            return false;
+        }
+        const std::size_t packet_size = fields_size + protobuf_size;
         if (packet_size > kMaxPacketSize ||
             packet_size >
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -104,7 +117,25 @@ bool TinyPBCoder::encode(
         p = writeInt32To(p, msg->m_err_code);
         p = writeInt32To(p, static_cast<std::int32_t>(msg->m_err_info.length()));
         p = appendTo(p, msg->m_err_info.data(), msg->m_err_info.length());
-        p = appendTo(p, msg->m_pb_data.data(), msg->m_pb_data.length());
+        if (protobuf_message != nullptr) {
+            // ByteSizeLong() above populated protobuf's cached sizes. The RPC
+            // caller already checked IsInitialized(), so avoid SerializeToArray
+            // repeating both operations before writing the same bytes.
+            auto* const payload_begin =
+                reinterpret_cast<std::uint8_t*>(p);
+            auto* const payload_end =
+                protobuf_message->SerializeWithCachedSizesToArray(
+                    payload_begin);
+            if (payload_end != payload_begin + protobuf_size) {
+                ROCKET_LOG_ERROR(
+                    "TinyPB protobuf serialization failed for message [{}]",
+                    msg->m_msg_id);
+                return false;
+            }
+            p = reinterpret_cast<char*>(payload_end);
+        } else {
+            p = appendTo(p, protobuf_bytes.data(), protobuf_bytes.size());
+        }
 
         const std::size_t body_len = static_cast<std::size_t>(p - buf);
         const std::uint32_t checksum = calculateChecksum(buf, body_len);
@@ -273,7 +304,13 @@ bool TinyPBCoder::decode(
             rejectPacket("invalid protobuf payload length");
             return false;
         }
-        message->m_pb_data.assign(data + parse_index, checksum_index - parse_index);
+        const std::string_view protobuf_payload(
+            data + parse_index, checksum_index - parse_index);
+        if (m_payload_mode == PayloadMode::Borrowed) {
+            message->setBorrowedPbData(protobuf_payload);
+        } else {
+            message->m_pb_data.assign(protobuf_payload);
+        }
         parse_index = checksum_index;
 
         // 6. checksum
