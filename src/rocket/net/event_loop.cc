@@ -16,6 +16,7 @@ namespace rocket {
 
 namespace {
 constexpr int kEpollWaitTimeoutMs = -1; // infinite
+constexpr int kMaxPendingTaskRounds = 8;
 thread_local EventLoop* t_current_event_loop = nullptr;
 } // namespace
 
@@ -103,20 +104,32 @@ void EventLoop::processPendingTasks() {
     // A task running on the loop may defer follow-up work without waking the
     // poller (for example, one batched socket flush after an MPSC drain).
     // Drain those locally-produced generations before sleeping again.
-    while (true) {
+    for (int round = 0; round < kMaxPendingTaskRounds; ++round) {
         std::queue<std::function<void()>> tasks;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             tasks.swap(m_pending_tasks);
         }
         if (tasks.empty()) {
-            break;
+            return;
         }
         while (!tasks.empty()) {
             auto& task = tasks.front();
             if (task) task();
             tasks.pop();
         }
+    }
+
+    // Preserve reactor fairness if tasks continuously enqueue more tasks.
+    // Leave the remainder for the next iteration and make its poll return
+    // immediately even when the follow-up was queued without a wakeup.
+    bool has_pending = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        has_pending = !m_pending_tasks.empty();
+    }
+    if (has_pending) {
+        wakeup();
     }
 }
 
