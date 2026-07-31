@@ -421,6 +421,51 @@ void testRpcExecutionModes() {
     testRpcExecutionMode(rocket::RpcExecutionMode::WorkerPool, true, true);
 }
 
+class AsyncCompletionOrder final : public Order {
+  public:
+    void makeOrder(::google::protobuf::RpcController*,
+                   const ::makeOrderRequest* request,
+                   ::makeOrderResponse* response,
+                   ::google::protobuf::Closure* done) override {
+        const int price = request->price();
+        std::thread([price, response, done] {
+            std::this_thread::sleep_for(20ms);
+            response->set_ret_code(0);
+            response->set_res_info("OK");
+            response->set_order_id("async-" + std::to_string(price));
+            if (done) done->Run();
+        }).detach();
+    }
+};
+
+void testAsyncRpcServiceRetainsCallState() {
+    const auto port = reserveUnusedPort();
+    auto address = std::make_shared<rocket::IPNetAddr>("127.0.0.1", port);
+
+    rocket::RpcServer server(address, 1, false);
+    server.registerService(std::make_shared<AsyncCompletionOrder>());
+    std::thread server_thread([&] { server.start(); });
+    std::this_thread::sleep_for(100ms);
+
+    auto pool = std::make_shared<rocket::RpcConnectionPool>(1, 1);
+    auto channel = std::make_shared<rocket::RpcChannel>(address, pool);
+    makeOrderRequest request;
+    request.set_price(73);
+    makeOrderResponse response;
+    rocket::RpcController controller;
+    const auto* method = Order::descriptor()->FindMethodByName("makeOrder");
+
+    const int result = channel->CallMethodBlocking(
+        method, &controller, &request, &response, 2000);
+    pool->shutdown();
+    server.stop();
+    server_thread.join();
+
+    require(result == 0, "asynchronous RPC service call failed");
+    require(response.order_id() == "async-73",
+            "asynchronous RPC service lost its retained call state");
+}
+
 rocket::Task<std::string> callOrderWithTypedClient(
     rocket::Client<Order_Stub> client, int price) {
     makeOrderRequest request;
@@ -816,6 +861,7 @@ int main() {
         testTimingWheelEagerlyRemovesShortCancelledTimer();
         testThreadPoolRejectsWhenBoundedQueueIsFull();
         testRpcExecutionModes();
+        testAsyncRpcServiceRetainsCallState();
         testTypedClientCallModes();
         testRpcWorkerQueueOverloadIsExplicit();
         testTaskRunWaitsForCompletion();

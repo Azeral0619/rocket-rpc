@@ -55,15 +55,6 @@ class RpcDispatcher {
     static bool parseServiceFullName(std::string_view full_name, std::string_view& service_name,
                                      std::string_view& method_name);
     [[nodiscard]] RpcExecutionMode executionModeFor(std::string_view full_method_name) const;
-    static void invokeService(const Services_ptr& service,
-                              const google::protobuf::MethodDescriptor* method,
-                              const std::shared_ptr<google::protobuf::Message>& request,
-                              const std::shared_ptr<google::protobuf::Message>& response,
-                              const TinyPBProtocol::s_ptr& request_protocol,
-                              const TinyPBProtocol::s_ptr& response_protocol,
-                              const TcpConnection::s_ptr& conn,
-                              std::string_view method_name);
-
     std::map<std::string, Services_ptr, std::less<>> m_service_map;
     std::map<std::string, RpcExecutionMode, std::less<>> m_method_execution_modes;
     RpcExecutionMode m_default_execution_mode{RpcExecutionMode::Inline};

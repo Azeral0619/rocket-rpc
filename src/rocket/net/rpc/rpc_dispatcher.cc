@@ -20,18 +20,141 @@ namespace rocket {
 
 namespace {
 
-class SelfDeletingClosure final : public google::protobuf::Closure {
-  public:
-    explicit SelfDeletingClosure(std::function<void()> callback)
-        : m_callback(std::move(callback)) {}
+struct ServerCallFreeNode {
+    ServerCallFreeNode* next{nullptr};
+};
 
-    void Run() override {
-        std::unique_ptr<SelfDeletingClosure> self(this);
-        if (m_callback) m_callback();
+class ServerCallPool {
+  public:
+    ~ServerCallPool() {
+        while (m_head != nullptr) {
+            auto* node = m_head;
+            m_head = node->next;
+            ::operator delete(node);
+        }
+    }
+
+    void* allocate(std::size_t size) {
+        if (m_head == nullptr) return ::operator new(size);
+        auto* node = m_head;
+        m_head = node->next;
+        --m_size;
+        return node;
+    }
+
+    void deallocate(void* ptr) noexcept {
+        constexpr std::size_t kMaxCachedCalls = 512;
+        if (m_size >= kMaxCachedCalls) {
+            ::operator delete(ptr);
+            return;
+        }
+        auto* node = static_cast<ServerCallFreeNode*>(ptr);
+        node->next = m_head;
+        m_head = node;
+        ++m_size;
     }
 
   private:
-    std::function<void()> m_callback;
+    ServerCallFreeNode* m_head{nullptr};
+    std::size_t m_size{0};
+};
+
+thread_local ServerCallPool t_server_call_pool;
+
+// One allocation owns all state retained by an asynchronous protobuf method.
+// The old path separately allocated shared_ptr control blocks for request,
+// response and controller plus a heap std::function closure.
+class ServerCallState final : public google::protobuf::Closure {
+  public:
+    ServerCallState(
+        std::shared_ptr<google::protobuf::Service> service,
+        const google::protobuf::MethodDescriptor* method,
+        std::unique_ptr<google::protobuf::Message> request,
+        std::unique_ptr<google::protobuf::Message> response,
+        TinyPBProtocol::s_ptr request_protocol,
+        TinyPBProtocol::s_ptr response_protocol,
+        TcpConnection::s_ptr connection)
+        : m_service(std::move(service)), m_method(method),
+          m_request(std::move(request)), m_response(std::move(response)),
+          m_request_protocol(std::move(request_protocol)),
+          m_response_protocol(std::move(response_protocol)),
+          m_connection(std::move(connection)) {
+        m_controller.SetLocalAddr(m_connection->getLocalAddr());
+        m_controller.SetPeerAddr(m_connection->getPeerAddr());
+        m_controller.SetMsgId(m_request_protocol->m_msg_id);
+    }
+
+    static void* operator new(std::size_t size) {
+        return t_server_call_pool.allocate(size);
+    }
+
+    static void operator delete(void* ptr) noexcept {
+        t_server_call_pool.deallocate(ptr);
+    }
+
+    void markInFlight() {
+        m_connection->incrInFlight();
+        m_in_flight = true;
+    }
+
+    void invoke() {
+        auto* runtime = RunTime::GetRunTime();
+        runtime->m_msgid = m_request_protocol->m_msg_id;
+        runtime->m_method_name = m_method->name();
+
+        // CallMethod may complete synchronously and delete this through Run().
+        // Do not access members after the call returns.
+        m_service->CallMethod(m_method, &m_controller, m_request.get(),
+                              m_response.get(), this);
+    }
+
+    void Run() override {
+        std::unique_ptr<ServerCallState> self(this);
+        finishInFlight();
+
+        if (!m_response->SerializeToString(&m_response_protocol->m_pb_data)) {
+            ROCKET_LOG_ERROR("{} | serialize error, origin message [{}]",
+                             m_request_protocol->m_msg_id,
+                             m_response->ShortDebugString());
+            m_response_protocol->m_err_code = error::kFailedSerialize;
+            m_response_protocol->m_err_info = "serialize error";
+            m_response_protocol->m_err_info_len =
+                static_cast<std::int32_t>(
+                    m_response_protocol->m_err_info.length());
+        } else {
+            m_response_protocol->m_err_code = 0;
+            m_response_protocol->m_err_info.clear();
+            ROCKET_LOG_INFO(
+                "{} | dispatch success, request[{}], response[{}]",
+                m_request_protocol->m_msg_id, m_request->ShortDebugString(),
+                m_response->ShortDebugString());
+        }
+        m_connection->send(std::move(m_response_protocol));
+    }
+
+    void reject(std::int32_t err_code, std::string_view err_info) {
+        std::unique_ptr<ServerCallState> self(this);
+        finishInFlight();
+        RpcDispatcher::setTinyPBError(m_response_protocol, err_code, err_info);
+        m_connection->send(std::move(m_response_protocol));
+    }
+
+  private:
+    void finishInFlight() noexcept {
+        if (!m_in_flight) return;
+        m_in_flight = false;
+        m_connection->decrInFlight();
+    }
+
+    std::shared_ptr<google::protobuf::Service> m_service;
+    const google::protobuf::MethodDescriptor* m_method;
+    std::unique_ptr<google::protobuf::Message> m_request;
+    std::unique_ptr<google::protobuf::Message> m_response;
+    TinyPBProtocol::s_ptr m_request_protocol;
+    TinyPBProtocol::s_ptr m_response_protocol;
+    TcpConnection::s_ptr m_connection;
+    RpcController m_controller;
+    bool m_in_flight{false};
 };
 
 } // namespace
@@ -43,15 +166,17 @@ RpcDispatcher::RpcDispatcher(std::size_t worker_threads, std::size_t max_pending
 void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::s_ptr response,
                              const TcpConnection::s_ptr& conn) {
 
-    auto req_protocol = std::dynamic_pointer_cast<TinyPBProtocol>(request);
-    auto rsp_protocol = std::dynamic_pointer_cast<TinyPBProtocol>(response);
+    auto req_protocol =
+        std::dynamic_pointer_cast<TinyPBProtocol>(std::move(request));
+    auto rsp_protocol =
+        std::dynamic_pointer_cast<TinyPBProtocol>(std::move(response));
 
     if (!req_protocol || !rsp_protocol) {
         // Not a TinyPB message — can't handle
         return;
     }
 
-    std::string method_full_name = req_protocol->m_method_name;
+    const std::string_view method_full_name = req_protocol->m_method_name;
     std::string_view service_name;
     std::string_view method_name;
 
@@ -89,87 +214,45 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
         return;
     }
 
-    // shared_ptr directly from prototype (avoid unique_ptr → shared_ptr conversion).
-    auto req_msg_ptr = std::shared_ptr<google::protobuf::Message>(service->GetRequestPrototype(method).New());
-    if (!req_msg_ptr->ParseFromString(req_protocol->m_pb_data)) {
+    auto request_message = std::unique_ptr<google::protobuf::Message>(
+        service->GetRequestPrototype(method).New());
+    if (!request_message->ParseFromString(req_protocol->m_pb_data)) {
         ROCKET_LOG_ERROR("{} | deserialize error", req_protocol->m_msg_id);
         sendError(error::kFailedDeserialize, "deserialize error");
         return;
     }
 
-    ROCKET_LOG_INFO("{} | get rpc request[{}]", req_protocol->m_msg_id, req_msg_ptr->ShortDebugString());
+    ROCKET_LOG_INFO("{} | get rpc request[{}]", req_protocol->m_msg_id,
+                    request_message->ShortDebugString());
 
-    auto rsp_msg_ptr = std::shared_ptr<google::protobuf::Message>(service->GetResponsePrototype(method).New());
+    auto response_message = std::unique_ptr<google::protobuf::Message>(
+        service->GetResponsePrototype(method).New());
+
+    auto* call = new ServerCallState(
+        service, method, std::move(request_message),
+        std::move(response_message), std::move(req_protocol),
+        std::move(rsp_protocol), conn);
 
     // Track in-flight for graceful shutdown.
-    conn->incrInFlight();
+    call->markInFlight();
 
     const auto mode = executionModeFor(method->full_name());
     if (mode == RpcExecutionMode::Inline) {
-        invokeService(service, method, req_msg_ptr, rsp_msg_ptr, req_protocol,
-                      rsp_protocol, conn, method->name());
+        call->invoke();
         return;
     }
 
-    const bool queued = m_worker_pool.tryExecute(
-        [service, method, req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn] {
-            invokeService(service, method, req_msg_ptr, rsp_msg_ptr, req_protocol,
-                          rsp_protocol, conn, method->name());
-        });
+    const bool queued =
+        m_worker_pool.tryExecute([call] { call->invoke(); });
     if (!queued) {
-        conn->decrInFlight();
         const bool stopping = m_stopping.load(std::memory_order_acquire);
         const auto err_code =
             stopping ? error::kRpcShutdown : error::kRpcServerOverloaded;
         const std::string_view err_info =
             stopping ? "server is shutting down" : "server worker queue is full";
-        ROCKET_LOG_WARN("{} | {}", req_protocol->m_msg_id, err_info);
-        sendError(err_code, err_info);
+        ROCKET_LOG_WARN("server call rejected: {}", err_info);
+        call->reject(err_code, err_info);
     }
-}
-
-void RpcDispatcher::invokeService(
-    const Services_ptr& service, const google::protobuf::MethodDescriptor* method,
-    const std::shared_ptr<google::protobuf::Message>& req_msg_ptr,
-    const std::shared_ptr<google::protobuf::Message>& rsp_msg_ptr,
-    const TinyPBProtocol::s_ptr& req_protocol,
-    const TinyPBProtocol::s_ptr& rsp_protocol, const TcpConnection::s_ptr& conn,
-    std::string_view method_name) {
-    auto* runtime = RunTime::GetRunTime();
-    runtime->m_msgid = req_protocol->m_msg_id;
-    runtime->m_method_name = method_name;
-
-    auto controller_ptr = std::make_shared<RpcController>();
-    controller_ptr->SetLocalAddr(conn->getLocalAddr());
-    controller_ptr->SetPeerAddr(conn->getPeerAddr());
-    controller_ptr->SetMsgId(req_protocol->m_msg_id);
-
-    auto* closure = new SelfDeletingClosure(
-        [req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn,
-         controller_ptr]() mutable {
-            conn->decrInFlight();
-
-            if (!rsp_msg_ptr->SerializeToString(&(rsp_protocol->m_pb_data))) {
-                ROCKET_LOG_ERROR("{} | serialize error, origin message [{}]",
-                                 req_protocol->m_msg_id,
-                                 rsp_msg_ptr->ShortDebugString());
-                rsp_protocol->m_err_code = error::kFailedSerialize;
-                rsp_protocol->m_err_info = "serialize error";
-                rsp_protocol->m_err_info_len =
-                    static_cast<std::int32_t>(rsp_protocol->m_err_info.length());
-            } else {
-                rsp_protocol->m_err_code = 0;
-                rsp_protocol->m_err_info = "";
-                ROCKET_LOG_INFO(
-                    "{} | dispatch success, request[{}], response[{}]",
-                    req_protocol->m_msg_id, req_msg_ptr->ShortDebugString(),
-                    rsp_msg_ptr->ShortDebugString());
-            }
-            conn->send(rsp_protocol);
-        });
-
-    service->CallMethod(method, controller_ptr.get(), req_msg_ptr.get(),
-                        rsp_msg_ptr.get(), closure);
 }
 
 bool RpcDispatcher::parseServiceFullName(std::string_view full_name, std::string_view& service_name,
