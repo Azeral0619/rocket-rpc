@@ -164,8 +164,13 @@ void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> message
         return;
     }
 
-    if (!m_fd_event->isListening(FdEvent::TriggerEvent::OUT_EVENT)) {
-        enableWriting();
+    // Hical-style optimistic write: sockets are non-blocking, so try to hand
+    // the encoded batch straight to the kernel while it is writable.  The
+    // common small-RPC path then avoids both EPOLL_CTL_MOD calls and the extra
+    // epoll round trip.  A partial write/EAGAIN falls back to normal EPOLLOUT.
+    const bool all_written = flushOutputInLoop();
+    if (m_state.load(std::memory_order_acquire) == TcpState::Closed) {
+        return;
     }
 
     // High-water mark edge trigger (checked once per batch).
@@ -175,6 +180,8 @@ void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> message
             m_hwm_callback(shared_from_this(), m_out_buffer->readAble());
         }
     }
+
+    updateWriteInterest(all_written);
 }
 
 void TcpConnection::drainWriteQueue() {
@@ -296,8 +303,17 @@ void TcpConnection::handleWrite() {
         return;
     }
 
+    const bool all_written = flushOutputInLoop();
+    if (m_state.load(std::memory_order_acquire) == TcpState::Closed) {
+        return;
+    }
+    updateWriteInterest(all_written);
+}
+
+bool TcpConnection::flushOutputInLoop() {
+    m_loop->assertInLoopThread();
+
     int saved_errno = 0;
-    bool all_written = false;
 
     while (m_out_buffer->readAble() > 0) {
         const ssize_t n = m_out_buffer->writeToFd(m_fd, &saved_errno);
@@ -313,16 +329,28 @@ void TcpConnection::handleWrite() {
             }
             ROCKET_LOG_ERROR("write error fd={} errno={}", m_fd, saved_errno);
             handleError();
-            return;
+            return false;
         }
+        // A zero-byte write made no progress.  Keep the data queued and let
+        // EPOLLOUT retry instead of spinning in the EventLoop thread.
+        break;
     }
 
-    if (m_out_buffer->readAble() == 0) {
-        all_written = true;
-        disableWriting();
+    return m_out_buffer->readAble() == 0;
+}
+
+void TcpConnection::updateWriteInterest(bool all_written) {
+    m_loop->assertInLoopThread();
+
+    if (all_written) {
+        if (m_fd_event->isListening(FdEvent::TriggerEvent::OUT_EVENT)) {
+            disableWriting();
+        }
         if (m_write_complete_callback) {
             m_write_complete_callback(shared_from_this());
         }
+    } else if (!m_fd_event->isListening(FdEvent::TriggerEvent::OUT_EVENT)) {
+        enableWriting();
     }
 
     // High-water mark recovery edge trigger.

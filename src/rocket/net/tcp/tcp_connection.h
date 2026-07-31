@@ -103,6 +103,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void sendInLoop(AbstractProtocol::s_ptr message);
     void sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> messages);
     void drainWriteQueue();
+    [[nodiscard]] bool flushOutputInLoop();
+    void updateWriteInterest(bool all_written);
     void shutdownInLoop();
     void enableWriting();
     void disableWriting();
