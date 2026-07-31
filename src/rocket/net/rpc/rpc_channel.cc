@@ -68,7 +68,8 @@ RpcConnectionPool::s_ptr GetDefaultPool() {
 }
 
 bool RpcChannel::finishRpc(const std::shared_ptr<RequestState>& state,
-                           std::function<void()> before_done) {
+                           std::function<void()> before_done,
+                           bool cancel_pending_read) {
     if (!state) return false;
 
     bool expected = false;
@@ -86,7 +87,7 @@ bool RpcChannel::finishRpc(const std::shared_ptr<RequestState>& state,
         }
         state->timer.reset();
     }
-    if (state->client && !state->msg_id.empty()) {
+    if (cancel_pending_read && state->client && !state->msg_id.empty()) {
         state->client->cancelRead(state->msg_id);
     }
 
@@ -297,7 +298,7 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                         state->controller->SetError(error::kFailedDeserialize,
                                                     "response deserialize error");
                     }
-                });
+                }, /*cancel_pending_read=*/false);
             });
         if (state->finished.load(std::memory_order_acquire)) {
             client->cancelRead(req_protocol->m_msg_id);

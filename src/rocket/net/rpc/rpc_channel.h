@@ -96,7 +96,8 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
     // Complete exactly one request generation.  Timer, response and connect
     // callbacks all race through this per-request gate.
     static bool finishRpc(const std::shared_ptr<RequestState>& state,
-                          std::function<void()> before_done = {});
+                          std::function<void()> before_done = {},
+                          bool cancel_pending_read = true);
 
     std::shared_ptr<NetAddr> m_peer_addr{nullptr};
     std::shared_ptr<NetAddr> m_local_addr{nullptr};

@@ -164,7 +164,10 @@ void TcpClient::readMessage(std::string_view msg_id, ReadCallback cb) {
 
 void TcpClient::cancelRead(std::string_view msg_id) {
     std::lock_guard<std::mutex> lk(m_mutex);
-    m_read_callbacks.erase(std::string(msg_id));
+    const auto it = m_read_callbacks.find(msg_id);
+    if (it != m_read_callbacks.end()) {
+        m_read_callbacks.erase(it);
+    }
 }
 
 AbstractProtocol::s_ptr TcpClient::requestSync(AbstractProtocol::s_ptr req, int timeout_ms) {
