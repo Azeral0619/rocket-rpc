@@ -175,7 +175,8 @@ int main(int argc, char* argv[]) {
 
     // Set server IO threads via temp config (default 4 from ConfigData).
     if (server_io > 0) {
-        std::string yaml = "LOG:\n  file_name: /dev/null\nSERVER:\n  port: 12998\n  io_threads: "
+        std::string yaml = "LOG:\n  file_name: /dev/null\n  level: ERROR\n"
+                           "SERVER:\n  port: 12998\n  io_threads: "
                          + std::to_string(server_io) + "\n";
         std::string path = "/tmp/bench_config_" + std::to_string(getpid()) + ".yaml";
         std::ofstream ofs(path);
