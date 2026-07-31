@@ -1,7 +1,9 @@
 // True async benchmark: all in-flight lanes are driven by IO-thread callbacks.
 // No per-request blocking threads — one callback fires the next request.
 //
-// Usage: async_bench [connections] [duration_s] [pipeline] [timeout_ms] [server_io]
+// Usage: async_bench [connections] [duration_s] [pipeline] [timeout_ms]
+//                    [server_io] [server_workers]
+// server_workers=0 keeps the inline IO-thread fast path (default).
 #include "order.pb.h"
 #include "rocket/common/config.h"
 #include "rocket/common/log.h"
@@ -169,6 +171,7 @@ int main(int argc, char* argv[]) {
     int pipeline    = argc > 3 ? std::atoi(argv[3]) : 1;
     int timeout_ms  = argc > 4 ? std::atoi(argv[4]) : 5000;
     int server_io   = argc > 5 ? std::atoi(argv[5]) : 4;
+    int server_workers = argc > 6 ? std::atoi(argv[6]) : 0;
 
     int n_inflight = n_conns * pipeline;
 
@@ -196,14 +199,20 @@ int main(int argc, char* argv[]) {
     // This benchmark intentionally terminates with _exit().  Keep the
     // process-default SIGINT/SIGTERM behavior so an interrupted warm-up
     // cannot leave a detached embedded server holding port 12998.
-    rocket::RpcServer server(addr, 1, false);
+    rocket::RpcServer server(
+        addr, static_cast<std::size_t>(std::max(server_workers, 1)), false);
+    if (server_workers > 0) {
+        server.setDefaultExecutionMode(rocket::RpcExecutionMode::WorkerPool);
+    }
     server.registerService(std::make_shared<OrderImpl>());
     std::thread svr([&] { server.start(); });
     svr.detach();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    printf("async_bench: connections=%d pipeline=%d inflight=%d duration=%ds server_io=%d\n",
-           n_conns, pipeline, n_inflight, duration_s, server_io);
+    printf("async_bench: connections=%d pipeline=%d inflight=%d duration=%ds "
+           "server_io=%d execution=%s workers=%d\n",
+           n_conns, pipeline, n_inflight, duration_s, server_io,
+           server_workers > 0 ? "worker" : "inline", server_workers);
 
     // c connections, each shared by pipeline channels (Hical-style pipelining).
     auto pool = std::make_shared<rocket::RpcConnectionPool>(4, n_conns);
