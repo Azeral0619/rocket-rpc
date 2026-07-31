@@ -21,7 +21,7 @@ int main(int argc, char* argv[]) {
     request.set_goods("apple");
 
     auto result = order.callBlocking<&Order_Stub::makeOrder>(
-        std::move(request), {.timeout = 3s});
+        request, {.timeout = 3s});
     if (!result) {
         ROCKET_LOG_ERROR("RPC failed: code={}, message={}",
                          result.status().code(), result.status().message());

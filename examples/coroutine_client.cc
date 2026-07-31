@@ -18,7 +18,7 @@ rocket::Task<int> makeOrders(rocket::Client<Order_Stub> order) {
     req1.set_price(100);
     req1.set_goods("apple");
     auto result1 = co_await order.call<&Order_Stub::makeOrder>(
-        std::move(req1), {.timeout = 3s});
+        req1, {.timeout = 3s});
     if (!result1) co_return result1.status().code();
     std::cout << "Order 1: " << result1.value().order_id() << "\n";
 
@@ -26,7 +26,7 @@ rocket::Task<int> makeOrders(rocket::Client<Order_Stub> order) {
     req2.set_price(200);
     req2.set_goods("banana");
     auto result2 = co_await order.call<&Order_Stub::makeOrder>(
-        std::move(req2), {.timeout = 3s});
+        req2, {.timeout = 3s});
     if (!result2) co_return result2.status().code();
     std::cout << "Order 2: " << result2.value().order_id() << "\n";
 
@@ -34,7 +34,7 @@ rocket::Task<int> makeOrders(rocket::Client<Order_Stub> order) {
     req3.set_price(300);
     req3.set_goods("cherry");
     auto result3 = co_await order.call<&Order_Stub::makeOrder>(
-        std::move(req3), {.timeout = 3s});
+        req3, {.timeout = 3s});
     if (!result3) co_return result3.status().code();
     std::cout << "Order 3: " << result3.value().order_id() << "\n";
 

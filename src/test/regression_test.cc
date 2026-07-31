@@ -429,7 +429,7 @@ rocket::Task<std::string> callOrderWithTypedClient(
 
     auto result =
         co_await client.call<&Order_Stub::makeOrder>(
-            std::move(request), rocket::CallOptions{.timeout = 2s});
+            request, rocket::CallOptions{.timeout = 2s});
     if (!result) {
         co_return std::string("error:") +
                   std::to_string(result.status().code());
@@ -459,7 +459,7 @@ void testTypedClientCallModes() {
     makeOrderRequest invalid_request;
     auto invalid_result =
         invalid_client.callBlocking<&Order_Stub::makeOrder>(
-            std::move(invalid_request),
+            invalid_request,
             rocket::CallOptions{.timeout = 2s});
     require(!invalid_result,
             "typed client accepted a missing peer address");
@@ -471,7 +471,7 @@ void testTypedClientCallModes() {
     blocking_request.set_goods("blocking");
     auto blocking_result =
         client.callBlocking<&Order_Stub::makeOrder>(
-            std::move(blocking_request),
+            blocking_request,
             rocket::CallOptions{.timeout = 2s});
     require(blocking_result.ok(), "typed blocking RPC failed");
     require(blocking_result.value().order_id() == "thread-101",
@@ -485,23 +485,25 @@ void testTypedClientCallModes() {
         std::string order_id;
     };
     auto async_state = std::make_shared<AsyncState>();
-    makeOrderRequest async_request;
-    async_request.set_price(202);
-    async_request.set_goods("callback");
-    client.callAsync<&Order_Stub::makeOrder>(
-        std::move(async_request), rocket::CallOptions{.timeout = 2s},
-        [async_state](rocket::RpcResult<makeOrderResponse> result) {
-            {
-                std::lock_guard<std::mutex> lock(async_state->mutex);
-                async_state->ok = result.ok();
-                if (result) {
-                    async_state->order_id =
-                        std::move(result).value().order_id();
+    {
+        makeOrderRequest async_request;
+        async_request.set_price(202);
+        async_request.set_goods("callback");
+        client.callAsync<&Order_Stub::makeOrder>(
+            async_request, rocket::CallOptions{.timeout = 2s},
+            [async_state](rocket::RpcResult<makeOrderResponse> result) {
+                {
+                    std::lock_guard<std::mutex> lock(async_state->mutex);
+                    async_state->ok = result.ok();
+                    if (result) {
+                        async_state->order_id =
+                            std::move(result).value().order_id();
+                    }
+                    async_state->done = true;
                 }
-                async_state->done = true;
-            }
-            async_state->cv.notify_one();
-        });
+                async_state->cv.notify_one();
+            });
+    }
     {
         std::unique_lock<std::mutex> lock(async_state->mutex);
         require(async_state->cv.wait_for(

@@ -309,7 +309,8 @@ class Client {
 
     template <auto Method>
     auto call(
-        typename detail::RpcMethodTraits<decltype(Method)>::request_type request,
+        const typename detail::RpcMethodTraits<
+            decltype(Method)>::request_type& request,
         CallOptions options = {}) const {
         using Traits = detail::RpcMethodTraits<decltype(Method)>;
         using MethodService = typename Traits::service_type;
@@ -330,18 +331,21 @@ class Client {
 
     template <auto Method>
     auto callBlocking(
-        typename detail::RpcMethodTraits<decltype(Method)>::request_type request,
+        const typename detail::RpcMethodTraits<
+            decltype(Method)>::request_type& request,
         CallOptions options = {}) const {
-        return std::move(
-                   call<Method>(std::move(request), std::move(options)))
+        return std::move(call<Method>(request, std::move(options)))
             .get();
     }
 
     template <auto Method, typename Callback>
     void callAsync(
-        typename detail::RpcMethodTraits<decltype(Method)>::request_type request,
+        const typename detail::RpcMethodTraits<
+            decltype(Method)>::request_type& request,
         CallOptions options, Callback&& callback) const {
-        std::move(call<Method>(std::move(request), std::move(options)))
+        // RpcChannel serializes request synchronously before call() returns,
+        // so asynchronous completion never retains this borrowed reference.
+        std::move(call<Method>(request, std::move(options)))
             .then(std::forward<Callback>(callback));
     }
 

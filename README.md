@@ -12,7 +12,7 @@ using namespace std::chrono_literals;
 auto order = rocket::MakeClient<Order_Stub>("order_server");
 
 auto result = co_await order.call<&Order_Stub::makeOrder>(
-    std::move(request), {.timeout = 3s});
+    request, {.timeout = 3s});
 if (!result) {
     // result.status().code(), result.status().message()
 }
@@ -22,19 +22,19 @@ The same generated method supports blocking and callback calls:
 
 ```cpp
 auto blocking = order.callBlocking<&Order_Stub::makeOrder>(
-    std::move(request), {.timeout = 3s});
+    request, {.timeout = 3s});
 
 order.callAsync<&Order_Stub::makeOrder>(
-    std::move(request), {.timeout = 3s},
+    request, {.timeout = 3s},
     [](rocket::RpcResult<makeOrderResponse> result) {
         // Handle completion.
     });
 ```
 
 `Client<Stub>` is a small, copyable, thread-safe handle. Keep it as a service
-member and share it across business threads. Requests are accepted by value so
-asynchronous calls never retain references to caller-owned protobuf objects;
-use `std::move(request)` to avoid a protobuf copy.
+member and share it across business threads. Requests are serialized
+synchronously during the call entry, so the API can borrow them by `const&`
+without copying or retaining caller-owned protobuf objects.
 
 ## RPC execution model
 
