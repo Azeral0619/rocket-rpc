@@ -13,6 +13,9 @@ end
 
 target("rocket")
     set_kind("static")
+    -- Support protobuf output generated from the project root
+    -- (for example: protoc --cpp_out=. proto/order.proto).
+    add_includedirs(".")
     add_includedirs("proto")
     -- common
     add_files("src/rocket/common/log.cc")
