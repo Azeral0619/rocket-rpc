@@ -4,16 +4,18 @@
 #include "rocket/common/service_registry.h"
 #include "rocket/net/coder/tinypb_coder.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace rocket {
 
 RpcConnectionPool::RpcConnectionPool(std::size_t io_threads, std::size_t conns_per_addr)
-    : m_io_group(io_threads), m_conns_per_addr(conns_per_addr) {
+    : m_io_group(io_threads), m_conns_per_addr(std::max<std::size_t>(1, conns_per_addr)) {
     m_io_group.start();
 }
 
@@ -71,6 +73,7 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
     std::string key = addr->toString();
 
     std::unique_lock<std::mutex> lk(m_mutex);
+    if (m_shutdown) return nullptr;
 
     auto it = m_clients.find(key);
     if (it != m_clients.end()) {
@@ -82,15 +85,16 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
                 ++iter;
             } else {
                 ROCKET_LOG_WARN("RpcConnectionPool: evicting dead connection for {}", key);
-                auto* loop = (*iter)->getLoop();
+                auto* loop = *iter ? (*iter)->getLoop() : nullptr;
                 if (loop) loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
-                (*iter)->stop();
+                if (*iter) (*iter)->stop();
                 iter = vec.erase(iter);
             }
         }
 
-        // Round-robin among healthy connections (brpc-style load distribution).
-        if (!vec.empty()) {
+        // Keep filling the configured pool before switching to round-robin.
+        // Sequential acquire() calls must not get stuck forever on slot zero.
+        if (vec.size() >= m_conns_per_addr) {
             size_t& idx = m_rr_counters[key];
             idx = idx % vec.size();
             auto client = vec[idx];
@@ -103,6 +107,10 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
     // m_conns_per_addr, create a new slot.  Otherwise reuse the first
     // slot (the vector was cleared above due to dead connections).
     EventLoop* loop = pickLoop();
+    if (!loop) {
+        ROCKET_LOG_ERROR("RpcConnectionPool: no IO loop available for {}", key);
+        return nullptr;
+    }
     lk.unlock();
 
     auto client = std::make_shared<TcpClient>(
@@ -121,6 +129,12 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
     }
 
     lk.lock();
+    if (m_shutdown) {
+        lk.unlock();
+        if (loop) loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
+        client->stop();
+        return nullptr;
+    }
     auto& vec = m_clients[key];
     if (vec.size() < m_conns_per_addr) {
         vec.push_back(client);
@@ -140,21 +154,37 @@ void RpcConnectionPool::release(NetAddr::s_ptr /*addr*/, TcpClient::s_ptr /*clie
 }
 
 void RpcConnectionPool::shutdown() {
-    std::lock_guard<std::mutex> lk(m_mutex);
-    m_shutdown = true;
-    for (auto& [key, vec] : m_clients) {
-        for (auto& client : vec) {
-            if (client) {
-                auto* loop = client->getLoop();
-                if (loop) {
-                    loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
-                }
-                client->stop();
-            }
+    std::vector<TcpClient::s_ptr> clients;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_shutdown) return;
+        m_shutdown = true;
+        for (auto& [key, vec] : m_clients) {
+            clients.insert(clients.end(), vec.begin(), vec.end());
         }
     }
-    m_clients.clear();
+
+    // First unregister every connection while its owning loop is alive.
+    for (auto& client : clients) {
+        if (client) {
+            auto* loop = client->getLoop();
+            if (loop) {
+                loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
+            }
+            client->stop();
+        }
+    }
+
+    // Keep all clients (and therefore their FdEvent storage) alive until no
+    // loop can still be polling them.
     m_io_group.join();
+
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_clients.clear();
+        m_rr_counters.clear();
+    }
+    clients.clear();
 }
 
 } // namespace rocket

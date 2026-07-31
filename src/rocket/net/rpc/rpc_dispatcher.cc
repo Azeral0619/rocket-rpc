@@ -3,13 +3,13 @@
 #include "rocket/common/ecode.h"
 #include "rocket/common/log.h"
 #include "rocket/common/runtime.h"
-#include "rocket/net/rpc/rpc_closure.h"
 #include "rocket/net/rpc/rpc_controller.h"
 #include "rocket/net/tcp/tcp_connection.h"
 
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -17,6 +17,24 @@
 #include <vector>
 
 namespace rocket {
+
+namespace {
+
+class SelfDeletingClosure final : public google::protobuf::Closure {
+  public:
+    explicit SelfDeletingClosure(std::function<void()> callback)
+        : m_callback(std::move(callback)) {}
+
+    void Run() override {
+        std::unique_ptr<SelfDeletingClosure> self(this);
+        if (m_callback) m_callback();
+    }
+
+  private:
+    std::function<void()> m_callback;
+};
+
+} // namespace
 
 RpcDispatcher::RpcDispatcher(std::size_t worker_threads)
     : m_worker_pool(worker_threads) {
@@ -89,14 +107,17 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
     // Track in-flight for graceful shutdown.
     conn->incrInFlight();
 
-    auto closure = std::make_shared<RpcClosure>(
-        nullptr, [req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn, controller_ptr, this]() mutable {
+    auto* closure = new SelfDeletingClosure(
+        [req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn, controller_ptr]() mutable {
             conn->decrInFlight();
 
             if (!rsp_msg_ptr->SerializeToString(&(rsp_protocol->m_pb_data))) {
                 ROCKET_LOG_ERROR("{} | serialize error, origin message [{}]", req_protocol->m_msg_id,
                                  rsp_msg_ptr->ShortDebugString());
-                setTinyPBError(rsp_protocol, error::kFailedSerialize, "serialize error");
+                rsp_protocol->m_err_code = error::kFailedSerialize;
+                rsp_protocol->m_err_info = "serialize error";
+                rsp_protocol->m_err_info_len =
+                    static_cast<std::int32_t>(rsp_protocol->m_err_info.length());
             } else {
                 rsp_protocol->m_err_code = 0;
                 rsp_protocol->m_err_info = "";
@@ -109,7 +130,7 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
     // Fast path: run directly on the IO thread (brpc/gRPC style).
     // Slow methods can offload themselves by not calling done->Run()
     // synchronously — the framework waits for the callback.
-    service->CallMethod(method, controller_ptr.get(), req_msg_ptr.get(), rsp_msg_ptr.get(), closure.get());
+    service->CallMethod(method, controller_ptr.get(), req_msg_ptr.get(), rsp_msg_ptr.get(), closure);
 }
 
 bool RpcDispatcher::parseServiceFullName(std::string_view full_name, std::string_view& service_name,
@@ -118,7 +139,7 @@ bool RpcDispatcher::parseServiceFullName(std::string_view full_name, std::string
         ROCKET_LOG_ERROR("full name empty");
         return false;
     }
-    size_t i = full_name.find_first_of('.');
+    size_t i = full_name.rfind('.');
     if (i == std::string::npos) {
         ROCKET_LOG_ERROR("not find . in full name [{}]", full_name);
         return false;

@@ -3,9 +3,14 @@
 #include "rocket/net/rpc/rpc_connection_pool.h"
 #include "rocket/net/tcp/net_addr.h"
 #include "rocket/net/timer_event.h"
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <google/protobuf/service.h>
 #include <google/protobuf/stubs/callback.h>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <string_view>
 
 namespace rocket {
@@ -77,9 +82,13 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
                            int timeout_ms = 3000);
 
   private:
-    // Called from response/timer callbacks (EventLoop thread).  Atomic flag
-    // ensures the RPC closure runs at most once regardless of race.
-    void finishRpc();
+    struct RequestState;
+
+    // Complete exactly one request generation.  Timer, response and connect
+    // callbacks all race through this per-request gate.
+    static bool finishRpc(const std::shared_ptr<RequestState>& state,
+                          std::function<void()> before_done = {});
+    void clearInitState(const std::shared_ptr<RequestState>& state);
 
     std::shared_ptr<NetAddr> m_peer_addr{nullptr};
     std::shared_ptr<NetAddr> m_local_addr{nullptr};
@@ -90,10 +99,9 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
     closure_s_ptr m_closure{nullptr};
 
     bool m_is_init{false};
-
-    // Set to true by the first finisher (response or timer) — ensures
-    // the RPC closure runs exactly once regardless of race.
-    std::atomic<bool> m_rpc_finished{false};
+    mutable std::mutex m_request_mutex;
+    std::shared_ptr<RequestState> m_active_request;
+    std::uint64_t m_next_generation{0};
 
     std::shared_ptr<TcpClient> m_client{nullptr};
     RpcConnectionPool::s_ptr m_pool;      // optional shared pool
@@ -101,11 +109,6 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
     ServiceRegistry* m_registry{nullptr};  // service-aware mode: registry for discovery
     NetAddr::s_ptr m_actual_peer;          // addr actually used for this call (for release)
 
-    // Hold the current timer so we can cancel it before starting a new
-    // request.  This prevents a stale timer callback (from the previous
-    // CallMethod) from accessing a freed controller after m_rpc_finished
-    // is reset by the next request.
-    TimerEvent::s_ptr m_timer_event;
 };
 
 // Global default connection pool (lazy-init, thread-safe).

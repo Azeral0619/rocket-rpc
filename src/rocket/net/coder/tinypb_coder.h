@@ -60,7 +60,8 @@ class TinyPBCoder : public AbstractCoder {
      * 4. 计算并写入校验和
      * 5. 写入结束标识 PB_END
      */
-    void encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuffer::s_ptr out_buffer) override;
+    [[nodiscard]] bool encode(std::vector<AbstractProtocol::s_ptr>& messages,
+                              TcpBuffer::s_ptr out_buffer) override;
 
     /**
      * @brief 解码：从字节流解析 TinyPB 协议对象

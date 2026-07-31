@@ -38,6 +38,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     using MessageCallback = std::function<void(const s_ptr&, std::vector<AbstractProtocol::s_ptr>&)>;
     using ConnectionCallback = std::function<void(const s_ptr&)>;
     using CloseCallback = std::function<void(const s_ptr&)>;
+    using ConnectCallback = std::function<void(int)>;
     using WriteCompleteCallback = std::function<void(const s_ptr&)>;
     using HighWaterMarkCallback = std::function<void(const s_ptr&, std::size_t)>;
 
@@ -63,6 +64,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // Must be called in the owning loop thread (usually via queueInLoop).
     void connectEstablished();
 
+    // Register a non-blocking connect with the loop.  The callback runs only
+    // after writability confirms success or SO_ERROR reports failure.
+    void connectInProgress(ConnectCallback cb);
+
     // Must be called in the owning loop thread after the connection is removed
     // from the owner (TcpServer/TcpClient).
     void connectDestroyed();
@@ -76,8 +81,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // Begin graceful close: reject new sends, finish in-flight work, then close.
     void shutdownGracefully();
 
-    void setState(TcpState state) noexcept { m_state = state; }
-    [[nodiscard]] TcpState getState() const noexcept { return m_state; }
+    void setState(TcpState state) noexcept { m_state.store(state, std::memory_order_release); }
+    [[nodiscard]] TcpState getState() const noexcept { return m_state.load(std::memory_order_acquire); }
 
     [[nodiscard]] EventLoop* getLoop() const noexcept { return m_loop; }
     [[nodiscard]] NetAddr::s_ptr getLocalAddr() const { return m_local_addr; }
@@ -107,7 +112,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     NetAddr::s_ptr m_peer_addr;
     const int m_fd{-1};
     const TcpConnectionType m_type{TcpConnectionType::Server};
-    TcpState m_state{TcpState::NotConnected};
+    std::atomic<TcpState> m_state{TcpState::NotConnected};
 
     std::unique_ptr<FdEvent> m_fd_event;
     std::unique_ptr<AbstractCoder> m_coder;

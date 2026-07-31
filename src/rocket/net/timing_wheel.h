@@ -10,13 +10,12 @@
 
 namespace rocket {
 
-// Two-level hierarchical timing wheel.
+// Timing wheel with an ordered long-timer overflow.
 //
 // Level 1: 256 slots × 10 ms tick = 2.56 s range (sub-ms precision not needed;
 //          the wheel rounds to tick boundaries.)
-// Level 2: 256 slots × 2.56 s     = ~655 s range
 //
-// Events beyond L2 range fall into an overflow multimap (rare in practice).
+// Events beyond the wheel range use an overflow multimap.
 // Add / cancel are O(1) (amortised).  Fire is O(N) in the number of expired
 // events per tick.
 //
@@ -26,7 +25,6 @@ class TimingWheel {
     static constexpr std::int64_t kTickMs = 10;
     static constexpr int kSlotsPerLevel = 256;
     static constexpr std::int64_t kL1Range = kSlotsPerLevel * kTickMs;       // 2560 ms
-    static constexpr std::int64_t kL2Range = kSlotsPerLevel * kL1Range;      // 655 360 ms
 
     TimingWheel() = default;
 
@@ -48,11 +46,8 @@ class TimingWheel {
   private:
     using Slot = std::vector<TimerEvent::s_ptr>;
 
-    // Advance L1 by one tick.  Returns true if L1 wrapped around.
-    bool tickL1();
-
-    // Cascade one slot from L2 down into L1.
-    void cascadeL2();
+    // Advance L1 by one tick.
+    void tickL1();
 
     // Put an event into the right level (or overflow).
     void schedule(const TimerEvent::s_ptr& event);
@@ -60,11 +55,9 @@ class TimingWheel {
     void collectExpired(Slot& slot, std::vector<TimerEvent::s_ptr>& out);
 
     std::array<Slot, kSlotsPerLevel> m_l1;
-    std::array<Slot, kSlotsPerLevel> m_l2;
     std::multimap<std::int64_t, TimerEvent::s_ptr> m_overflow; // key = arrival ms
 
     int m_l1_cursor{0};
-    int m_l2_cursor{0};
     std::int64_t m_last_tick_ms{0}; // last time fireExpired was called
 
     mutable std::mutex m_mutex;

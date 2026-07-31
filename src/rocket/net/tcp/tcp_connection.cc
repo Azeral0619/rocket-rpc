@@ -34,35 +34,15 @@ TcpConnection::~TcpConnection() {
 
 void TcpConnection::connectEstablished() {
     m_loop->assertInLoopThread();
-    if (m_state != TcpState::NotConnected) {
+    if (m_state.load(std::memory_order_acquire) != TcpState::NotConnected) {
         return;
     }
 
-    // For async client connects: verify the connection actually succeeded via
-    // getsockopt(SO_ERROR).  A non-blocking connect() returns EINPROGRESS
-    // immediately; the real outcome is only known once the fd becomes writable.
-    if (m_type == TcpConnectionType::Client) {
-        int so_error = 0;
-        socklen_t len = sizeof(so_error);
-        if (::getsockopt(m_fd_event->getFd(), SOL_SOCKET, SO_ERROR, &so_error, &len) == 0
-            && so_error != 0) {
-            ROCKET_LOG_ERROR("TcpConnection: async connect failed, SO_ERROR={} ({})",
-                             so_error, strerror(so_error));
-            handleClose();
-            return;
-        }
-    }
-
-    m_state = TcpState::Connected;
+    m_state.store(TcpState::Connected, std::memory_order_release);
 
     m_fd_event->listen(FdEvent::TriggerEvent::IN_EVENT, [weak = weak_from_this()] {
         if (auto conn = weak.lock()) {
             conn->handleRead();
-        }
-    });
-    m_fd_event->listen(FdEvent::TriggerEvent::OUT_EVENT, [weak = weak_from_this()] {
-        if (auto conn = weak.lock()) {
-            conn->handleWrite();
         }
     });
     m_fd_event->setErrorCallback([weak = weak_from_this()] {
@@ -78,17 +58,53 @@ void TcpConnection::connectEstablished() {
     }
 }
 
-void TcpConnection::connectDestroyed() {
+void TcpConnection::connectInProgress(ConnectCallback cb) {
     m_loop->assertInLoopThread();
-    if (m_state == TcpState::Closed) {
+    if (m_state.load(std::memory_order_acquire) != TcpState::NotConnected) {
+        if (cb) cb(EISCONN);
         return;
     }
 
-    if (m_state == TcpState::Connected) {
-        m_state = TcpState::Closed;
-        m_loop->deleteEpollEvent(m_fd_event.get());
-    }
+    auto completed = std::make_shared<std::atomic<bool>>(false);
+    auto finish = [weak = weak_from_this(), completed, cb = std::move(cb)]() mutable {
+        bool expected = false;
+        if (!completed->compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
 
+        auto conn = weak.lock();
+        if (!conn) return;
+
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        if (::getsockopt(conn->m_fd, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
+            so_error = errno;
+        }
+
+        conn->m_loop->deleteEpollEvent(conn->m_fd_event.get());
+        conn->m_fd_event->clearCallbacks();
+
+        if (so_error != 0) {
+            conn->m_state.store(TcpState::Closed, std::memory_order_release);
+            ROCKET_LOG_ERROR("TcpConnection: async connect failed, SO_ERROR={} ({})",
+                             so_error, strerror(so_error));
+            if (cb) cb(so_error);
+            return;
+        }
+
+        conn->connectEstablished();
+        if (cb) cb(0);
+    };
+
+    m_fd_event->listen(FdEvent::TriggerEvent::OUT_EVENT, finish);
+    m_fd_event->setErrorCallback(std::move(finish));
+    m_loop->addEpollEvent(m_fd_event.get());
+}
+
+void TcpConnection::connectDestroyed() {
+    m_loop->assertInLoopThread();
+    m_state.store(TcpState::Closed, std::memory_order_release);
+    m_loop->deleteEpollEvent(m_fd_event.get());
     m_fd_event->clearCallbacks();
     // NOTE: do NOT fire m_close_callback here — the owner
     // (TcpServer::removeConnection) already handled the removal
@@ -99,7 +115,8 @@ void TcpConnection::send(AbstractProtocol::s_ptr message) {
     if (!message) {
         return;
     }
-    if (m_state == TcpState::HalfClosing || m_state == TcpState::Closed) {
+    const auto state = m_state.load(std::memory_order_acquire);
+    if (state == TcpState::HalfClosing || state == TcpState::Closed) {
         ROCKET_LOG_WARN("send on closed/half-closing connection fd={}", m_fd);
         return;
     }
@@ -133,14 +150,19 @@ void TcpConnection::sendInLoop(AbstractProtocol::s_ptr message) {
 
 void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> messages) {
     m_loop->assertInLoopThread();
-    if (m_state == TcpState::HalfClosing || m_state == TcpState::Closed) {
+    const auto state = m_state.load(std::memory_order_acquire);
+    if (state == TcpState::HalfClosing || state == TcpState::Closed) {
         return;
     }
     if (messages.empty()) {
         return;
     }
 
-    m_coder->encode(messages, m_out_buffer);
+    if (!m_coder->encode(messages, m_out_buffer)) {
+        ROCKET_LOG_ERROR("encode failed or output buffer limit exceeded, closing fd={}", m_fd);
+        handleError();
+        return;
+    }
 
     if (!m_fd_event->isListening(FdEvent::TriggerEvent::OUT_EVENT)) {
         enableWriting();
@@ -168,7 +190,7 @@ void TcpConnection::drainWriteQueue() {
             if (!raw) break;
 
             auto* node = static_cast<TypedMpscNode<AbstractProtocol::s_ptr>*>(raw);
-            if (m_state == TcpState::Connected) {
+            if (m_state.load(std::memory_order_acquire) == TcpState::Connected) {
                 messages.push_back(std::move(node->data));
             }
             MpscNodePool::free(node);
@@ -211,7 +233,8 @@ void TcpConnection::disableWriting() {
 
 void TcpConnection::handleRead() {
     m_loop->assertInLoopThread();
-    if (m_state != TcpState::Connected && m_state != TcpState::HalfClosing) {
+    const auto state = m_state.load(std::memory_order_acquire);
+    if (state != TcpState::Connected && state != TcpState::HalfClosing) {
         return;
     }
 
@@ -268,7 +291,8 @@ void TcpConnection::handleRead() {
 
 void TcpConnection::handleWrite() {
     m_loop->assertInLoopThread();
-    if (m_state != TcpState::Connected && m_state != TcpState::HalfClosing) {
+    const auto state = m_state.load(std::memory_order_acquire);
+    if (state != TcpState::Connected && state != TcpState::HalfClosing) {
         return;
     }
 
@@ -306,17 +330,18 @@ void TcpConnection::handleWrite() {
         m_sending_above_hwm = false;
     }
 
-    if (all_written && m_state == TcpState::HalfClosing && m_in_flight.load(std::memory_order_relaxed) == 0) {
+    if (all_written && m_state.load(std::memory_order_acquire) == TcpState::HalfClosing &&
+        m_in_flight.load(std::memory_order_relaxed) == 0) {
         handleClose();
     }
 }
 
 void TcpConnection::handleClose() {
     m_loop->assertInLoopThread();
-    if (m_state == TcpState::Closed) {
+    if (m_state.load(std::memory_order_acquire) == TcpState::Closed) {
         return;
     }
-    m_state = TcpState::Closed;
+    m_state.store(TcpState::Closed, std::memory_order_release);
 
     m_loop->deleteEpollEvent(m_fd_event.get());
     m_fd_event->clearCallbacks();
@@ -345,10 +370,10 @@ void TcpConnection::shutdown() {
 
 void TcpConnection::shutdownInLoop() {
     m_loop->assertInLoopThread();
-    if (m_state == TcpState::Closed) {
+    if (m_state.load(std::memory_order_acquire) == TcpState::Closed) {
         return;
     }
-    m_state = TcpState::HalfClosing;
+    m_state.store(TcpState::HalfClosing, std::memory_order_release);
 
     if (m_out_buffer->readAble() == 0) {
         ::shutdown(m_fd, SHUT_WR);

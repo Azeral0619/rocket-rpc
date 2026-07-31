@@ -48,13 +48,16 @@ void EventLoop::loop() {
         ROCKET_LOG_ERROR("EventLoop::loop() called on invalid (failed-construction) loop");
         return;
     }
-    m_thread_id = std::this_thread::get_id();  // set to the thread that actually runs the loop
+    {
+        std::lock_guard<std::mutex> lock(m_state_mutex);
+        m_thread_id = std::this_thread::get_id();
+    }
     t_current_event_loop = this;
-    m_is_looping = true;
+    m_is_looping.store(true, std::memory_order_release);
 
     std::vector<Poller::ActiveEvent> active;
 
-    while (!m_stop_flag) {
+    while (!m_stop_flag.load(std::memory_order_acquire)) {
         int timeout_ms = kEpollWaitTimeoutMs;
         if (m_timer) {
             auto ms = m_timer->msUntilNextExpire();
@@ -73,7 +76,7 @@ void EventLoop::loop() {
         processPendingTasks();
     }
 
-    m_is_looping = false;
+    m_is_looping.store(false, std::memory_order_release);
 }
 
 void EventLoop::processEvents(const std::vector<Poller::ActiveEvent>& events) {
@@ -82,15 +85,15 @@ void EventLoop::processEvents(const std::vector<Poller::ActiveEvent>& events) {
         if (!fd_event) continue;
 
         if ((ae.event_mask & toMask(FdEvent::TriggerEvent::IN_EVENT)) != 0) {
-            const auto& handler = fd_event->handler(FdEvent::TriggerEvent::IN_EVENT);
+            auto handler = fd_event->handler(FdEvent::TriggerEvent::IN_EVENT);
             if (handler) handler();
         }
         if ((ae.event_mask & toMask(FdEvent::TriggerEvent::OUT_EVENT)) != 0) {
-            const auto& handler = fd_event->handler(FdEvent::TriggerEvent::OUT_EVENT);
+            auto handler = fd_event->handler(FdEvent::TriggerEvent::OUT_EVENT);
             if (handler) handler();
         }
         if ((ae.event_mask & toMask(FdEvent::TriggerEvent::ERROR_EVENT)) != 0) {
-            const auto& handler = fd_event->handler(FdEvent::TriggerEvent::ERROR_EVENT);
+            auto handler = fd_event->handler(FdEvent::TriggerEvent::ERROR_EVENT);
             if (handler) handler();
         }
     }
@@ -121,7 +124,7 @@ void EventLoop::wakeup() {
 }
 
 void EventLoop::stop() {
-    m_stop_flag = true;
+    m_stop_flag.store(true, std::memory_order_release);
     wakeup();
 }
 
@@ -134,6 +137,7 @@ void EventLoop::deleteEpollEvent(FdEvent* event) {
 }
 
 bool EventLoop::isInLoopThread() const noexcept {
+    std::lock_guard<std::mutex> lock(m_state_mutex);
     return m_thread_id == std::this_thread::get_id();
 }
 
@@ -149,7 +153,14 @@ void EventLoop::addTimerEvent(const TimerEvent::s_ptr& event) {
     if (m_timer) m_timer->addTimerEvent(event);
 }
 
-bool EventLoop::isLooping() const noexcept { return m_is_looping; }
+bool EventLoop::isLooping() const noexcept {
+    return m_is_looping.load(std::memory_order_acquire);
+}
+
+std::thread::id EventLoop::getThreadId() const noexcept {
+    std::lock_guard<std::mutex> lock(m_state_mutex);
+    return m_thread_id;
+}
 
 void EventLoop::runInLoop(std::function<void()> fn) {
     if (isInLoopThread()) { fn(); }
@@ -160,7 +171,7 @@ void EventLoop::queueInLoop(std::function<void()> fn) { addTask(std::move(fn), t
 
 void EventLoop::assertInLoopThread() const noexcept {
     if (!isInLoopThread()) {
-        ROCKET_LOG_ERROR("assertInLoopThread() failed: loop belongs to thread {}", m_thread_id);
+        ROCKET_LOG_ERROR("assertInLoopThread() failed: loop belongs to thread {}", getThreadId());
         std::abort();
     }
 }

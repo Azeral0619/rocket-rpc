@@ -3,6 +3,7 @@
 #include "rocket/net/fd_event.h"
 #include "rocket/net/poller/poller.h"
 #include "rocket/net/timer_event.h"
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -44,7 +45,7 @@ class EventLoop {
 
     [[nodiscard]] bool isLooping() const noexcept;
 
-    [[nodiscard]] std::thread::id getThreadId() const noexcept { return m_thread_id; }
+    [[nodiscard]] std::thread::id getThreadId() const noexcept;
 
     void runInLoop(std::function<void()> fn);
     void queueInLoop(std::function<void()> fn);
@@ -59,19 +60,20 @@ class EventLoop {
     void processTimerEvents();
 
     std::thread::id m_thread_id;
+    mutable std::mutex m_state_mutex;
 
     std::unique_ptr<Poller> m_poller;
     std::unique_ptr<WakeupChannel> m_wakeup_channel;
     std::unique_ptr<FdEvent> m_wakeup_fd_event;
 
-    bool m_stop_flag{false};
+    std::atomic<bool> m_stop_flag{false};
 
     std::queue<std::function<void()>> m_pending_tasks;
     mutable std::mutex m_mutex;
 
     std::unique_ptr<Timer> m_timer;
 
-    bool m_is_looping{false};
+    std::atomic<bool> m_is_looping{false};
     bool m_valid{false};
 
   public:

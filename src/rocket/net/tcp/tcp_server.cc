@@ -5,6 +5,7 @@
 #include "rocket/net/io_thread.h"
 
 #include <memory>
+#include <unistd.h>
 #include <utility>
 
 namespace rocket {
@@ -30,6 +31,8 @@ void TcpServer::init() {
 }
 
 void TcpServer::onAccept() {
+    if (!m_running.load(std::memory_order_acquire)) return;
+
     auto re = m_acceptor->accept();
     if (!re.isValid()) {
         ROCKET_LOG_ERROR("accept failed: {}", re.error_msg);
@@ -38,7 +41,15 @@ void TcpServer::onAccept() {
 
     int client_fd = re.client_fd;
     auto peer_addr = std::move(re.peer_addr);
+    if (!m_io_group) {
+        ::close(client_fd);
+        return;
+    }
     IOThread* io_thread = m_io_group->getIOThread();
+    if (!io_thread || !io_thread->getEventLoop()) {
+        ::close(client_fd);
+        return;
+    }
 
     auto conn = std::make_shared<TcpConnection>(
         io_thread->getEventLoop(), client_fd,
@@ -59,31 +70,68 @@ void TcpServer::onAccept() {
         conn->connectEstablished();
     });
 
-    m_connections.insert(conn);
+    {
+        std::lock_guard<std::mutex> lk(m_connections_mutex);
+        m_connections.insert(conn);
+    }
     ROCKET_LOG_INFO("TcpServer new client fd={} peer={}", client_fd, peer_addr->toString());
 }
 
 void TcpServer::removeConnection(const TcpConnection::s_ptr& conn) {
-    m_connections.erase(conn);
+    {
+        std::lock_guard<std::mutex> lk(m_connections_mutex);
+        m_connections.erase(conn);
+    }
     conn->getLoop()->queueInLoop([conn] {
         conn->connectDestroyed();
     });
 }
 
 void TcpServer::start() {
-    if (m_ready_cb) m_ready_cb();
-    m_running = true;
+    bool expected = false;
+    if (!m_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
+        m_main_loop_active = true;
+        m_start_thread_id = std::this_thread::get_id();
+    }
+
     m_io_group->start();
+    if (m_ready_cb) m_ready_cb();
     m_main_loop->loop();
+
+    {
+        std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
+        m_main_loop_active = false;
+    }
+    m_lifecycle_cv.notify_all();
+
+    // A fatal poll error can also end the loop without an explicit stop.
+    if (m_running.load(std::memory_order_acquire)) stop();
 }
 
 void TcpServer::stop() {
-    if (!m_running) return;
-    m_running = false;
+    std::lock_guard<std::mutex> stop_lk(m_stop_mutex);
+    if (!m_running.exchange(false, std::memory_order_acq_rel)) return;
 
-    // Copy connection set — IO threads may call removeConnection() concurrently
-    // while we iterate, which would invalidate iterators.
-    auto connections = m_connections;
+    // Stop accepting first.  When called from a foreign thread, wait until
+    // onAccept() can no longer be using the IO thread group.
+    m_main_loop->stop();
+    {
+        std::unique_lock<std::mutex> lk(m_lifecycle_mutex);
+        if (m_start_thread_id != std::this_thread::get_id()) {
+            m_lifecycle_cv.wait(lk, [this] { return !m_main_loop_active; });
+        }
+    }
+
+    std::set<TcpConnection::s_ptr> connections;
+    {
+        std::lock_guard<std::mutex> lk(m_connections_mutex);
+        connections = m_connections;
+    }
     for (auto& conn : connections) {
         conn->getLoop()->queueInLoop([conn] {
             conn->shutdownGracefully();
@@ -91,10 +139,7 @@ void TcpServer::stop() {
     }
 
     // Stop IO thread group (joins all IO threads)
-    m_io_group.reset();
-
-    // Stop main loop
-    m_main_loop->stop();
+    if (m_io_group) m_io_group.reset();
 
     ROCKET_LOG_INFO("TcpServer stopped");
 }

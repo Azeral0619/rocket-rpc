@@ -40,12 +40,12 @@ class TcpBuffer {
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t capacity() const noexcept;
 
-    void writeToBuffer(const char* buf, std::size_t size);
-    void writeToBuffer(std::string_view data);
-    void append(const void* data, std::size_t len);
-    void append(std::string_view data);
-    void appendInt32(std::int32_t x);
-    void appendInt64(std::int64_t x);
+    [[nodiscard]] bool writeToBuffer(const char* buf, std::size_t size);
+    [[nodiscard]] bool writeToBuffer(std::string_view data);
+    [[nodiscard]] bool append(const void* data, std::size_t len);
+    [[nodiscard]] bool append(std::string_view data);
+    [[nodiscard]] bool appendInt32(std::int32_t x);
+    [[nodiscard]] bool appendInt64(std::int64_t x);
 
     void prepend(const void* data, std::size_t len);
     void prependInt32(std::int32_t x);
@@ -76,7 +76,7 @@ class TcpBuffer {
 
     void resizeBuffer(std::size_t new_size);
     void adjustBuffer();
-    void ensureWritable(std::size_t len);
+    [[nodiscard]] bool ensureWritable(std::size_t len);
     void shrink(std::size_t reserve);
     void clear() noexcept;
 
@@ -91,7 +91,7 @@ class TcpBuffer {
     [[nodiscard]] char* data() noexcept;
 
   private:
-    void makeSpace(std::size_t len);
+    [[nodiscard]] bool makeSpace(std::size_t len);
     [[nodiscard]] char* begin() noexcept;
     [[nodiscard]] const char* begin() const noexcept;
 

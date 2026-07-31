@@ -165,7 +165,10 @@ class Logger final : public Singleton<Logger> {
         }
 
         void runFormat(std::string& out) {
-            if (num_args == 0) return;
+            if (num_args == 0) {
+                out.append(fmt_ptr, fmt_len);
+                return;
+            }
             auto* data = heap_allocated ? arg_data : fmt_data;
             auto* base = data;
             int n = static_cast<int>(*data++);

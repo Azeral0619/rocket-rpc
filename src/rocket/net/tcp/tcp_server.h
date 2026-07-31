@@ -7,9 +7,13 @@
 #include "rocket/net/tcp/tcp_connection.h"
 #include "rocket/net/fd_event.h"
 #include "rocket/net/coder/abstract_coder.h"
+#include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <thread>
 
 namespace rocket {
 
@@ -53,6 +57,7 @@ class TcpServer {
     std::unique_ptr<FdEvent> m_listen_fd_event;
 
     std::set<TcpConnection::s_ptr> m_connections;
+    mutable std::mutex m_connections_mutex;
 
     TcpConnection::MessageCallback m_message_cb;
     TcpConnection::ConnectionCallback m_connection_cb;
@@ -60,7 +65,12 @@ class TcpServer {
     TcpConnection::HighWaterMarkCallback m_hwm_cb;
     std::size_t m_high_water_mark{0};
 
-    bool m_running{false};
+    std::atomic<bool> m_running{false};
+    std::mutex m_stop_mutex;
+    std::mutex m_lifecycle_mutex;
+    std::condition_variable m_lifecycle_cv;
+    bool m_main_loop_active{false};
+    std::thread::id m_start_thread_id;
 };
 
 } // namespace rocket

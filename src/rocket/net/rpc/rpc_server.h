@@ -5,8 +5,11 @@
 #include "rocket/net/tcp/net_addr.h"
 #include "rocket/net/tcp/tcp_server.h"
 #include <atomic>
+#include <condition_variable>
+#include <csignal>
 #include <google/protobuf/service.h>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 namespace rocket {
@@ -37,10 +40,20 @@ class RpcServer {
 
   private:
     void onMessage(const TcpConnection::s_ptr& conn, std::vector<AbstractProtocol::s_ptr>& messages);
+    void startSignalMonitor();
+    void stopSignalMonitor();
+    void restoreSignalHandlers();
 
     TcpServer m_server;
     RpcDispatcher m_dispatcher;
     std::atomic<bool> m_stopping{false};
+    std::thread m_signal_thread;
+    std::mutex m_signal_mutex;
+    std::condition_variable m_signal_cv;
+    bool m_signal_monitor_stop{false};
+    bool m_signal_handlers_installed{false};
+    struct sigaction m_old_sigint {};
+    struct sigaction m_old_sigterm {};
 };
 
 } // namespace rocket

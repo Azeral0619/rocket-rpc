@@ -126,6 +126,13 @@ target("capacity_test")
     add_deps("rocket")
     add_packages("protobuf-cpp", "yaml-cpp", "fmt")
 
+target("regression_test")
+    set_kind("binary")
+    add_includedirs("proto")
+    add_files("src/test/regression_test.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
 -- Examples (all need proto/ on include path)
 target("echo_server")
     set_kind("binary")
@@ -161,4 +168,3 @@ target("rpc_client_example")
     add_files("examples/rpc_client.cc")
     add_deps("rocket")
     add_packages("protobuf-cpp", "yaml-cpp", "fmt")
-

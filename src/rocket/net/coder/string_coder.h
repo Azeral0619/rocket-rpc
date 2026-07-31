@@ -69,14 +69,18 @@ class StringCoder : public AbstractCoder {
      *
      * 实现：遍历所有消息，依次写入它们的 info 字段
      */
-    void encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuffer::s_ptr out_buffer) override {
+    [[nodiscard]] bool encode(std::vector<AbstractProtocol::s_ptr>& messages,
+                              TcpBuffer::s_ptr out_buffer) override {
         for (auto& msg_base : messages) {
             auto msg = std::dynamic_pointer_cast<StringProtocol>(msg_base);
             if (!msg || msg->info.empty()) {
                 continue;
             }
-            out_buffer->writeToBuffer(msg->info.c_str(), msg->info.length());
+            if (!out_buffer->writeToBuffer(msg->info.c_str(), msg->info.length())) {
+                return false;
+            }
         }
+        return true;
     }
 
     /**

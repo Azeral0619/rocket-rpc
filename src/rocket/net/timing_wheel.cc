@@ -10,6 +10,10 @@ namespace rocket {
 void TimingWheel::addEvent(const TimerEvent::s_ptr& event) {
     if (!event || event->isCancelled()) return;
     std::lock_guard<std::mutex> lk(m_mutex);
+    if (m_last_tick_ms == 0) {
+        m_last_tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     schedule(event);
 }
 
@@ -21,28 +25,33 @@ void TimingWheel::cancelEvent(const TimerEvent::s_ptr& event) {
 std::optional<std::int64_t> TimingWheel::msUntilNextExpire() const {
     std::lock_guard<std::mutex> lk(m_mutex);
 
-    // Check L1 (scan from cursor forward)
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::optional<std::int64_t> next;
+
+    // Check L1 (scan from cursor forward).  The current slot is processed on
+    // the next full tick, not immediately.
+    const std::int64_t elapsed =
+        m_last_tick_ms == 0 ? 0 : std::max<std::int64_t>(0, now - m_last_tick_ms);
+    const std::int64_t until_next_tick =
+        std::max<std::int64_t>(1, kTickMs - std::min(elapsed, kTickMs));
     for (int i = 0; i < kSlotsPerLevel; ++i) {
         int idx = (m_l1_cursor + i) % kSlotsPerLevel;
-        if (!m_l1[idx].empty()) return i * kTickMs;
+        if (!m_l1[idx].empty()) {
+            next = until_next_tick + i * kTickMs;
+            break;
+        }
     }
 
-    // Check L2
+    // Long timers live in the ordered overflow map.  Compare them with L1
+    // instead of blindly preferring a newly-added L1 timer.
     if (!m_overflow.empty()) {
-        // Overflow sorted by arrival time — return time until first entry.
         auto earliest = m_overflow.begin()->first;
-        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        return std::max<std::int64_t>(0, earliest - now);
+        const auto overflow_wait = std::max<std::int64_t>(0, earliest - now);
+        next = next.has_value() ? std::min(*next, overflow_wait) : overflow_wait;
     }
 
-    // L2 is scanned from cursor
-    for (int i = 0; i < kSlotsPerLevel; ++i) {
-        int idx = (m_l2_cursor + i) % kSlotsPerLevel;
-        if (!m_l2[idx].empty()) return kL1Range - (m_l1_cursor * kTickMs) + i * kL1Range;
-    }
-
-    return std::nullopt; // idle
+    return next;
 }
 
 void TimingWheel::fireExpired(std::int64_t now_ms) {
@@ -58,18 +67,23 @@ void TimingWheel::fireExpired(std::int64_t now_ms) {
 
         std::int64_t elapsed = now_ms - m_last_tick_ms;
         if (elapsed < 0) elapsed = 0; // clock skew guard
-        m_last_tick_ms = now_ms;
 
         std::int64_t ticks = elapsed / kTickMs;
-        if (ticks > static_cast<std::int64_t>(kSlotsPerLevel * 2)) {
+        if (ticks > static_cast<std::int64_t>(kSlotsPerLevel)) {
             // Large gap (e.g. system suspend). Process directly from overflow
             // and reset the wheel rather than spinning millions of ticks.
             ticks = kSlotsPerLevel;
+            m_last_tick_ms = now_ms;
+        } else {
+            // Preserve the sub-tick remainder.  Advancing this timestamp to
+            // now when ticks == 0 would discard every short poll interval and
+            // could prevent the wheel cursor from ever moving.
+            m_last_tick_ms += ticks * kTickMs;
         }
 
         for (std::int64_t t = 0; t < ticks; ++t) {
             collectExpired(m_l1[m_l1_cursor], expired);
-            if (tickL1()) cascadeL2();
+            tickL1();
         }
 
         // Fire overflow entries that have expired.
@@ -95,7 +109,6 @@ std::size_t TimingWheel::pendingCount() const {
     std::lock_guard<std::mutex> lk(m_mutex);
     std::size_t count = m_overflow.size();
     for (auto& slot : m_l1) count += slot.size();
-    for (auto& slot : m_l2) count += slot.size();
     return count;
 }
 
@@ -115,28 +128,20 @@ void TimingWheel::schedule(const TimerEvent::s_ptr& event) {
     }
 
     if (delay <= kL1Range) {
-        int idx = (m_l1_cursor + (delay / kTickMs)) % kSlotsPerLevel;
+        const auto ticks_ahead = (delay - 1) / kTickMs;
+        int idx = (m_l1_cursor + static_cast<int>(ticks_ahead)) % kSlotsPerLevel;
         m_l1[idx].push_back(event);
-    } else if (delay <= kL2Range) {
-        int idx = (m_l2_cursor + (delay / kL1Range)) % kSlotsPerLevel;
-        m_l2[idx].push_back(event);
     } else {
+        // An ordered map is used for long timers.  This avoids delaying a
+        // timer by a whole L2 revolution when it is inserted part-way through
+        // the current L1 cycle.
         m_overflow.insert({arrival, event});
     }
 }
 
-bool TimingWheel::tickL1() {
+void TimingWheel::tickL1() {
     m_l1[m_l1_cursor].clear();
     m_l1_cursor = (m_l1_cursor + 1) % kSlotsPerLevel;
-    return m_l1_cursor == 0; // wrapped
-}
-
-void TimingWheel::cascadeL2() {
-    auto& slot = m_l2[m_l2_cursor];
-    for (auto& ev : slot)
-        schedule(ev); // re-insert into L1 (or overflow)
-    slot.clear();
-    m_l2_cursor = (m_l2_cursor + 1) % kSlotsPerLevel;
 }
 
 void TimingWheel::collectExpired(Slot& slot, std::vector<TimerEvent::s_ptr>& out) {

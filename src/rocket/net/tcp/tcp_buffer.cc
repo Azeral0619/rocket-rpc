@@ -67,14 +67,18 @@ const char* TcpBuffer::beginWrite() const noexcept { return begin() + m_write_in
 // 写入操作
 // ============================================================================
 
-void TcpBuffer::ensureWritable(std::size_t len) {
-    if (writeAble() < len) {
-        makeSpace(len);
+bool TcpBuffer::ensureWritable(std::size_t len) {
+    if (len > kMaxBufferSize || readAble() > kMaxBufferSize - len) {
+        return false;
     }
+    if (writeAble() < len) {
+        return makeSpace(len);
+    }
+    return true;
 }
 
-void TcpBuffer::makeSpace(std::size_t len) {
-    if (len == 0) return;
+bool TcpBuffer::makeSpace(std::size_t len) {
+    if (len == 0) return true;
 
     if (writeAble() + prependAble() >= len + kPrependSize) {
         // Enough total space after compaction.
@@ -84,53 +88,55 @@ void TcpBuffer::makeSpace(std::size_t len) {
         }
         m_read_index = kPrependSize;
         m_write_index = m_read_index + readable;
-        return;
+        return true;
     }
 
-    // Need more buffer — try to grow.
-    const std::size_t new_size = std::min(m_write_index + len, kMaxBufferSize);
+    const std::size_t readable = readAble();
+    if (readable > kMaxBufferSize - kPrependSize ||
+        len > kMaxBufferSize - kPrependSize - readable) {
+        return false;
+    }
+
+    // Need more buffer.  Grow only when the entire append fits; callers must
+    // never observe a silently truncated frame.
+    const std::size_t required = kPrependSize + readable + len;
+    const std::size_t doubled = std::min(m_buffer.size() * 2, kMaxBufferSize);
+    const std::size_t new_size = std::max(required, doubled);
+    if (new_size > kMaxBufferSize) {
+        return false;
+    }
+
+    if (m_read_index != kPrependSize && readable > 0) {
+        std::memmove(begin() + kPrependSize, begin() + m_read_index, readable);
+    }
+    m_read_index = kPrependSize;
+    m_write_index = m_read_index + readable;
     m_buffer.resize(new_size);
-
-    // If resize hit the ceiling and there's still not enough contiguous
-    // writable space, compact (move readable data to the front).
-    if (writeAble() < len && prependAble() + writeAble() >= len + kPrependSize) {
-        const std::size_t readable = readAble();
-        if (readable > 0) {
-            std::memmove(begin() + kPrependSize, begin() + m_read_index, readable);
-        }
-        m_read_index = kPrependSize;
-        m_write_index = m_read_index + readable;
-    }
+    return writeAble() >= len;
 }
 
-void TcpBuffer::append(const void* data, std::size_t len) {
-    if (len == 0) return;
-    ensureWritable(len);
-    // Safety: if buffer is at hard ceiling and can't expand, clip to
-    // available space so we never write past m_buffer's end.
-    std::size_t avail = writeAble();
-    if (avail < len) {
-        len = avail;
-        if (len == 0) return;
-    }
+bool TcpBuffer::append(const void* data, std::size_t len) {
+    if (len == 0) return true;
+    if (data == nullptr || !ensureWritable(len)) return false;
     std::memcpy(beginWrite(), data, len);
     m_write_index += len;
+    return true;
 }
 
-void TcpBuffer::append(std::string_view data) { append(data.data(), data.size()); }
+bool TcpBuffer::append(std::string_view data) { return append(data.data(), data.size()); }
 
-void TcpBuffer::writeToBuffer(const char* buf, std::size_t size) { append(buf, size); }
+bool TcpBuffer::writeToBuffer(const char* buf, std::size_t size) { return append(buf, size); }
 
-void TcpBuffer::writeToBuffer(std::string_view data) { append(data); }
+bool TcpBuffer::writeToBuffer(std::string_view data) { return append(data); }
 
-void TcpBuffer::appendInt32(std::int32_t x) {
+bool TcpBuffer::appendInt32(std::int32_t x) {
     const std::int32_t net32 = HostToNetwork32(x);
-    append(&net32, sizeof(net32));
+    return append(&net32, sizeof(net32));
 }
 
-void TcpBuffer::appendInt64(std::int64_t x) {
+bool TcpBuffer::appendInt64(std::int64_t x) {
     const std::int64_t net64 = HostToNetwork64(x);
-    append(&net64, sizeof(net64));
+    return append(&net64, sizeof(net64));
 }
 
 void TcpBuffer::prepend(const void* data, std::size_t len) {
@@ -304,7 +310,10 @@ ssize_t TcpBuffer::readFromFd(int fd, int* saved_errno) {
         m_write_index += static_cast<std::size_t>(n);
     } else {
         m_write_index = m_buffer.size();
-        append(&extrabuf, static_cast<std::size_t>(n) - writable);
+        if (!append(extrabuf.data(), static_cast<std::size_t>(n) - writable)) {
+            *saved_errno = EMSGSIZE;
+            return -1;
+        }
     }
 
     return n;

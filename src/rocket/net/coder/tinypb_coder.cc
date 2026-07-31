@@ -4,9 +4,12 @@
 #include "rocket/net/coder/abstract_protocol.h"
 #include "rocket/net/coder/tinypb_protocol.h"
 #include "rocket/net/tcp/tcp_buffer.h"
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <netinet/in.h>
 #include <string>
@@ -17,12 +20,6 @@ namespace rocket {
 namespace {
 
 constexpr std::size_t kMaxPacketSize = 1024ULL * 1024;
-
-inline void writeInt32(std::string& buffer, std::int32_t value) {
-    const std::uint32_t net_value = htonl(static_cast<std::uint32_t>(value));
-    const auto* bytes = static_cast<const void*>(&net_value);
-    buffer.append(static_cast<const char*>(bytes), sizeof(net_value));
-}
 
 // Raw-pointer variants for stack-buffer encoding (Hical FixedBuffer pattern).
 inline char* writeInt32To(char* p, std::int32_t value) {
@@ -47,7 +44,7 @@ inline std::int32_t readInt32(const char* data) {
 
 } // anonymous namespace
 
-void TinyPBCoder::encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuffer::s_ptr out_buffer) {
+bool TinyPBCoder::encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuffer::s_ptr out_buffer) {
     for (auto& msg_base : messages) {
         auto msg = std::dynamic_pointer_cast<TinyPBProtocol>(msg_base);
         if (!msg) {
@@ -57,10 +54,16 @@ void TinyPBCoder::encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuff
 
         std::string encoded = encodeTinyPB(msg);
         if (!encoded.empty()) {
-            out_buffer->writeToBuffer(encoded.c_str(), encoded.length());
+            if (!out_buffer->writeToBuffer(encoded)) {
+                ROCKET_LOG_ERROR("TinyPB output buffer limit exceeded for message [{}]", msg->m_msg_id);
+                return false;
+            }
             ROCKET_LOG_DEBUG("Encoded TinyPB message [{}], {} bytes", msg->m_msg_id, encoded.length());
+        } else {
+            return false;
         }
     }
+    return true;
 }
 
 DecodeResult TinyPBCoder::decode(TcpBuffer::s_ptr buffer) {
@@ -76,57 +79,48 @@ DecodeResult TinyPBCoder::decode(TcpBuffer::s_ptr buffer) {
         tmp.resize(readable);
         std::memcpy(tmp.data(), buffer->readableSpan().data(), readable);
 
-        const std::size_t start_index = 0;
-        const std::size_t write_index = readable;
-
         ROCKET_LOG_DEBUG("Decode: readable={} bytes, first byte=0x{:02x}", readable,
                          static_cast<unsigned char>(tmp[0]));
 
-        std::size_t pk_start_index = 0;
-        std::size_t pk_end_index = 0;
-        std::int32_t pk_len = 0;
-        bool found_valid_packet = false;
-
-        for (std::size_t i = start_index; i < write_index; ++i) {
-            if (tmp[i] == TinyPBProtocol::PB_START) {
-                if (i + 1 + sizeof(std::int32_t) > write_index) {
-                    return result;
-                }
-
-                pk_len = readInt32(&tmp[i + 1]);
-                ROCKET_LOG_DEBUG("Found PB_START at {}, pk_len={}", i, pk_len);
-
-                if (pk_len <= 0 || static_cast<std::size_t>(pk_len) > kMaxPacketSize) {
-                    ROCKET_LOG_WARN("Invalid pk_len={}, skip byte", pk_len);
-                    buffer->moveReadIndex(1);
-                    break;
-                }
-
-                const std::size_t pk_end_pos = i + static_cast<std::size_t>(pk_len) - 1;
-                if (pk_end_pos >= write_index) {
-                    ROCKET_LOG_DEBUG("Incomplete packet, need {} bytes", pk_len);
-                    return result;
-                }
-
-                if (tmp[pk_end_pos] == TinyPBProtocol::PB_END) {
-                    pk_start_index = i;
-                    pk_end_index = pk_end_pos;
-                    found_valid_packet = true;
-                    ROCKET_LOG_DEBUG("Found valid packet: start={}, end={}, len={}", pk_start_index, pk_end_index,
-                                     pk_len);
-                    break;
-                }
-
-                ROCKET_LOG_WARN("PB_END not found at expected position {}, byte=0x{:02x}, skip byte", pk_end_pos,
-                                static_cast<unsigned char>(tmp[pk_end_pos]));
-                buffer->moveReadIndex(1);
-                break;
-            }
+        const auto start_it = std::find(tmp.begin(), tmp.end(), TinyPBProtocol::PB_START);
+        if (start_it == tmp.end()) {
+            // No possible frame remains; do not retain an unbounded garbage
+            // prefix while waiting for the next socket read.
+            buffer->moveReadIndex(readable);
+            return result;
         }
 
-        if (!found_valid_packet) {
-            ROCKET_LOG_DEBUG("No valid packet found, waiting");
+        const std::size_t pk_start_index =
+            static_cast<std::size_t>(std::distance(tmp.begin(), start_it));
+        const std::size_t bytes_from_start = readable - pk_start_index;
+        if (bytes_from_start < 1 + sizeof(std::int32_t)) {
+            buffer->moveReadIndex(pk_start_index);
             return result;
+        }
+
+        const std::int32_t pk_len = readInt32(&tmp[pk_start_index + 1]);
+        ROCKET_LOG_DEBUG("Found PB_START at {}, pk_len={}", pk_start_index, pk_len);
+
+        if (pk_len < static_cast<std::int32_t>(TinyPBProtocol::HEADER_SIZE) ||
+            static_cast<std::size_t>(pk_len) > kMaxPacketSize) {
+            ROCKET_LOG_WARN("Invalid pk_len={}, resynchronizing", pk_len);
+            buffer->moveReadIndex(pk_start_index + 1);
+            continue;
+        }
+
+        const std::size_t packet_size = static_cast<std::size_t>(pk_len);
+        if (bytes_from_start < packet_size) {
+            // Consume only the confirmed garbage prefix and retain the
+            // incomplete frame.
+            buffer->moveReadIndex(pk_start_index);
+            return result;
+        }
+
+        const std::size_t pk_end_index = pk_start_index + packet_size - 1;
+        if (tmp[pk_end_index] != TinyPBProtocol::PB_END) {
+            ROCKET_LOG_WARN("PB_END not found at expected position {}, resynchronizing", pk_end_index);
+            buffer->moveReadIndex(pk_start_index + 1);
+            continue;
         }
 
         auto message = std::make_shared<TinyPBProtocol>();
@@ -135,87 +129,100 @@ DecodeResult TinyPBCoder::decode(TcpBuffer::s_ptr buffer) {
         std::size_t parse_index = pk_start_index + 1 + sizeof(std::int32_t);
 
         auto checkRemaining = [&](std::size_t need_bytes) -> bool {
-            if (parse_index + need_bytes > pk_end_index) {
+            if (parse_index > pk_end_index || need_bytes > pk_end_index - parse_index) {
                 ROCKET_LOG_ERROR("Parse error at index {}, need {} bytes", parse_index, need_bytes);
-                message->parse_success = false;
-                buffer->moveReadIndex(pk_end_index - pk_start_index + 1);
+                return false;
+            }
+            return true;
+        };
+
+        auto rejectPacket = [&](std::string_view reason) {
+            ROCKET_LOG_ERROR("Reject TinyPB packet: {}", reason);
+            message->parse_success = false;
+            buffer->moveReadIndex(pk_end_index + 1);
+            result.fatal = true;
+        };
+
+        auto readLength = [&](std::int32_t& value, std::string_view field_name) -> bool {
+            if (!checkRemaining(sizeof(std::int32_t))) {
+                rejectPacket("missing " + std::string(field_name) + " length");
+                return false;
+            }
+            value = readInt32(&tmp[parse_index]);
+            parse_index += sizeof(std::int32_t);
+            if (value < 0) {
+                rejectPacket("negative " + std::string(field_name) + " length");
+                return false;
+            }
+            if (!checkRemaining(static_cast<std::size_t>(value))) {
+                rejectPacket("oversized " + std::string(field_name) + " length");
                 return false;
             }
             return true;
         };
 
         // 1. msg_id
-        if (!checkRemaining(sizeof(std::int32_t))) {
-            continue;
+        if (!readLength(message->m_msg_id_len, "msg_id")) {
+            return result;
         }
-        message->m_msg_id_len = readInt32(&tmp[parse_index]);
-        parse_index += sizeof(std::int32_t);
-
-        if (!checkRemaining(message->m_msg_id_len)) {
-            continue;
-        }
-        message->m_msg_id.assign(&tmp[parse_index], message->m_msg_id_len);
-        parse_index += message->m_msg_id_len;
+        message->m_msg_id.assign(&tmp[parse_index], static_cast<std::size_t>(message->m_msg_id_len));
+        parse_index += static_cast<std::size_t>(message->m_msg_id_len);
         ROCKET_LOG_DEBUG("msg_id: {}", message->m_msg_id);
 
         // 2. method_name
-        if (!checkRemaining(sizeof(std::int32_t))) {
-            continue;
+        if (!readLength(message->m_method_name_len, "method_name")) {
+            return result;
         }
-        message->m_method_name_len = readInt32(&tmp[parse_index]);
-        parse_index += sizeof(std::int32_t);
-
-        if (!checkRemaining(message->m_method_name_len)) {
-            continue;
-        }
-        message->m_method_name.assign(&tmp[parse_index], message->m_method_name_len);
-        parse_index += message->m_method_name_len;
+        message->m_method_name.assign(&tmp[parse_index],
+                                      static_cast<std::size_t>(message->m_method_name_len));
+        parse_index += static_cast<std::size_t>(message->m_method_name_len);
         ROCKET_LOG_DEBUG("method: {}", message->m_method_name);
 
         // 3. err_code
         if (!checkRemaining(sizeof(std::int32_t))) {
-            continue;
+            rejectPacket("missing error code");
+            return result;
         }
         message->m_err_code = readInt32(&tmp[parse_index]);
         parse_index += sizeof(std::int32_t);
 
         // 4. err_info
-        if (!checkRemaining(sizeof(std::int32_t))) {
-            continue;
+        if (!readLength(message->m_err_info_len, "err_info")) {
+            return result;
         }
-        message->m_err_info_len = readInt32(&tmp[parse_index]);
-        parse_index += sizeof(std::int32_t);
-
-        if (!checkRemaining(message->m_err_info_len)) {
-            continue;
-        }
-        message->m_err_info.assign(&tmp[parse_index], message->m_err_info_len);
-        parse_index += message->m_err_info_len;
+        message->m_err_info.assign(&tmp[parse_index],
+                                   static_cast<std::size_t>(message->m_err_info_len));
+        parse_index += static_cast<std::size_t>(message->m_err_info_len);
 
         // 5. pb_data
-        const std::int32_t pb_data_len = pk_len - static_cast<std::int32_t>(TinyPBProtocol::HEADER_SIZE) -
-                                         message->m_msg_id_len - message->m_method_name_len - message->m_err_info_len;
-
-        if (pb_data_len < 0) {
-            ROCKET_LOG_ERROR("Invalid pb_data_len={}", pb_data_len);
-            message->parse_success = false;
-            buffer->moveReadIndex(pk_end_index - pk_start_index + 1);
-            continue;
+        if (parse_index > pk_end_index ||
+            sizeof(std::int32_t) > pk_end_index - parse_index) {
+            rejectPacket("missing checksum");
+            return result;
         }
-
-        if (!checkRemaining(pb_data_len)) {
-            continue;
+        const std::size_t checksum_index = pk_end_index - sizeof(std::int32_t);
+        if (parse_index > checksum_index) {
+            rejectPacket("invalid protobuf payload length");
+            return result;
         }
-        message->m_pb_data.assign(&tmp[parse_index], pb_data_len);
-        parse_index += pb_data_len;
+        message->m_pb_data.assign(&tmp[parse_index], checksum_index - parse_index);
+        parse_index = checksum_index;
 
         // 6. checksum
         if (!checkRemaining(sizeof(std::int32_t))) {
-            continue;
+            rejectPacket("missing checksum");
+            return result;
         }
         message->m_check_sum = readInt32(&tmp[parse_index]);
+        const auto calculated =
+            calculateChecksum(&tmp[pk_start_index], checksum_index - pk_start_index);
+        if (calculated != static_cast<std::uint32_t>(message->m_check_sum)) {
+            rejectPacket("checksum mismatch");
+            return result;
+        }
 
-        buffer->moveReadIndex(pk_end_index - pk_start_index + 1);
+        // Consume both the valid frame and any garbage prefix preceding it.
+        buffer->moveReadIndex(pk_end_index + 1);
         message->parse_success = true;
         result.messages.push_back(message);
 
@@ -232,9 +239,15 @@ std::string TinyPBCoder::encodeTinyPB(const TinyPBProtocol::s_ptr& message) {
         message->m_msg_id = "default_msg_id";
     }
 
-    const auto pk_len = static_cast<std::int32_t>(TinyPBProtocol::HEADER_SIZE + message->m_msg_id.length() +
-                                                  message->m_method_name.length() + message->m_err_info.length() +
-                                                  message->m_pb_data.length());
+    const std::size_t packet_size = TinyPBProtocol::HEADER_SIZE + message->m_msg_id.length() +
+                                    message->m_method_name.length() + message->m_err_info.length() +
+                                    message->m_pb_data.length();
+    if (packet_size > kMaxPacketSize ||
+        packet_size > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        ROCKET_LOG_ERROR("TinyPB packet too large: {} bytes", packet_size);
+        return "";
+    }
+    const auto pk_len = static_cast<std::int32_t>(packet_size);
 
     // Stack buffer for the common case (most RPC messages are < 512 bytes).
     // Avoids heap allocation on the encode hot path.  Pattern from Hical's
@@ -247,7 +260,7 @@ std::string TinyPBCoder::encodeTinyPB(const TinyPBProtocol::s_ptr& message) {
     if (static_cast<std::size_t>(pk_len) <= kStackCapacity) {
         buf = stack_buf;
     } else {
-        heap_buf.reserve(pk_len);
+        heap_buf.resize(static_cast<std::size_t>(pk_len));
         buf = heap_buf.data();
     }
 

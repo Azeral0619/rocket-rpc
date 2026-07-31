@@ -40,7 +40,8 @@ class AbstractCoder {
     AbstractCoder(AbstractCoder&&) = delete;
     AbstractCoder& operator=(AbstractCoder&&) = delete;
 
-    virtual void encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuffer::s_ptr out_buffer) = 0;
+    [[nodiscard]] virtual bool encode(std::vector<AbstractProtocol::s_ptr>& messages,
+                                      TcpBuffer::s_ptr out_buffer) = 0;
 
     virtual DecodeResult decode(TcpBuffer::s_ptr buffer) = 0;
 };

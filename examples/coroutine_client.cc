@@ -1,6 +1,6 @@
 // Example: using C++20 coroutines for RPC calls.
 // Requires: xmake f -m release && xmake build coroutine_client
-#include "proto/order.pb.h"
+#include "order.pb.h"
 #include "rocket/common/config.h"
 #include "rocket/common/log.h"
 #include "rocket/net/rpc/coroutine.h"

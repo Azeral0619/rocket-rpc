@@ -5,11 +5,13 @@
 #include "rocket/net/rpc/rpc_controller.h"
 
 #include <coroutine>
+#include <condition_variable>
 #include <exception>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -86,6 +88,7 @@ class CoCallAwaitable {
             explicit ResumeClosure(std::shared_ptr<detail::CoCallState<Response>> s)
                 : state(std::move(s)) {}
             void Run() override {
+                std::unique_ptr<ResumeClosure> self(this);
                 auto* rt = RunTime::GetRunTime();
                 if (rt) {
                     rt->m_msgid = std::move(state->saved_msgid);
@@ -134,13 +137,28 @@ class Task {
         int err_code{0};
         std::string err_info;
         std::exception_ptr exception;
+        std::mutex completion_mutex;
+        std::condition_variable completion_cv;
+        bool completed{false};
 
         [[nodiscard]] Task get_return_object() {
             return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
 
         [[nodiscard]] std::suspend_always initial_suspend() noexcept { return {}; }
-        [[nodiscard]] std::suspend_always final_suspend() noexcept { return {}; }
+        struct FinalAwaiter {
+            [[nodiscard]] bool await_ready() const noexcept { return false; }
+            void await_suspend(std::coroutine_handle<promise_type> handle) const noexcept {
+                auto& promise = handle.promise();
+                {
+                    std::lock_guard<std::mutex> lk(promise.completion_mutex);
+                    promise.completed = true;
+                }
+                promise.completion_cv.notify_all();
+            }
+            void await_resume() const noexcept {}
+        };
+        [[nodiscard]] FinalAwaiter final_suspend() noexcept { return {}; }
 
         void unhandled_exception() { exception = std::current_exception(); }
 
@@ -174,7 +192,12 @@ class Task {
     // Throws if the coroutine threw an exception.
     T run() {
         if (!m_handle) return T{};
-        m_handle.resume(); // enter coroutine body
+        if (!m_handle.done()) m_handle.resume();
+        {
+            auto& promise = m_handle.promise();
+            std::unique_lock<std::mutex> lk(promise.completion_mutex);
+            promise.completion_cv.wait(lk, [&promise] { return promise.completed; });
+        }
         if (m_handle.promise().exception) {
             std::rethrow_exception(m_handle.promise().exception);
         }
