@@ -117,6 +117,28 @@ void testBufferOverflowIsExplicit() {
     require(buffer.readAble() == 0, "oversized append partially modified buffer");
 }
 
+void testBufferWritesContiguousBytesToFd() {
+    int fds[2] = {-1, -1};
+    require(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+            "buffer write socketpair failed");
+
+    rocket::TcpBuffer buffer;
+    require(buffer.append("ping", 4), "buffer write append failed");
+    int saved_errno = 0;
+    require(buffer.writeToFd(fds[0], &saved_errno) == 4,
+            "buffer write did not send all bytes");
+    require(buffer.empty(), "buffer write did not consume sent bytes");
+
+    char received[4] = {};
+    require(::read(fds[1], received, sizeof(received)) == 4,
+            "buffer write peer did not receive bytes");
+    require(std::string_view(received, sizeof(received)) == "ping",
+            "buffer write corrupted bytes");
+
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
+
 void testLiteralLogFormatting() {
     rocket::Logger::LogEntry entry;
     entry.setArgs("literal log message");
@@ -560,6 +582,7 @@ int main() {
         testTinyPBLargeFrameAndPrefix();
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
+        testBufferWritesContiguousBytesToFd();
         testLiteralLogFormatting();
         testDisabledLogDoesNotEvaluateArguments();
         testTimingWheelKeepsPartialTicks();
