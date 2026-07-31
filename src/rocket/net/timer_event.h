@@ -7,6 +7,8 @@
 
 namespace rocket {
 
+class TimingWheel;
+
 class TimerEvent {
 
   public:
@@ -48,11 +50,22 @@ class TimerEvent {
     void resetArriveTime();
 
   private:
+    friend class TimingWheel;
+
+    // Scheduling metadata is protected by TimingWheel::m_mutex.  Keeping the
+    // L1 slot/index on the event lets cancellation remove it with one
+    // swap-and-pop instead of retaining the callback until its deadline.
+    static constexpr int kUnscheduledSlot = -2;
+    static constexpr int kOverflowSlot = -1;
+
     std::int64_t m_arrive_time{0}; // ms
     std::int64_t m_interval{0};    // ms
     bool m_is_repeated{false};
     std::atomic<bool> m_is_cancelled{false};
     std::function<void()> m_task;
+    TimingWheel* m_wheel_owner{nullptr};
+    int m_wheel_slot{kUnscheduledSlot};
+    std::size_t m_wheel_index{0};
 };
 
 } // namespace rocket

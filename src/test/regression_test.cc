@@ -200,6 +200,26 @@ void testTimingWheelEagerlyRemovesLongCancelledTimer() {
     require(!fired.load(), "cancelled timer fired");
 }
 
+void testTimingWheelEagerlyRemovesShortCancelledTimer() {
+    rocket::TimingWheel wheel;
+    auto retained = std::make_shared<int>(1);
+    std::weak_ptr<int> weak_retained = retained;
+    auto timer =
+        rocket::TimerEvent::create(1000, false, [retained] { (void)retained; });
+    retained.reset();
+
+    wheel.addEvent(timer);
+    require(wheel.pendingCount() == 1, "short timer was not scheduled");
+    require(!weak_retained.expired(), "timer callback state was not retained");
+
+    wheel.cancelEvent(timer);
+    require(wheel.pendingCount() == 0,
+            "cancelled short timer remained in the timing-wheel slot");
+    timer.reset();
+    require(weak_retained.expired(),
+            "cancelled short timer retained its callback state");
+}
+
 void testThreadPoolRejectsWhenBoundedQueueIsFull() {
     rocket::ThreadPool pool(1, 1);
     std::mutex mutex;
@@ -594,6 +614,7 @@ int main() {
         testDisabledLogDoesNotEvaluateArguments();
         testTimingWheelKeepsPartialTicks();
         testTimingWheelEagerlyRemovesLongCancelledTimer();
+        testTimingWheelEagerlyRemovesShortCancelledTimer();
         testThreadPoolRejectsWhenBoundedQueueIsFull();
         testRpcExecutionModes();
         testRpcWorkerQueueOverloadIsExplicit();

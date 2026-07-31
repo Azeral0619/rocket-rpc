@@ -7,9 +7,23 @@
 
 namespace rocket {
 
+TimingWheel::~TimingWheel() {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    for (auto& slot : m_l1) {
+        for (auto& event : slot) markUnscheduled(event);
+    }
+    for (auto& [arrival, event] : m_overflow) {
+        (void)arrival;
+        markUnscheduled(event);
+    }
+}
+
 void TimingWheel::addEvent(const TimerEvent::s_ptr& event) {
     if (!event || event->isCancelled()) return;
     std::lock_guard<std::mutex> lk(m_mutex);
+    if (event->m_wheel_owner != nullptr) {
+        return;
+    }
     if (m_last_tick_ms == 0) {
         m_last_tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -21,17 +35,30 @@ void TimingWheel::cancelEvent(const TimerEvent::s_ptr& event) {
     if (!event) return;
     event->cancel();
 
-    // Long RPC deadlines are stored in the ordered overflow map. Successful
-    // calls vastly outnumber timeouts, so retaining every cancelled event
-    // until its original deadline creates a large multi-second backlog.
-    // Locate the small equal-deadline range and erase eagerly. Short L1
-    // timers remain lazily cancelled because finding their vector position
-    // would require scanning the wheel.
     std::lock_guard<std::mutex> lk(m_mutex);
+    if (event->m_wheel_owner != this) return;
+
+    if (event->m_wheel_slot >= 0) {
+        auto& slot = m_l1[static_cast<std::size_t>(event->m_wheel_slot)];
+        const std::size_t index = event->m_wheel_index;
+        if (index < slot.size() && slot[index].get() == event.get()) {
+            if (index + 1 != slot.size()) {
+                slot[index] = std::move(slot.back());
+                slot[index]->m_wheel_index = index;
+            }
+            slot.pop_back();
+            markUnscheduled(event);
+        }
+        return;
+    }
+
+    // Long deadlines live in an ordered map. Locate only the equal-deadline
+    // range; successful RPCs remove their callback state immediately.
     const auto [first, last] = m_overflow.equal_range(event->getArriveTime());
     for (auto it = first; it != last; ++it) {
         if (it->second.get() == event.get()) {
             m_overflow.erase(it);
+            markUnscheduled(event);
             break;
         }
     }
@@ -104,8 +131,10 @@ void TimingWheel::fireExpired(std::int64_t now_ms) {
         // Fire overflow entries that have expired.
         while (!m_overflow.empty() && m_overflow.begin()->first <= now_ms) {
             auto it = m_overflow.begin();
-            if (!it->second->isCancelled()) expired.push_back(it->second);
+            auto event = std::move(it->second);
             m_overflow.erase(it);
+            markUnscheduled(event);
+            if (!event->isCancelled()) expired.push_back(std::move(event));
         }
     }
 
@@ -145,12 +174,19 @@ void TimingWheel::schedule(const TimerEvent::s_ptr& event) {
     if (delay <= kL1Range) {
         const auto ticks_ahead = (delay - 1) / kTickMs;
         int idx = (m_l1_cursor + static_cast<int>(ticks_ahead)) % kSlotsPerLevel;
-        m_l1[idx].push_back(event);
+        auto& slot = m_l1[static_cast<std::size_t>(idx)];
+        slot.push_back(event);
+        event->m_wheel_owner = this;
+        event->m_wheel_slot = idx;
+        event->m_wheel_index = slot.size() - 1;
     } else {
         // An ordered map is used for long timers.  This avoids delaying a
         // timer by a whole L2 revolution when it is inserted part-way through
         // the current L1 cycle.
         m_overflow.insert({arrival, event});
+        event->m_wheel_owner = this;
+        event->m_wheel_slot = TimerEvent::kOverflowSlot;
+        event->m_wheel_index = 0;
     }
 }
 
@@ -160,11 +196,17 @@ void TimingWheel::tickL1() {
 }
 
 void TimingWheel::collectExpired(Slot& slot, std::vector<TimerEvent::s_ptr>& out) {
-    for (auto& ev : slot)
-        if (!ev->isCancelled()) out.push_back(ev);
-    // Remove cancelled events that would otherwise linger in the slot,
-    // causing msUntilNextExpire to return small timeouts → 100% CPU busy-loop.
-    std::erase_if(slot, [](const TimerEvent::s_ptr& ev) { return ev->isCancelled(); });
+    for (auto& event : slot) {
+        markUnscheduled(event);
+        if (!event->isCancelled()) out.push_back(event);
+    }
+}
+
+void TimingWheel::markUnscheduled(const TimerEvent::s_ptr& event) noexcept {
+    if (!event) return;
+    event->m_wheel_owner = nullptr;
+    event->m_wheel_slot = TimerEvent::kUnscheduledSlot;
+    event->m_wheel_index = 0;
 }
 
 } // namespace rocket

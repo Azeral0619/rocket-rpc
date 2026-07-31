@@ -27,11 +27,12 @@ class TimingWheel {
     static constexpr std::int64_t kL1Range = kSlotsPerLevel * kTickMs;       // 2560 ms
 
     TimingWheel() = default;
+    ~TimingWheel();
 
     // Insert or re-insert an event.  Called for both new and repeated events.
     void addEvent(const TimerEvent::s_ptr& event);
 
-    // Lazy cancel — just marks the event; fireExpired skips it.
+    // Cancel and eagerly unlink the event. L1 removal is O(1).
     void cancelEvent(const TimerEvent::s_ptr& event);
 
     // Milliseconds until the next non-empty slot, or nullopt if idle.
@@ -53,6 +54,7 @@ class TimingWheel {
     void schedule(const TimerEvent::s_ptr& event);
 
     void collectExpired(Slot& slot, std::vector<TimerEvent::s_ptr>& out);
+    void markUnscheduled(const TimerEvent::s_ptr& event) noexcept;
 
     std::array<Slot, kSlotsPerLevel> m_l1;
     std::multimap<std::int64_t, TimerEvent::s_ptr> m_overflow; // key = arrival ms
