@@ -4,6 +4,8 @@
 #include "rocket/net/event_loop.h"
 
 #include <cerrno>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -23,6 +25,13 @@ TcpConnection::TcpConnection(EventLoop* loop, int fd, NetAddr::s_ptr local_addr,
       m_out_buffer(std::make_shared<TcpBuffer>(kDefaultBufferSize)) {
 
     m_fd_event->setNonBlock();
+
+    const int enabled = 1;
+    if (::setsockopt(m_fd, IPPROTO_TCP, TCP_NODELAY, &enabled,
+                     sizeof(enabled)) != 0) {
+        ROCKET_LOG_WARN("failed to enable TCP_NODELAY fd={} errno={}", m_fd,
+                        errno);
+    }
 }
 
 TcpConnection::~TcpConnection() {
