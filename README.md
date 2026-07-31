@@ -1,5 +1,41 @@
 # rocket-rpc
 
+## Typed C++ client
+
+`MakeClient<Stub>` wraps the protobuf-generated stub and reuses the channel's
+connection pool. The method pointer is a compile-time value, so request and
+response types are inferred without runtime reflection:
+
+```cpp
+using namespace std::chrono_literals;
+
+auto order = rocket::MakeClient<Order_Stub>("order_server");
+
+auto result = co_await order.call<&Order_Stub::makeOrder>(
+    std::move(request), {.timeout = 3s});
+if (!result) {
+    // result.status().code(), result.status().message()
+}
+```
+
+The same generated method supports blocking and callback calls:
+
+```cpp
+auto blocking = order.callBlocking<&Order_Stub::makeOrder>(
+    std::move(request), {.timeout = 3s});
+
+order.callAsync<&Order_Stub::makeOrder>(
+    std::move(request), {.timeout = 3s},
+    [](rocket::RpcResult<makeOrderResponse> result) {
+        // Handle completion.
+    });
+```
+
+`Client<Stub>` is a small, copyable, thread-safe handle. Keep it as a service
+member and share it across business threads. Requests are accepted by value so
+asynchronous calls never retain references to caller-owned protobuf objects;
+use `std::move(request)` to avoid a protobuf copy.
+
 ## RPC execution model
 
 RPC methods run inline on their connection's IO thread by default. Keep inline

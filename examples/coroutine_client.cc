@@ -4,35 +4,41 @@
 #include "rocket/common/config.h"
 #include "rocket/common/log.h"
 #include "rocket/net/rpc/coroutine.h"
-#include "rocket/net/rpc/rpc_channel.h"
-#include "rocket/net/rpc/rpc_controller.h"
+#include "rocket/net/rpc/rpc_client.h"
 
+#include <chrono>
 #include <iostream>
 #include <memory>
 
-// Coroutine: make three RPC calls sequentially, each awaiting the response.
-rocket::Task<int> makeOrders(rocket::RpcChannel::s_ptr channel) {
-    auto* method = Order::descriptor()->FindMethodByName("makeOrder");
+using namespace std::chrono_literals;
 
+// Coroutine: make three RPC calls sequentially, each awaiting the response.
+rocket::Task<int> makeOrders(rocket::Client<Order_Stub> order) {
     makeOrderRequest req1;
     req1.set_price(100);
     req1.set_goods("apple");
-    auto rsp1 = co_await rocket::coCall<makeOrderResponse>(channel, method, &req1);
-    std::cout << "Order 1: " << rsp1.order_id() << "\n";
+    auto result1 = co_await order.call<&Order_Stub::makeOrder>(
+        std::move(req1), {.timeout = 3s});
+    if (!result1) co_return result1.status().code();
+    std::cout << "Order 1: " << result1.value().order_id() << "\n";
 
     makeOrderRequest req2;
     req2.set_price(200);
     req2.set_goods("banana");
-    auto rsp2 = co_await rocket::coCall<makeOrderResponse>(channel, method, &req2);
-    std::cout << "Order 2: " << rsp2.order_id() << "\n";
+    auto result2 = co_await order.call<&Order_Stub::makeOrder>(
+        std::move(req2), {.timeout = 3s});
+    if (!result2) co_return result2.status().code();
+    std::cout << "Order 2: " << result2.value().order_id() << "\n";
 
     makeOrderRequest req3;
     req3.set_price(300);
     req3.set_goods("cherry");
-    auto rsp3 = co_await rocket::coCall<makeOrderResponse>(channel, method, &req3);
-    std::cout << "Order 3: " << rsp3.order_id() << "\n";
+    auto result3 = co_await order.call<&Order_Stub::makeOrder>(
+        std::move(req3), {.timeout = 3s});
+    if (!result3) co_return result3.status().code();
+    std::cout << "Order 3: " << result3.value().order_id() << "\n";
 
-    co_return rsp3.ret_code();
+    co_return result3.value().ret_code();
 }
 
 int main(int argc, char* argv[]) {
@@ -41,17 +47,12 @@ int main(int argc, char* argv[]) {
     }
     rocket::Logger::getInstance().start();
 
-    auto channel = rocket::NewRpcChannel("order_server");
-    if (!channel) {
-        ROCKET_LOG_ERROR("Failed to create RpcChannel");
-        return 1;
-    }
-
-    auto task = makeOrders(channel);
+    auto order = rocket::MakeClient<Order_Stub>("order_server");
+    auto task = makeOrders(std::move(order));
     int ret = task.run();
 
-    if (task.errorCode() != 0) {
-        ROCKET_LOG_ERROR("Coroutine RPC failed: {}", task.errorInfo());
+    if (ret != 0) {
+        ROCKET_LOG_ERROR("Coroutine RPC failed: {}", ret);
         return 1;
     }
 

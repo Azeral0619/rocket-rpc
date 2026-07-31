@@ -7,6 +7,7 @@
 #include "rocket/net/event_loop.h"
 #include "rocket/net/rpc/coroutine.h"
 #include "rocket/net/rpc/rpc_channel.h"
+#include "rocket/net/rpc/rpc_client.h"
 #include "rocket/net/rpc/rpc_controller.h"
 #include "rocket/net/rpc/rpc_server.h"
 #include "rocket/net/tcp/net_addr.h"
@@ -420,6 +421,106 @@ void testRpcExecutionModes() {
     testRpcExecutionMode(rocket::RpcExecutionMode::WorkerPool, true, true);
 }
 
+rocket::Task<std::string> callOrderWithTypedClient(
+    rocket::Client<Order_Stub> client, int price) {
+    makeOrderRequest request;
+    request.set_price(price);
+    request.set_goods("coroutine");
+
+    auto result =
+        co_await client.call<&Order_Stub::makeOrder>(
+            std::move(request), rocket::CallOptions{.timeout = 2s});
+    if (!result) {
+        co_return std::string("error:") +
+                  std::to_string(result.status().code());
+    }
+    co_return std::move(result).value().order_id();
+}
+
+void testTypedClientCallModes() {
+    const auto port = reserveUnusedPort();
+    auto address =
+        std::make_shared<rocket::IPNetAddr>("127.0.0.1", port);
+    auto service = std::make_shared<ExecutionRecordingOrder>();
+
+    rocket::RpcServer server(address, 2, false);
+    server.registerService(service);
+    std::thread server_thread([&] { server.start(); });
+    std::this_thread::sleep_for(100ms);
+
+    auto pool = std::make_shared<rocket::RpcConnectionPool>(1, 1);
+    auto channel = std::make_shared<rocket::RpcChannel>(address, pool);
+    auto client = rocket::MakeClient<Order_Stub>(channel);
+
+    auto invalid_channel = std::make_shared<rocket::RpcChannel>(
+        rocket::NetAddr::s_ptr{}, pool);
+    auto invalid_client =
+        rocket::MakeClient<Order_Stub>(std::move(invalid_channel));
+    makeOrderRequest invalid_request;
+    auto invalid_result =
+        invalid_client.callBlocking<&Order_Stub::makeOrder>(
+            std::move(invalid_request),
+            rocket::CallOptions{.timeout = 2s});
+    require(!invalid_result,
+            "typed client accepted a missing peer address");
+    require(invalid_result.status().code() == rocket::error::kRpcPeerAddr,
+            "typed client lost a synchronous channel error");
+
+    makeOrderRequest blocking_request;
+    blocking_request.set_price(101);
+    blocking_request.set_goods("blocking");
+    auto blocking_result =
+        client.callBlocking<&Order_Stub::makeOrder>(
+            std::move(blocking_request),
+            rocket::CallOptions{.timeout = 2s});
+    require(blocking_result.ok(), "typed blocking RPC failed");
+    require(blocking_result.value().order_id() == "thread-101",
+            "typed blocking RPC returned the wrong response");
+
+    struct AsyncState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done{false};
+        bool ok{false};
+        std::string order_id;
+    };
+    auto async_state = std::make_shared<AsyncState>();
+    makeOrderRequest async_request;
+    async_request.set_price(202);
+    async_request.set_goods("callback");
+    client.callAsync<&Order_Stub::makeOrder>(
+        std::move(async_request), rocket::CallOptions{.timeout = 2s},
+        [async_state](rocket::RpcResult<makeOrderResponse> result) {
+            {
+                std::lock_guard<std::mutex> lock(async_state->mutex);
+                async_state->ok = result.ok();
+                if (result) {
+                    async_state->order_id =
+                        std::move(result).value().order_id();
+                }
+                async_state->done = true;
+            }
+            async_state->cv.notify_one();
+        });
+    {
+        std::unique_lock<std::mutex> lock(async_state->mutex);
+        require(async_state->cv.wait_for(
+                    lock, 2s, [&] { return async_state->done; }),
+                "typed callback RPC did not complete");
+        require(async_state->ok, "typed callback RPC failed");
+        require(async_state->order_id == "thread-202",
+                "typed callback RPC returned the wrong response");
+    }
+
+    auto coroutine = callOrderWithTypedClient(client, 303);
+    require(coroutine.run() == "thread-303",
+            "typed coroutine RPC returned the wrong response");
+
+    pool->shutdown();
+    server.stop();
+    server_thread.join();
+}
+
 class BlockingOrder final : public Order {
   public:
     void makeOrder(::google::protobuf::RpcController*,
@@ -713,6 +814,7 @@ int main() {
         testTimingWheelEagerlyRemovesShortCancelledTimer();
         testThreadPoolRejectsWhenBoundedQueueIsFull();
         testRpcExecutionModes();
+        testTypedClientCallModes();
         testRpcWorkerQueueOverloadIsExplicit();
         testTaskRunWaitsForCompletion();
         testConnectFailureAndStandardDone();

@@ -1,10 +1,12 @@
 #include "order.pb.h"
 #include "rocket/common/config.h"
 #include "rocket/common/log.h"
-#include "rocket/net/rpc/rpc_channel.h"
-#include "rocket/net/rpc/rpc_controller.h"
+#include "rocket/net/rpc/rpc_client.h"
 
+#include <chrono>
 #include <memory>
+
+using namespace std::chrono_literals;
 
 int main(int argc, char* argv[]) {
     if (argc > 1) {
@@ -12,28 +14,21 @@ int main(int argc, char* argv[]) {
     }
     rocket::Logger::getInstance().start();
 
-    auto channel = rocket::NewRpcChannel("order_server");
-    if (!channel) {
-        ROCKET_LOG_ERROR("Failed to create RpcChannel");
-        return 1;
-    }
+    auto order = rocket::MakeClient<Order_Stub>("order_server");
 
     makeOrderRequest request;
     request.set_price(100);
     request.set_goods("apple");
 
-    makeOrderResponse response;
-    rocket::RpcController controller;
-
-    int err = channel->CallMethodBlocking(
-        Order::descriptor()->FindMethodByName("makeOrder"),
-        &controller, &request, &response, 3000);
-
-    if (err != 0 || controller.Failed()) {
-        ROCKET_LOG_ERROR("RPC failed: {}", controller.ErrorText());
+    auto result = order.callBlocking<&Order_Stub::makeOrder>(
+        std::move(request), {.timeout = 3s});
+    if (!result) {
+        ROCKET_LOG_ERROR("RPC failed: code={}, message={}",
+                         result.status().code(), result.status().message());
         return 1;
     }
 
+    const auto& response = result.value();
     ROCKET_LOG_INFO("RPC success: ret_code={}, res_info={}, order_id={}",
                     response.ret_code(), response.res_info(), response.order_id());
     return 0;
