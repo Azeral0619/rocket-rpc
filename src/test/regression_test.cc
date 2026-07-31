@@ -135,6 +135,13 @@ void testBufferWritesContiguousBytesToFd() {
     require(std::string_view(received, sizeof(received)) == "ping",
             "buffer write corrupted bytes");
 
+    require(::write(fds[1], "pong", 4) == 4,
+            "buffer direct-read peer write failed");
+    rocket::TcpBuffer input;
+    require(input.readFromFd(fds[0], &saved_errno, false) == 4,
+            "buffer direct-read failed");
+    require(input.retrieveAll() == "pong", "buffer direct-read corrupted bytes");
+
     ::close(fds[0]);
     ::close(fds[1]);
 }

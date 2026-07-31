@@ -284,9 +284,21 @@ void TcpConnection::handleRead() {
             m_in_buffer->resizeBuffer(std::min(m_in_buffer->capacity() * 2, TcpBuffer::kMaxBufferSize));
         }
 
-        const ssize_t n = m_in_buffer->readFromFd(m_fd, &saved_errno);
+        const bool use_readv = m_use_readv;
+        const std::size_t writable_before_read = m_in_buffer->writeAble();
+        const ssize_t n =
+            m_in_buffer->readFromFd(m_fd, &saved_errno, use_readv);
         if (n > 0) {
-            if (static_cast<std::size_t>(n) < kMaxReadPerRound) {
+            if (!use_readv &&
+                static_cast<std::size_t>(n) == writable_before_read) {
+                // The direct-read buffer filled. This connection carries
+                // large or pipelined input; retain readv's overflow path for
+                // subsequent reads.
+                m_use_readv = true;
+                continue;
+            }
+            if (!use_readv ||
+                static_cast<std::size_t>(n) < kMaxReadPerRound) {
                 break;
             }
             continue;

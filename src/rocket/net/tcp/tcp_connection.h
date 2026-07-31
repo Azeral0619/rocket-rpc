@@ -144,6 +144,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     bool m_flush_queued{false};  // owning EventLoop thread only
     bool m_defer_output_flush{false};  // batch frames decoded by one read
     bool m_direct_output_flush{false};
+    bool m_use_readv{false};
 
     // TinyPB control frames are normally well below 1 KiB. TcpBuffer grows
     // on demand, so keeping the per-connection baseline small substantially

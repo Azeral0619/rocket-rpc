@@ -84,7 +84,7 @@ class TcpBuffer {
     void moveReadIndex(std::size_t size);
     void moveWriteIndex(std::size_t size);
 
-    [[nodiscard]] ssize_t readFromFd(int fd, int* saved_errno);
+    [[nodiscard]] ssize_t readFromFd(int fd, int* saved_errno, bool use_readv = true);
     [[nodiscard]] ssize_t writeToFd(int fd, int* saved_errno);
 
     [[nodiscard]] const char* data() const noexcept;

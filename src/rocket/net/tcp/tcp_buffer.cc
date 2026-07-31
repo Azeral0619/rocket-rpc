@@ -290,12 +290,22 @@ void TcpBuffer::moveWriteIndex(std::size_t size) {
 // Socket I/O
 // ============================================================================
 
-ssize_t TcpBuffer::readFromFd(int fd, int* saved_errno) {
+ssize_t TcpBuffer::readFromFd(int fd, int* saved_errno, bool use_readv) {
+    const std::size_t writable = writeAble();
+    if (!use_readv) {
+        const ssize_t n = ::read(fd, beginWrite(), writable);
+        if (n < 0) {
+            *saved_errno = errno;
+        } else {
+            m_write_index += static_cast<std::size_t>(n);
+        }
+        return n;
+    }
+
     static constexpr size_t kBufferSize = 65536;
-    std::array<char, kBufferSize> extrabuf;
+    static thread_local std::array<char, kBufferSize> extrabuf;
     std::array<struct iovec, 2> vec;
 
-    const std::size_t writable = writeAble();
     vec[0].iov_base = beginWrite();
     vec[0].iov_len = writable;
     vec[1].iov_base = extrabuf.data();
