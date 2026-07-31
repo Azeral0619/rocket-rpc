@@ -37,7 +37,7 @@ int main(int argc, char* argv[]) {
     rocket::Logger::getInstance().start(opts);
 
     auto addr = std::make_shared<rocket::IPNetAddr>("127.0.0.1", 12888);
-    rocket::RpcServer server(addr, 4);
+    rocket::RpcServer server(addr, 4, false);
     server.registerService(std::make_shared<OrderImpl>());
     std::thread svr([&] { server.start(); });
     svr.detach();

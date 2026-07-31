@@ -21,7 +21,9 @@ class RpcServer {
   public:
     using Services_ptr = std::shared_ptr<google::protobuf::Service>;
 
-    RpcServer(NetAddr::s_ptr local_addr, std::size_t worker_threads = ThreadPool::kDefaultThreadCount);
+    RpcServer(NetAddr::s_ptr local_addr,
+              std::size_t worker_threads = ThreadPool::kDefaultThreadCount,
+              bool handle_process_signals = true);
 
     ~RpcServer();
 
@@ -52,6 +54,7 @@ class RpcServer {
     std::condition_variable m_signal_cv;
     bool m_signal_monitor_stop{false};
     bool m_signal_handlers_installed{false};
+    bool m_handle_process_signals{true};
     struct sigaction m_old_sigint {};
     struct sigaction m_old_sigterm {};
 };

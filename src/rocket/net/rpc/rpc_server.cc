@@ -26,9 +26,11 @@ extern "C" void requestShutdown(int signal_number) {
 
 } // namespace
 
-RpcServer::RpcServer(NetAddr::s_ptr local_addr, std::size_t worker_threads)
+RpcServer::RpcServer(NetAddr::s_ptr local_addr, std::size_t worker_threads,
+                     bool handle_process_signals)
     : m_server(std::move(local_addr), [] { return std::make_unique<TinyPBCoder>(); }),
-      m_dispatcher(worker_threads) {
+      m_dispatcher(worker_threads),
+      m_handle_process_signals(handle_process_signals) {
 
     m_server.setMessageCallback([this](const TcpConnection::s_ptr& conn,
                                        std::vector<AbstractProtocol::s_ptr>& messages) {
@@ -45,10 +47,12 @@ RpcServer::~RpcServer() {
 void RpcServer::registerService(Services_ptr service) { m_dispatcher.registerService(std::move(service)); }
 
 void RpcServer::start() {
-    startSignalMonitor();
+    if (m_handle_process_signals) startSignalMonitor();
     m_server.start();
-    stopSignalMonitor();
-    restoreSignalHandlers();
+    if (m_handle_process_signals) {
+        stopSignalMonitor();
+        restoreSignalHandlers();
+    }
 }
 
 void RpcServer::stop() {

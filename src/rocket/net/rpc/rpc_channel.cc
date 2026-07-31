@@ -216,14 +216,12 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
     state->client = client;
 
     if (my_controller->GetMsgId().empty()) {
-        std::string msg_id = RunTime::GetRunTime()->m_msgid;
-        if (!msg_id.empty()) {
-            req_protocol->m_msg_id = msg_id;
-            my_controller->SetMsgId(msg_id);
-        } else {
-            req_protocol->m_msg_id = MsgIDUtil::GenMsgID();
-            my_controller->SetMsgId(req_protocol->m_msg_id);
-        }
+        // A response callback is keyed by msg_id, so every in-flight RPC must
+        // have its own ID.  RunTime::m_msgid is logging/trace context and can
+        // outlive the request that populated it; inheriting it here lets two
+        // calls made on the same thread overwrite each other's callbacks.
+        req_protocol->m_msg_id = MsgIDUtil::GenMsgID();
+        my_controller->SetMsgId(req_protocol->m_msg_id);
     } else {
         req_protocol->m_msg_id = my_controller->GetMsgId();
     }

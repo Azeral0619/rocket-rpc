@@ -181,7 +181,10 @@ int main(int argc, char* argv[]) {
     }
 
     auto addr = std::make_shared<rocket::IPNetAddr>("127.0.0.1", 12998);
-    rocket::RpcServer server(addr, 1);
+    // This benchmark intentionally terminates with _exit().  Keep the
+    // process-default SIGINT/SIGTERM behavior so an interrupted warm-up
+    // cannot leave a detached embedded server holding port 12998.
+    rocket::RpcServer server(addr, 1, false);
     server.registerService(std::make_shared<OrderImpl>());
     std::thread svr([&] { server.start(); });
     svr.detach();
