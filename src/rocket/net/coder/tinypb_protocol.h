@@ -15,10 +15,10 @@ namespace rocket {
  * TinyPB（Tiny Protocol Buffer）是一个轻量级的二进制 RPC 协议。
  *
  * 协议结构（所有多字节整数使用网络字节序）：
- * +-------+--------+-------------+--------+------------------+--------+--------------+
- * | Start | PkLen  | MsgIdLen    | MsgId  | MethodNameLen    | Method | ErrCode      |
- * | 1B    | 4B     | 4B          | var    | 4B               | var    | 4B           |
- * +-------+--------+-------------+--------+------------------+--------+--------------+
+ * +-------+--------+-------------+------------------+--------+--------------+
+ * | Start | PkLen  | MsgId       | MethodNameLen    | Method | ErrCode      |
+ * | 1B    | 4B     | 8B          | 4B               | var    | 4B           |
+ * +-------+--------+-------------+------------------+--------+--------------+
  * | ErrInfoLen | ErrInfo | PbData      | CheckSum | End  |
  * | 4B         | var     | var         | 4B       | 1B   |
  * +------------+---------+-------------+----------+------+
@@ -26,8 +26,7 @@ namespace rocket {
  * 字段说明：
  * - Start: 起始标识符 0x02
  * - PkLen: 整包长度（包括起始和结束标识符）
- * - MsgIdLen: 消息ID长度
- * - MsgId: 消息唯一标识符（用于请求-响应匹配）
+ * - MsgId: 固定 64 位无符号消息ID（用于请求-响应匹配）
  * - MethodNameLen: 方法名长度
  * - MethodName: RPC 方法名
  * - ErrCode: 错误码（0表示成功）
@@ -37,7 +36,7 @@ namespace rocket {
  * - CheckSum: 校验和（CRC32）
  * - End: 结束标识符 0x03
  *
- * 固定开销：2（起始+结束） + 24（6个int32）= 26 字节
+ * 固定开销：2（起始+结束） + 20（5个int32）+ 8（MsgId）= 30 字节
  */
 struct TinyPBProtocol : public AbstractProtocol {
   public:
@@ -46,7 +45,9 @@ struct TinyPBProtocol : public AbstractProtocol {
     static constexpr char PB_START = 0x02; ///< 起始标识
     static constexpr char PB_END = 0x03;   ///< 结束标识
 
-    static constexpr std::size_t HEADER_SIZE = 1 + (4 * 6) + 1; ///< 起始+6个int32+结束 = 26字节
+    static constexpr std::size_t HEADER_SIZE =
+        1 + sizeof(std::int32_t) + sizeof(MessageId) +
+        (sizeof(std::int32_t) * 4) + 1;
 
     TinyPBProtocol() = default;
     ~TinyPBProtocol() override = default;
@@ -59,8 +60,7 @@ struct TinyPBProtocol : public AbstractProtocol {
     [[nodiscard]] std::string_view getProtocolType() const override { return "TinyPB"; }
 
     // 协议字段
-    std::int32_t m_pk_len{0};     ///< 整包长度
-    std::int32_t m_msg_id_len{0}; ///< 消息ID长度
+    std::int32_t m_pk_len{0}; ///< 整包长度
     // m_msg_id 继承自 AbstractProtocol
 
     std::int32_t m_method_name_len{0}; ///< 方法名长度

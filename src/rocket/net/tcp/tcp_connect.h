@@ -70,7 +70,7 @@ class TcpConnection {
 
     void pushSendMessage(AbstractProtocol::s_ptr message, std::function<void(AbstractProtocol::s_ptr)> done);
 
-    void pushReadMessage(std::string_view msg_id, std::function<void(AbstractProtocol::s_ptr)> done);
+    void pushReadMessage(MessageId msg_id, std::function<void(AbstractProtocol::s_ptr)> done);
 
     [[nodiscard]] NetAddr::s_ptr getLocalAddr() const;
 
@@ -101,7 +101,7 @@ class TcpConnection {
 
     std::vector<std::pair<AbstractProtocol::s_ptr, std::function<void(AbstractProtocol::s_ptr)>>> m_write_dones;
 
-    std::map<std::string, std::function<void(AbstractProtocol::s_ptr)>, std::less<>> m_read_dones;
+    std::map<MessageId, std::function<void(AbstractProtocol::s_ptr)>> m_read_dones;
 };
 
 } // namespace rocket

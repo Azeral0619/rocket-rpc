@@ -260,7 +260,7 @@ void Logger::consumerRun() {
         fmt::format_to(std::back_inserter(wb), "{}.{:03d} [{}] [tid={}]",
             std::string_view(dtc.buf.data(), dtc.len), ms,
             LogLevelToString(static_cast<LogLevel>(e.level)), e.thread_id);
-        if (!e.msgid.empty())
+        if (e.msgid != 0)
             fmt::format_to(std::back_inserter(wb), " [msgid={}]", e.msgid);
         if (!e.method_name.empty())
             fmt::format_to(std::back_inserter(wb), " [method={}]", e.method_name);

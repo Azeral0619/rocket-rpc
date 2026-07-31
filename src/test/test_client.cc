@@ -78,7 +78,7 @@ void test_tcp_client() {
     client.connect([addr, &client, &event_loop]() {
         ROCKET_LOG_DEBUG("connect to [{}] success", addr->toString());
         std::shared_ptr<rocket::TinyPBProtocol> message = std::make_shared<rocket::TinyPBProtocol>();
-        message->m_msg_id = "123456789";
+        message->m_msg_id = 123456789;
         message->m_method_name = "Test.Echo"; // 添加方法名以通过协议验证
         message->m_pb_data = "test pb data";
         client.writeMessage(message, [](const std::shared_ptr<rocket::AbstractProtocol>&) {

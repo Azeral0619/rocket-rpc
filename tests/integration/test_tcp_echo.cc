@@ -54,10 +54,10 @@ TEST(TcpEcho, Roundtrip) {
 
     std::promise<std::string> response_promise;
     auto req = std::make_shared<StringProtocol>();
-    req->m_msg_id = "string_msg";
+    req->m_msg_id = 1;
     req->info = "hello";
 
-    client->readMessage("string_msg", [&response_promise](AbstractProtocol::s_ptr msg) mutable {
+    client->readMessage(1, [&response_promise](AbstractProtocol::s_ptr msg) mutable {
         auto* str = dynamic_cast<StringProtocol*>(msg.get());
         if (str != nullptr) {
             response_promise.set_value(str->info);

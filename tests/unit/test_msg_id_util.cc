@@ -7,25 +7,21 @@
 namespace rocket {
 namespace {
 
-TEST(MsgIDUtil, Generates20DigitIds) {
-    const std::string id = MsgIDUtil::GenMsgID();
-    EXPECT_EQ(id.length(), 20U);
-    for (const char c : id) {
-        EXPECT_GE(c, '0');
-        EXPECT_LE(c, '9');
-    }
+TEST(MsgIDUtil, GeneratesNonZeroIds) {
+    const std::uint64_t id = MsgIDUtil::GenMsgID();
+    EXPECT_NE(id, 0U);
 }
 
 TEST(MsgIDUtil, SequentialCallsIncrement) {
-    const std::string first = MsgIDUtil::GenMsgID();
-    const std::string second = MsgIDUtil::GenMsgID();
+    const std::uint64_t first = MsgIDUtil::GenMsgID();
+    const std::uint64_t second = MsgIDUtil::GenMsgID();
     EXPECT_NE(first, second);
     // Same-thread ids are numeric increments of each other.
     EXPECT_GT(second, first);
 }
 
 TEST(MsgIDUtil, ConsecutiveCallsUnique) {
-    std::set<std::string> ids;
+    std::set<std::uint64_t> ids;
     for (int i = 0; i < 1000; ++i) {
         ids.insert(MsgIDUtil::GenMsgID());
     }
@@ -35,7 +31,7 @@ TEST(MsgIDUtil, ConsecutiveCallsUnique) {
 TEST(MsgIDUtil, MultiThreadedUnique) {
     constexpr int kThreads = 4;
     constexpr int kPerThread = 500;
-    std::vector<std::vector<std::string>> results(kThreads);
+    std::vector<std::vector<std::uint64_t>> results(kThreads);
     std::vector<std::thread> threads;
     threads.reserve(kThreads);
     for (int t = 0; t < kThreads; ++t) {
@@ -49,7 +45,7 @@ TEST(MsgIDUtil, MultiThreadedUnique) {
         th.join();
     }
 
-    std::set<std::string> all;
+    std::set<std::uint64_t> all;
     for (const auto& per : results) {
         all.insert(per.begin(), per.end());
     }

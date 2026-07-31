@@ -13,10 +13,10 @@ using ::testing::ElementsAre;
 using ::testing::IsEmpty;
 using ::testing::SizeIs;
 
-TinyPBProtocol::s_ptr MakeMessage(std::string_view msg_id, std::string_view method, std::string_view pb_data,
+TinyPBProtocol::s_ptr MakeMessage(MessageId msg_id, std::string_view method, std::string_view pb_data,
                                   std::int32_t err_code = 0, std::string_view err_info = "") {
     auto msg = std::make_shared<TinyPBProtocol>();
-    msg->m_msg_id = std::string(msg_id);
+    msg->m_msg_id = msg_id;
     msg->m_method_name = std::string(method);
     msg->m_pb_data = std::string(pb_data);
     msg->m_err_code = err_code;
@@ -28,7 +28,7 @@ TEST(TinyPBCoder, Roundtrip) {
     TinyPBCoder coder;
     TcpBuffer buf;
 
-    auto original = MakeMessage("12345", "Order.makeOrder", "payload");
+    auto original = MakeMessage(12345, "Order.makeOrder", "payload");
     std::vector<AbstractProtocol::s_ptr> messages = {original};
     EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -39,7 +39,7 @@ TEST(TinyPBCoder, Roundtrip) {
 
     auto decoded = std::dynamic_pointer_cast<TinyPBProtocol>(result.messages[0]);
     ASSERT_NE(decoded, nullptr);
-    EXPECT_EQ(decoded->m_msg_id, "12345");
+    EXPECT_EQ(decoded->m_msg_id, 12345U);
     EXPECT_EQ(decoded->m_method_name, "Order.makeOrder");
     EXPECT_EQ(decoded->m_pb_data, "payload");
     EXPECT_EQ(decoded->m_err_code, 0);
@@ -51,9 +51,9 @@ TEST(TinyPBCoder, MultipleFramesInOneBuffer) {
     TcpBuffer buf;
 
     std::vector<AbstractProtocol::s_ptr> messages = {
-        MakeMessage("1", "A.m1", "one"),
-        MakeMessage("2", "A.m2", "two"),
-        MakeMessage("3", "A.m3", "three"),
+        MakeMessage(1, "A.m1", "one"),
+        MakeMessage(2, "A.m2", "two"),
+        MakeMessage(3, "A.m3", "three"),
     };
     EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -71,7 +71,7 @@ TEST(TinyPBCoder, IncompleteFrameWaitsForMoreData) {
     TinyPBCoder coder;
     TcpBuffer buf;
 
-    auto original = MakeMessage("id", "Method", "payload");
+    auto original = MakeMessage(10, "Method", "payload");
     std::vector<AbstractProtocol::s_ptr> messages = {original};
     EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -90,7 +90,7 @@ TEST(TinyPBCoder, IncompleteFrameWaitsForMoreData) {
     result = coder.decode(buf);
     EXPECT_FALSE(result.fatal);
     ASSERT_THAT(result.messages, SizeIs(1));
-    EXPECT_EQ(std::dynamic_pointer_cast<TinyPBProtocol>(result.messages[0])->m_msg_id, "id");
+    EXPECT_EQ(std::dynamic_pointer_cast<TinyPBProtocol>(result.messages[0])->m_msg_id, 10U);
     EXPECT_TRUE(buf.empty());
 }
 
@@ -98,7 +98,7 @@ TEST(TinyPBCoder, CrcMismatchDropsFrame) {
     TinyPBCoder coder;
     TcpBuffer buf;
 
-    auto original = MakeMessage("id", "Method", "payload");
+    auto original = MakeMessage(11, "Method", "payload");
     std::vector<AbstractProtocol::s_ptr> messages = {original};
     EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -119,7 +119,7 @@ TEST(TinyPBCoder, ThreeConsecutiveErrorsBecomeFatal) {
 
     for (int i = 0; i < 3; ++i) {
         TcpBuffer buf;
-        auto original = MakeMessage(std::to_string(i), "Method", "payload");
+        auto original = MakeMessage(static_cast<MessageId>(i + 1), "Method", "payload");
         std::vector<AbstractProtocol::s_ptr> messages = {original};
         EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -143,7 +143,7 @@ TEST(TinyPBCoder, ErrorsResetAfterSuccessfulFrame) {
     // Two bad frames.
     for (int i = 0; i < 2; ++i) {
         TcpBuffer buf;
-        auto original = MakeMessage(std::to_string(i), "Method", "payload");
+        auto original = MakeMessage(static_cast<MessageId>(i + 1), "Method", "payload");
         std::vector<AbstractProtocol::s_ptr> messages = {original};
         EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -158,7 +158,7 @@ TEST(TinyPBCoder, ErrorsResetAfterSuccessfulFrame) {
     // One good frame resets the counter.
     {
         TcpBuffer buf;
-        auto original = MakeMessage("good", "Method", "payload");
+        auto original = MakeMessage(100, "Method", "payload");
         std::vector<AbstractProtocol::s_ptr> messages = {original};
         EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -171,7 +171,7 @@ TEST(TinyPBCoder, ErrorsResetAfterSuccessfulFrame) {
     // Three more bad frames are needed to trigger fatal again.
     for (int i = 0; i < 3; ++i) {
         TcpBuffer buf;
-        auto original = MakeMessage(std::to_string(i), "Method", "payload");
+        auto original = MakeMessage(static_cast<MessageId>(i + 1), "Method", "payload");
         std::vector<AbstractProtocol::s_ptr> messages = {original};
         EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -213,7 +213,7 @@ TEST(TinyPBCoder, ResyncsAfterGarbagePrefix) {
     TinyPBCoder coder;
     TcpBuffer buf;
 
-    auto original = MakeMessage("id", "Method", "payload");
+    auto original = MakeMessage(12, "Method", "payload");
     std::vector<AbstractProtocol::s_ptr> messages = {original};
     EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -232,7 +232,7 @@ TEST(TinyPBCoder, FormatLock) {
     TinyPBCoder coder;
     TcpBuffer buf;
 
-    auto original = MakeMessage("abc", "X.y", "data");
+    auto original = MakeMessage(0x0102030405060708ULL, "X.y", "data");
     std::vector<AbstractProtocol::s_ptr> messages = {original};
     EXPECT_TRUE(coder.encode(messages, buf));
 
@@ -249,6 +249,13 @@ TEST(TinyPBCoder, FormatLock) {
     std::memcpy(&net_pk_len, encoded.data() + 1, sizeof(net_pk_len));
     const std::int32_t pk_len = static_cast<std::int32_t>(ntohl(net_pk_len));
     EXPECT_EQ(pk_len, static_cast<std::int32_t>(encoded.size()));
+
+    constexpr unsigned char kExpectedId[] = {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    ASSERT_GE(encoded.size(), 5U + sizeof(kExpectedId));
+    EXPECT_EQ(std::memcmp(encoded.data() + 5, kExpectedId,
+                          sizeof(kExpectedId)),
+              0);
 }
 
 } // namespace

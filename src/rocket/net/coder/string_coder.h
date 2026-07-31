@@ -105,7 +105,7 @@ class StringCoder : public AbstractCoder {
 
         auto msg = std::make_shared<StringProtocol>();
         msg->info.assign(data.begin(), data.end());
-        msg->m_msg_id = "string_msg";
+        msg->m_msg_id = 1;
 
         result.messages.push_back(msg);
         return result;

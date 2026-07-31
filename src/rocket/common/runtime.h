@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 namespace rocket {
 
@@ -9,7 +10,7 @@ class RunTime {
     [[nodiscard]] RpcInterface* getRpcInterface() const;
     static RunTime* GetRunTime();
 
-    std::string m_msgid;
+    std::uint64_t m_msgid{0};
     std::string m_method_name;
     RpcInterface* m_rpc_interface{nullptr};
 };

@@ -43,8 +43,8 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
     int connectSync(int timeout_ms = 5000);
 
     void send(AbstractProtocol::s_ptr msg);
-    void readMessage(std::string_view msg_id, ReadCallback cb);
-    void cancelRead(std::string_view msg_id);
+    void readMessage(MessageId msg_id, ReadCallback cb);
+    void cancelRead(MessageId msg_id);
 
     void addTimerEvent(TimerEvent::s_ptr ev) { m_loop->addTimerEvent(ev); }
 
@@ -90,7 +90,7 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
     std::atomic<int> m_connect_error_code{0};
     std::string m_connect_error_info;
 
-    std::map<std::string, ReadCallback, std::less<>> m_read_callbacks;
+    std::map<MessageId, ReadCallback> m_read_callbacks;
 
     mutable std::mutex m_mutex;
     std::atomic<bool> m_stopped{false};

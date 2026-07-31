@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "rocket/common/log.h"
+#include "rocket/net/coder/abstract_protocol.h"
 #include "rocket/net/tcp/net_addr.h"
 
 namespace rocket {
@@ -42,9 +43,9 @@ class RpcController : public google::protobuf::RpcController {
 
     [[nodiscard]] std::string GetErrorInfo() const;
 
-    void SetMsgId(std::string_view msg_id);
+    void SetMsgId(MessageId msg_id) noexcept;
 
-    std::string GetMsgId();
+    [[nodiscard]] MessageId GetMsgId() const noexcept;
 
     void SetLocalAddr(NetAddr::s_ptr addr);
 
@@ -67,7 +68,7 @@ class RpcController : public google::protobuf::RpcController {
 
     int32_t m_error_code{0};
     std::string m_error_info;
-    std::string m_msg_id;
+    MessageId m_msg_id{kInvalidMessageId};
 
     bool m_is_failed{false};
     bool m_is_cancled{false};

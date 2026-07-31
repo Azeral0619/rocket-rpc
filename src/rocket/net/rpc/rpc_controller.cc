@@ -12,7 +12,7 @@ namespace rocket {
 void RpcController::Reset() {
     m_error_code = 0;
     m_error_info = "";
-    m_msg_id = "";
+    m_msg_id = kInvalidMessageId;
     m_is_failed = false;
     m_is_cancled = false;
     m_is_finished = false;
@@ -50,9 +50,9 @@ int32_t RpcController::GetErrorCode() const { return m_error_code; }
 
 std::string RpcController::GetErrorInfo() const { return m_error_info; }
 
-void RpcController::SetMsgId(std::string_view msg_id) { m_msg_id = msg_id; }
+void RpcController::SetMsgId(MessageId msg_id) noexcept { m_msg_id = msg_id; }
 
-std::string RpcController::GetMsgId() { return m_msg_id; }
+MessageId RpcController::GetMsgId() const noexcept { return m_msg_id; }
 
 void RpcController::SetLocalAddr(NetAddr::s_ptr addr) { m_local_addr = std::move(addr); }
 

@@ -265,9 +265,8 @@ class Logger final : public Singleton<Logger> {
         std::uint64_t thread_id{0};
         std::uint64_t timestamp_ns{0};
         std::uint8_t level{0};
-        // RunTime metadata — copied eagerly to avoid dangling pointers to
-        // thread-local std::string data.  SSO covers the common case.
-        std::string msgid;
+        // Numeric message IDs stay allocation-free in the async log record.
+        std::uint64_t msgid{0};
         std::string method_name;
         std::uint8_t num_args{0};
         bool heap_allocated{false};
@@ -454,8 +453,6 @@ void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args
     entry.timestamp_ns = now_ns;
     entry.level = static_cast<std::uint8_t>(level);
     auto* rt = RunTime::GetRunTime();
-    // Copy into std::string — SSO avoids heap allocation for short values,
-    // and ownership is cleanly transferred to the consumer thread.
     entry.msgid = rt->m_msgid;
     entry.method_name = rt->m_method_name;
 

@@ -1,10 +1,14 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 
 namespace rocket {
+
+using MessageId = std::uint64_t;
+inline constexpr MessageId kInvalidMessageId = 0;
 
 /**
  * @brief 抽象协议基类
@@ -32,7 +36,7 @@ struct AbstractProtocol : public std::enable_shared_from_this<AbstractProtocol> 
      */
     [[nodiscard]] virtual std::string_view getProtocolType() const = 0;
 
-    std::string m_msg_id; ///< 消息唯一标识符（用于请求-响应匹配）
+    MessageId m_msg_id{kInvalidMessageId}; ///< 消息唯一标识符（用于请求-响应匹配）
 };
 
 } // namespace rocket

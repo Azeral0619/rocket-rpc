@@ -209,7 +209,8 @@ void TcpConnection::pushSendMessage(AbstractProtocol::s_ptr message,
     m_write_dones.emplace_back(std::move(message), std::move(done));
 }
 
-void TcpConnection::pushReadMessage(std::string_view msg_id, std::function<void(AbstractProtocol::s_ptr)> done) {
+void TcpConnection::pushReadMessage(
+    MessageId msg_id, std::function<void(AbstractProtocol::s_ptr)> done) {
     m_read_dones.insert(std::make_pair(msg_id, std::move(done)));
 }
 

@@ -1,11 +1,13 @@
 #include "rocket/net/coder/tinypb_coder.h"
 #include "3rd-party/CRC.h"
 #include "rocket/common/log.h"
+#include "rocket/common/msg_id_util.h"
 #include "rocket/net/coder/abstract_protocol.h"
 #include "rocket/net/coder/tinypb_protocol.h"
 #include "rocket/net/tcp/tcp_buffer.h"
 #include <algorithm>
 #include <arpa/inet.h>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -27,6 +29,14 @@ inline char* writeInt32To(char* p, std::int32_t value) {
     return p + sizeof(net);
 }
 
+inline char* writeMessageIdTo(char* p, MessageId value) {
+    if constexpr (std::endian::native == std::endian::little) {
+        value = std::byteswap(value);
+    }
+    std::memcpy(p, &value, sizeof(value));
+    return p + sizeof(value);
+}
+
 inline char* appendTo(char* p, const char* data, std::size_t len) {
     if (len > 0) {
         std::memcpy(p, data, len);
@@ -39,6 +49,15 @@ inline std::int32_t readInt32(const char* data) {
     std::uint32_t net_value = 0;
     std::memcpy(&net_value, data, sizeof(net_value));
     return static_cast<std::int32_t>(ntohl(net_value));
+}
+
+inline MessageId readMessageId(const char* data) {
+    MessageId value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    if constexpr (std::endian::native == std::endian::little) {
+        value = std::byteswap(value);
+    }
+    return value;
 }
 
 } // anonymous namespace
@@ -55,14 +74,13 @@ bool TinyPBCoder::encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuff
             continue;
         }
 
-        if (msg->m_msg_id.empty()) {
-            msg->m_msg_id = "default_msg_id";
+        if (msg->m_msg_id == kInvalidMessageId) {
+            msg->m_msg_id = MsgIDUtil::GenMsgID();
         }
 
         const std::size_t packet_size =
-            TinyPBProtocol::HEADER_SIZE + msg->m_msg_id.length() +
-            msg->m_method_name.length() + msg->m_err_info.length() +
-            msg->m_pb_data.length();
+            TinyPBProtocol::HEADER_SIZE + msg->m_method_name.length() +
+            msg->m_err_info.length() + msg->m_pb_data.length();
         if (packet_size > kMaxPacketSize ||
             packet_size >
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -81,8 +99,7 @@ bool TinyPBCoder::encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuff
 
         *p++ = TinyPBProtocol::PB_START;
         p = writeInt32To(p, pk_len);
-        p = writeInt32To(p, static_cast<std::int32_t>(msg->m_msg_id.length()));
-        p = appendTo(p, msg->m_msg_id.data(), msg->m_msg_id.length());
+        p = writeMessageIdTo(p, msg->m_msg_id);
         p = writeInt32To(
             p, static_cast<std::int32_t>(msg->m_method_name.length()));
         p = appendTo(p, msg->m_method_name.data(), msg->m_method_name.length());
@@ -100,8 +117,6 @@ bool TinyPBCoder::encode(std::vector<AbstractProtocol::s_ptr>& messages, TcpBuff
         out_buffer->moveWriteIndex(total_len);
 
         msg->m_pk_len = pk_len;
-        msg->m_msg_id_len =
-            static_cast<std::int32_t>(msg->m_msg_id.length());
         msg->m_method_name_len =
             static_cast<std::int32_t>(msg->m_method_name.length());
         msg->m_err_info_len =
@@ -213,13 +228,17 @@ DecodeResult TinyPBCoder::decode(TcpBuffer::s_ptr buffer) {
             return true;
         };
 
-        // 1. msg_id
-        if (!readLength(message->m_msg_id_len, "msg_id")) {
+        // 1. fixed-width message ID
+        if (!checkRemaining(sizeof(MessageId))) {
+            rejectPacket("missing message id");
             return result;
         }
-        message->m_msg_id.assign(data + parse_index,
-                                 static_cast<std::size_t>(message->m_msg_id_len));
-        parse_index += static_cast<std::size_t>(message->m_msg_id_len);
+        message->m_msg_id = readMessageId(data + parse_index);
+        parse_index += sizeof(MessageId);
+        if (message->m_msg_id == kInvalidMessageId) {
+            rejectPacket("invalid message id");
+            return result;
+        }
         ROCKET_LOG_DEBUG("msg_id: {}", message->m_msg_id);
 
         // 2. method_name

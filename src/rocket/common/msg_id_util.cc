@@ -1,58 +1,52 @@
 #include "rocket/common/msg_id_util.h"
-#include "rocket/common/log.h"
-#include <cstddef>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <random>
-#include <string>
-#include <utility>
+#include <unistd.h>
 
 namespace rocket {
 
-static constexpr int kMsgIdLength = 20;
-
-static thread_local std::string t_msg_id_no;
-static thread_local std::string t_max_msg_id_no;
-
 namespace {
 
-std::mt19937_64& GetRng() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    return rng;
+constexpr std::uint64_t kIdBlockSize = 4096;
+
+std::uint64_t initialMessageId() {
+    std::uint64_t seed = 0;
+    try {
+        std::random_device random;
+        seed = (static_cast<std::uint64_t>(random()) << 32U) ^
+               static_cast<std::uint64_t>(random());
+    } catch (...) {
+        // steady_clock + pid below still provide a process-specific fallback.
+    }
+    seed ^= static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    seed ^= static_cast<std::uint64_t>(::getpid()) << 17U;
+
+    // SplitMix64 finalizer: spread weak/random_device fallbacks across all
+    // bits so independently-started processes do not share an ID range.
+    seed ^= seed >> 30U;
+    seed *= 0xbf58476d1ce4e5b9ULL;
+    seed ^= seed >> 27U;
+    seed *= 0x94d049bb133111ebULL;
+    seed ^= seed >> 31U;
+    return seed == 0 ? 1 : seed;
 }
+
+std::atomic<std::uint64_t> g_next_id{initialMessageId()};
+thread_local std::uint64_t t_next_id = 0;
+thread_local std::uint64_t t_id_block_end = 0;
 
 } // namespace
 
-std::string MsgIDUtil::GenMsgID() {
-    if (t_msg_id_no.empty() || t_msg_id_no == t_max_msg_id_no) {
-        if (t_max_msg_id_no.empty()) {
-            t_max_msg_id_no.assign(kMsgIdLength, '9');
-        }
-
-        auto& rng = GetRng();
-        std::uniform_int_distribution<int> dist(0, 9);
-
-        std::string res;
-        res.reserve(kMsgIdLength);
-        for (int i = 0; i < kMsgIdLength; ++i) {
-            res += static_cast<char>('0' + dist(rng));
-        }
-
-        t_msg_id_no = std::move(res);
-    } else {
-        std::size_t i = t_msg_id_no.length();
-        while (i > 0 && t_msg_id_no[i - 1] == '9') {
-            --i;
-        }
-
-        if (i > 0) {
-            ++t_msg_id_no[i - 1];
-            for (std::size_t j = i; j < t_msg_id_no.length(); ++j) {
-                t_msg_id_no[j] = '0';
-            }
-        }
+std::uint64_t MsgIDUtil::GenMsgID() {
+    if (t_next_id == t_id_block_end) {
+        t_next_id =
+            g_next_id.fetch_add(kIdBlockSize, std::memory_order_relaxed);
+        t_id_block_end = t_next_id + kIdBlockSize;
     }
-
-    return t_msg_id_no;
+    return t_next_id++;
 }
 
 } // namespace rocket

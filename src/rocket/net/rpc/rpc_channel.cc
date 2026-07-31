@@ -41,7 +41,7 @@ struct RpcChannel::RequestState {
 
     TcpClient::s_ptr client;
     TimerEvent::s_ptr timer;
-    std::string msg_id;
+    MessageId msg_id{kInvalidMessageId};
 };
 
 RpcChannel::RpcChannel(NetAddr::s_ptr peer_addr)
@@ -87,7 +87,8 @@ bool RpcChannel::finishRpc(const std::shared_ptr<RequestState>& state,
         }
         state->timer.reset();
     }
-    if (cancel_pending_read && state->client && !state->msg_id.empty()) {
+    if (cancel_pending_read && state->client &&
+        state->msg_id != kInvalidMessageId) {
         state->client->cancelRead(state->msg_id);
     }
 
@@ -222,7 +223,7 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
     }
     state->client = client;
 
-    if (my_controller->GetMsgId().empty()) {
+    if (my_controller->GetMsgId() == kInvalidMessageId) {
         // A response callback is keyed by msg_id, so every in-flight RPC must
         // have its own ID.  RunTime::m_msgid is logging/trace context and can
         // outlive the request that populated it; inheriting it here lets two

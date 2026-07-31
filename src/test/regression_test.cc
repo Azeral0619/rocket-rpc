@@ -55,7 +55,7 @@ std::string encodeMessage(const std::shared_ptr<rocket::TinyPBProtocol>& message
 
 void testTinyPBLargeFrameAndPrefix() {
     auto message = std::make_shared<rocket::TinyPBProtocol>();
-    message->m_msg_id = "large-message";
+    message->m_msg_id = 1001;
     message->m_method_name = "pkg.example.Order.Make";
     message->m_pb_data.assign(4096, 'x');
 
@@ -78,9 +78,49 @@ void testTinyPBLargeFrameAndPrefix() {
     require(input->readAble() == 0, "decoder left bytes from garbage prefix");
 }
 
+void testTinyPBNumericMessageIdFormat() {
+    constexpr rocket::MessageId kMessageId = 0x0102030405060708ULL;
+    auto message = std::make_shared<rocket::TinyPBProtocol>();
+    message->m_msg_id = kMessageId;
+    message->m_method_name = "Order.Make";
+    message->m_pb_data = "payload";
+
+    const std::string frame = encodeMessage(message);
+    require(frame.size() ==
+                rocket::TinyPBProtocol::HEADER_SIZE +
+                    message->m_method_name.size() + message->m_pb_data.size(),
+            "numeric message ID frame retained variable-length ID overhead");
+    constexpr unsigned char kExpectedId[] = {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    constexpr std::size_t kMessageIdOffset =
+        1 + sizeof(std::int32_t);
+    require(frame.size() >=
+                kMessageIdOffset + sizeof(kExpectedId),
+            "numeric message ID frame was too short");
+    require(std::memcmp(frame.data() + kMessageIdOffset, kExpectedId,
+                        sizeof(kExpectedId)) == 0,
+            "numeric message ID was not encoded in network byte order");
+
+    auto input = std::make_shared<rocket::TcpBuffer>();
+    require(input->append(frame), "failed to append numeric message ID frame");
+    rocket::TinyPBCoder coder;
+    auto decoded = coder.decode(input);
+    require(!decoded.fatal && decoded.messages.size() == 1,
+            "numeric message ID frame did not decode");
+    require(decoded.messages.front()->m_msg_id == kMessageId,
+            "numeric message ID changed during roundtrip");
+
+    auto generated = std::make_shared<rocket::TinyPBProtocol>();
+    generated->m_method_name = "Order.Make";
+    const std::string generated_frame = encodeMessage(generated);
+    require(!generated_frame.empty() &&
+                generated->m_msg_id != rocket::kInvalidMessageId,
+            "encoder did not assign a non-zero numeric message ID");
+}
+
 void testTinyPBRejectsMalformedFrames() {
     auto message = std::make_shared<rocket::TinyPBProtocol>();
-    message->m_msg_id = "checksum";
+    message->m_msg_id = 1002;
     message->m_method_name = "Order.Make";
     message->m_pb_data = "payload";
     const std::string valid = encodeMessage(message);
@@ -99,7 +139,10 @@ void testTinyPBRejectsMalformedFrames() {
     {
         std::string negative_length = valid;
         const std::uint32_t encoded_negative = htonl(0xffffffffU);
-        std::memcpy(negative_length.data() + 5, &encoded_negative,
+        constexpr std::size_t kMethodLengthOffset =
+            1 + sizeof(std::int32_t) + sizeof(rocket::MessageId);
+        std::memcpy(negative_length.data() + kMethodLengthOffset,
+                    &encoded_negative,
                     sizeof(encoded_negative));
         auto input = std::make_shared<rocket::TcpBuffer>();
         require(input->append(negative_length), "failed to append malformed frame");
@@ -568,8 +611,9 @@ void testConnectFailureAndStandardDone() {
             "refused non-blocking connect was reported as successful");
     require(controller.GetErrorCode() != rocket::error::kRpcChannelInit,
             "shared channel rejected a concurrent RPC");
-    const std::string first_msg_id = controller.GetMsgId();
-    require(!first_msg_id.empty(), "first RPC did not receive a message ID");
+    const rocket::MessageId first_msg_id = controller.GetMsgId();
+    require(first_msg_id != rocket::kInvalidMessageId,
+            "first RPC did not receive a message ID");
     lk.unlock();
 
     std::unique_lock<std::mutex> second_lk(second_state.mutex);
@@ -580,7 +624,7 @@ void testConnectFailureAndStandardDone() {
             "second refused connect was reported as successful");
     require(second_controller.GetErrorCode() != rocket::error::kRpcChannelInit,
             "second concurrent RPC was rejected by the channel");
-    require(!second_controller.GetMsgId().empty(),
+    require(second_controller.GetMsgId() != rocket::kInvalidMessageId,
             "second RPC did not receive a message ID");
     require(second_controller.GetMsgId() != first_msg_id,
             "concurrent RPCs reused the thread runtime message ID");
@@ -657,6 +701,7 @@ void testConnectionPoolFillsConfiguredSize() {
 int main() {
     try {
         testTinyPBLargeFrameAndPrefix();
+        testTinyPBNumericMessageIdFormat();
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
         testBufferWritesContiguousBytesToFd();

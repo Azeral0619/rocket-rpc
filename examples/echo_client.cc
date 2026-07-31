@@ -20,7 +20,7 @@ int main() {
 
     // Synchronous request/response.
     auto req = std::make_shared<rocket::StringProtocol>();
-    req->m_msg_id = "string_msg";
+    req->m_msg_id = 1;
     req->info = "hello from sync client";
 
     auto reply = client->requestSync(req);

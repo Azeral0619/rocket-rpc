@@ -157,12 +157,12 @@ void TcpClient::send(AbstractProtocol::s_ptr msg) {
     });
 }
 
-void TcpClient::readMessage(std::string_view msg_id, ReadCallback cb) {
+void TcpClient::readMessage(MessageId msg_id, ReadCallback cb) {
     std::lock_guard<std::mutex> lk(m_mutex);
-    m_read_callbacks[std::string(msg_id)] = std::move(cb);
+    m_read_callbacks[msg_id] = std::move(cb);
 }
 
-void TcpClient::cancelRead(std::string_view msg_id) {
+void TcpClient::cancelRead(MessageId msg_id) {
     std::lock_guard<std::mutex> lk(m_mutex);
     const auto it = m_read_callbacks.find(msg_id);
     if (it != m_read_callbacks.end()) {
@@ -173,7 +173,7 @@ void TcpClient::cancelRead(std::string_view msg_id) {
 AbstractProtocol::s_ptr TcpClient::requestSync(AbstractProtocol::s_ptr req, int timeout_ms) {
     if (!m_connection || m_connection->getState() != TcpState::Connected) return nullptr;
 
-    std::string msg_id = req->m_msg_id;
+    const MessageId msg_id = req->m_msg_id;
     std::mutex mtx;
     std::condition_variable cv;
     AbstractProtocol::s_ptr response;

@@ -6,6 +6,7 @@
 
 #include <coroutine>
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
@@ -48,7 +49,7 @@ struct CoCallState {
     RpcController controller;
 
     // Saved RunTime context (msgid + method_name) captured before the call.
-    std::string saved_msgid;
+    std::uint64_t saved_msgid{0};
     std::string saved_method_name;
 };
 
