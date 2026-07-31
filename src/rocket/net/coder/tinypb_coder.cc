@@ -138,7 +138,10 @@ bool TinyPBCoder::encode(
         }
 
         const std::size_t body_len = static_cast<std::size_t>(p - buf);
-        const std::uint32_t checksum = calculateChecksum(buf, body_len);
+        const std::uint32_t checksum =
+            m_checksum_policy == ChecksumPolicy::Crc32
+                ? calculateChecksum(buf, body_len)
+                : 0;
         p = writeInt32To(p, static_cast<std::int32_t>(checksum));
         *p++ = TinyPBProtocol::PB_END;
 
@@ -319,11 +322,14 @@ bool TinyPBCoder::decode(
             return false;
         }
         message->m_check_sum = readInt32(data + parse_index);
-        const auto calculated =
-            calculateChecksum(data + pk_start_index, checksum_index - pk_start_index);
-        if (calculated != static_cast<std::uint32_t>(message->m_check_sum)) {
-            rejectPacket("checksum mismatch");
-            return false;
+        if (m_checksum_policy == ChecksumPolicy::Crc32) {
+            const auto calculated = calculateChecksum(
+                data + pk_start_index, checksum_index - pk_start_index);
+            if (calculated !=
+                static_cast<std::uint32_t>(message->m_check_sum)) {
+                rejectPacket("checksum mismatch");
+                return false;
+            }
         }
 
         // Consume both the valid frame and any garbage prefix preceding it.

@@ -22,7 +22,7 @@ namespace rocket {
  * 特性：
  * - 支持粘包/拆包处理
  * - 网络字节序转换（大端）
- * - CRC32 校验和验证
+ * - 可选 CRC32 校验和验证
  * - 边界安全检查
  *
  * 使用示例：
@@ -44,8 +44,16 @@ class TinyPBCoder : public AbstractCoder {
         Borrowed,
     };
 
-    explicit TinyPBCoder(PayloadMode payload_mode = PayloadMode::Owned)
-        : m_payload_mode(payload_mode) {}
+    enum class ChecksumPolicy : std::uint8_t {
+        None,
+        Crc32,
+    };
+
+    explicit TinyPBCoder(
+        PayloadMode payload_mode = PayloadMode::Owned,
+        ChecksumPolicy checksum_policy = ChecksumPolicy::Crc32)
+        : m_payload_mode(payload_mode),
+          m_checksum_policy(checksum_policy) {}
     ~TinyPBCoder() override = default;
 
     TinyPBCoder(const TinyPBCoder&) = delete;
@@ -63,7 +71,7 @@ class TinyPBCoder : public AbstractCoder {
      * 1. 写入起始标识 PB_START
      * 2. 写入总长度（网络字节序）
      * 3. 依次写入各字段（长度+内容）
-     * 4. 计算并写入校验和
+     * 4. 按策略计算校验和（禁用时写入 0）
      * 5. 写入结束标识 PB_END
      */
     using AbstractCoder::decode;
@@ -83,7 +91,7 @@ class TinyPBCoder : public AbstractCoder {
      * 1. 查找起始标识 PB_START
      * 2. 读取总长度，验证结束标识 PB_END
      * 3. 依次解析各字段
-     * 4. 验证校验和
+     * 4. 按策略验证校验和
      * 5. 移除已解析的数据
      *
      * 边界处理：
@@ -105,6 +113,7 @@ class TinyPBCoder : public AbstractCoder {
     static std::uint32_t calculateChecksum(const char* data, std::size_t len);
 
     PayloadMode m_payload_mode{PayloadMode::Owned};
+    ChecksumPolicy m_checksum_policy{ChecksumPolicy::Crc32};
 };
 
 } // namespace rocket

@@ -114,6 +114,35 @@ TEST(TinyPBCoder, CrcMismatchDropsFrame) {
     EXPECT_THAT(result.messages, IsEmpty());
 }
 
+TEST(TinyPBCoder, DisabledChecksumUsesReservedZeroAndSkipsValidation) {
+    TinyPBCoder coder(TinyPBCoder::PayloadMode::Owned,
+                      TinyPBCoder::ChecksumPolicy::None);
+    TcpBuffer buf;
+
+    auto original = MakeMessage(12, "Method", "payload");
+    std::vector<AbstractProtocol::s_ptr> messages = {original};
+    ASSERT_TRUE(coder.encode(messages, buf));
+
+    std::string encoded = buf.retrieveAll();
+    ASSERT_GT(encoded.size(), 10U);
+    std::uint32_t checksum = 1;
+    std::memcpy(&checksum, encoded.data() + encoded.size() - 5,
+                sizeof(checksum));
+    EXPECT_EQ(checksum, 0U);
+
+    // The checksum policy is a connection-level contract. With it disabled,
+    // the reserved checksum field is ignored while structural validation and
+    // protobuf parsing remain active.
+    encoded[encoded.size() - 5] ^= static_cast<char>(0xFF);
+    buf.append(encoded);
+
+    auto result = coder.decode(buf);
+    EXPECT_FALSE(result.fatal);
+    EXPECT_EQ(result.dropped_frames, 0U);
+    ASSERT_THAT(result.messages, SizeIs(1));
+    EXPECT_TRUE(buf.empty());
+}
+
 TEST(TinyPBCoder, ThreeConsecutiveErrorsBecomeFatal) {
     TinyPBCoder coder;
 

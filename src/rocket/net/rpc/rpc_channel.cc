@@ -220,7 +220,8 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
             client = std::make_shared<TcpClient>(m_peer_addr,
                 [] {
                     return std::make_unique<TinyPBCoder>(
-                        TinyPBCoder::PayloadMode::Borrowed);
+                        TinyPBCoder::PayloadMode::Borrowed,
+                        TinyPBCoder::ChecksumPolicy::None);
                 });
             std::atomic_store_explicit(&m_client, client, std::memory_order_release);
         }

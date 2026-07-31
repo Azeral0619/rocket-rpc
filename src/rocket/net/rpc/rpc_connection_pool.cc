@@ -157,7 +157,8 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
         std::move(addr),
         [] {
             return std::make_unique<TinyPBCoder>(
-                TinyPBCoder::PayloadMode::Borrowed);
+                TinyPBCoder::PayloadMode::Borrowed,
+                TinyPBCoder::ChecksumPolicy::None);
         },
         loop,
         direct_output_flush);

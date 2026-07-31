@@ -162,6 +162,40 @@ void testTinyPBDirectAndBorrowedProtobufPayload() {
             "borrowed protobuf payload could not be parsed directly");
 }
 
+void testTinyPBOptionalChecksum() {
+    auto message = std::make_shared<rocket::TinyPBProtocol>();
+    message->m_msg_id = 2002;
+    message->m_method_name = "Order.Make";
+    message->m_pb_data = "payload";
+
+    rocket::TinyPBCoder coder(
+        rocket::TinyPBCoder::PayloadMode::Owned,
+        rocket::TinyPBCoder::ChecksumPolicy::None);
+    rocket::TcpBuffer encoded;
+    std::vector<rocket::AbstractProtocol::s_ptr> messages{message};
+    require(coder.encode(messages, encoded),
+            "checksum-free TinyPB encode failed");
+
+    std::string frame(encoded.readableView());
+    require(frame.size() > sizeof(std::uint32_t) + 1,
+            "checksum-free TinyPB frame was too short");
+    std::uint32_t reserved_checksum = 1;
+    std::memcpy(&reserved_checksum,
+                frame.data() + frame.size() - 1 - sizeof(reserved_checksum),
+                sizeof(reserved_checksum));
+    require(reserved_checksum == 0,
+            "disabled checksum did not leave the reserved field zeroed");
+
+    // A disabled decoder must not scan or validate the reserved checksum
+    // field. Keep the frame structure intact and replace only that field.
+    frame[frame.size() - 2] ^= static_cast<char>(0xff);
+    auto input = std::make_shared<rocket::TcpBuffer>();
+    require(input->append(frame), "failed to append checksum-free frame");
+    auto decoded = coder.decode(input);
+    require(!decoded.fatal && decoded.messages.size() == 1,
+            "disabled checksum policy still rejected the checksum field");
+}
+
 void testTinyPBRejectsMalformedFrames() {
     auto message = std::make_shared<rocket::TinyPBProtocol>();
     message->m_msg_id = 1002;
@@ -894,6 +928,7 @@ int main() {
         testTinyPBLargeFrameAndPrefix();
         testTinyPBNumericMessageIdFormat();
         testTinyPBDirectAndBorrowedProtobufPayload();
+        testTinyPBOptionalChecksum();
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
         testBufferWritesContiguousBytesToFd();
