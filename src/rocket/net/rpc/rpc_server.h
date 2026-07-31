@@ -14,16 +14,17 @@
 
 namespace rocket {
 
-// One RpcServer binds an address, accepts connections, and dispatches incoming
-// TinyPB requests on a worker pool.  Users register protobuf Service
-// implementations, then call start() (blocks on the main reactor loop).
+// One RpcServer binds an address and dispatches TinyPB requests. Business
+// methods run inline on their connection's IO thread by default; callers can
+// opt blocking methods into the bounded worker pool before start().
 class RpcServer {
   public:
     using Services_ptr = std::shared_ptr<google::protobuf::Service>;
 
     RpcServer(NetAddr::s_ptr local_addr,
               std::size_t worker_threads = ThreadPool::kDefaultThreadCount,
-              bool handle_process_signals = true);
+              bool handle_process_signals = true,
+              std::size_t max_pending_tasks = ThreadPool::kDefaultMaxPendingTasks);
 
     ~RpcServer();
 
@@ -33,6 +34,10 @@ class RpcServer {
     RpcServer& operator=(RpcServer&&) = delete;
 
     void registerService(Services_ptr service);
+
+    bool setDefaultExecutionMode(RpcExecutionMode mode);
+    bool setMethodExecutionMode(std::string full_method_name, RpcExecutionMode mode);
+    [[nodiscard]] std::size_t pendingWorkerTasks() const;
 
     // Blocks the calling thread on the main reactor loop.
     void start();
@@ -49,6 +54,7 @@ class RpcServer {
     TcpServer m_server;
     RpcDispatcher m_dispatcher;
     std::atomic<bool> m_stopping{false};
+    std::atomic<bool> m_started{false};
     std::thread m_signal_thread;
     std::mutex m_signal_mutex;
     std::condition_variable m_signal_cv;

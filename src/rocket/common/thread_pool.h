@@ -18,8 +18,10 @@ namespace rocket {
 class ThreadPool {
   public:
     static constexpr std::size_t kDefaultThreadCount = 4;
+    static constexpr std::size_t kDefaultMaxPendingTasks = 4096;
 
-    explicit ThreadPool(std::size_t threads = kDefaultThreadCount);
+    explicit ThreadPool(std::size_t threads = kDefaultThreadCount,
+                        std::size_t max_pending_tasks = kDefaultMaxPendingTasks);
 
     ~ThreadPool();
 
@@ -33,6 +35,7 @@ class ThreadPool {
     [[nodiscard]] auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>>;
 
     void execute(std::function<void()> task);
+    [[nodiscard]] bool tryExecute(std::function<void()> task);
 
     void stopAndDrain();
 
@@ -46,11 +49,13 @@ class ThreadPool {
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     bool m_stop{false};
+    std::size_t m_max_pending_tasks;
 };
 
 // ─── Implementation ──────────────────────────────────────────────
 
-inline ThreadPool::ThreadPool(std::size_t threads) {
+inline ThreadPool::ThreadPool(std::size_t threads, std::size_t max_pending_tasks)
+    : m_max_pending_tasks(max_pending_tasks) {
     m_workers.reserve(threads);
     for (std::size_t i = 0; i < threads; ++i) {
         m_workers.emplace_back([this] {
@@ -71,13 +76,7 @@ inline ThreadPool::ThreadPool(std::size_t threads) {
     }
 }
 
-inline ThreadPool::~ThreadPool() {
-    {
-        std::lock_guard lock(m_mutex);
-        m_stop = true;
-    }
-    m_cv.notify_all();
-}
+inline ThreadPool::~ThreadPool() { stopAndDrain(); }
 
 template <typename F, typename... Args>
     requires std::invocable<F, Args...>
@@ -92,8 +91,11 @@ auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<std::invoke_result
     auto future = task->get_future();
     {
         std::lock_guard lock(m_mutex);
-        if (m_stop) {
+        if (m_stop || m_workers.empty()) {
             throw std::runtime_error("submit on stopped ThreadPool");
+        }
+        if (m_max_pending_tasks != 0 && m_tasks.size() >= m_max_pending_tasks) {
+            throw std::runtime_error("submit on full ThreadPool");
         }
         m_tasks.emplace([task = std::move(task)] { (*task)(); });
     }
@@ -102,14 +104,22 @@ auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<std::invoke_result
 }
 
 inline void ThreadPool::execute(std::function<void()> task) {
+    if (!tryExecute(std::move(task))) {
+        throw std::runtime_error("execute on stopped or full ThreadPool");
+    }
+}
+
+inline bool ThreadPool::tryExecute(std::function<void()> task) {
     {
         std::lock_guard lock(m_mutex);
-        if (m_stop) {
-            return;
+        if (m_stop || m_workers.empty() ||
+            (m_max_pending_tasks != 0 && m_tasks.size() >= m_max_pending_tasks)) {
+            return false;
         }
         m_tasks.emplace(std::move(task));
     }
     m_cv.notify_one();
+    return true;
 }
 
 inline std::size_t ThreadPool::pendingCount() const {

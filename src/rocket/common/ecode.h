@@ -30,6 +30,7 @@ inline constexpr std::int32_t kRpcPeerAddr = SYS_ERROR_PREFIX(0012);      // RPC
 inline constexpr std::int32_t kRpcBackpressure = SYS_ERROR_PREFIX(0013);  // RPC 背压（high water mark）
 inline constexpr std::int32_t kRpcPoolExhausted = SYS_ERROR_PREFIX(0014); // 连接池耗尽
 inline constexpr std::int32_t kRpcShutdown = SYS_ERROR_PREFIX(0015);      // 服务器正在关闭
+inline constexpr std::int32_t kRpcServerOverloaded = SYS_ERROR_PREFIX(0016); // 服务端业务队列已满
 
 } // namespace error
 } // namespace rocket

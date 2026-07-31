@@ -1,11 +1,14 @@
 #include "order.pb.h"
 #include "rocket/common/ecode.h"
 #include "rocket/common/log.h"
+#include "rocket/common/thread_pool.h"
 #include "rocket/net/coder/tinypb_coder.h"
 #include "rocket/net/coder/tinypb_protocol.h"
+#include "rocket/net/event_loop.h"
 #include "rocket/net/rpc/coroutine.h"
 #include "rocket/net/rpc/rpc_channel.h"
 #include "rocket/net/rpc/rpc_controller.h"
+#include "rocket/net/rpc/rpc_server.h"
 #include "rocket/net/tcp/net_addr.h"
 #include "rocket/net/tcp/tcp_buffer.h"
 #include "rocket/net/tcp/tcp_client.h"
@@ -38,6 +41,8 @@ using namespace std::chrono_literals;
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+std::uint16_t reserveUnusedPort();
 
 std::string encodeMessage(const std::shared_ptr<rocket::TinyPBProtocol>& message) {
     rocket::TinyPBCoder coder;
@@ -147,6 +152,212 @@ void testTimingWheelEagerlyRemovesLongCancelledTimer() {
     require(wheel.pendingCount() == 0,
             "cancelled long timer remained in the overflow queue");
     require(!fired.load(), "cancelled timer fired");
+}
+
+void testThreadPoolRejectsWhenBoundedQueueIsFull() {
+    rocket::ThreadPool pool(1, 1);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool first_started = false;
+    bool release_first = false;
+    std::atomic<int> completed{0};
+
+    require(pool.tryExecute([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        first_started = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_first; });
+        completed.fetch_add(1, std::memory_order_relaxed);
+    }), "worker pool rejected its first task");
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        require(cv.wait_for(lock, 1s, [&] { return first_started; }),
+                "worker pool did not start its first task");
+    }
+
+    require(pool.tryExecute(
+                [&] { completed.fetch_add(1, std::memory_order_relaxed); }),
+            "worker pool rejected a task with queue capacity available");
+    require(!pool.tryExecute([] {}),
+            "worker pool accepted a task beyond its bounded queue");
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_first = true;
+    }
+    cv.notify_all();
+    pool.stopAndDrain();
+    require(completed.load(std::memory_order_relaxed) == 2,
+            "worker pool did not drain accepted tasks");
+}
+
+class ExecutionRecordingOrder final : public Order {
+  public:
+    void makeOrder(::google::protobuf::RpcController*,
+                   const ::makeOrderRequest* request,
+                   ::makeOrderResponse* response,
+                   ::google::protobuf::Closure* done) override {
+        ran_on_event_loop.store(
+            rocket::EventLoop::GetCurrentEventLoop() != nullptr,
+            std::memory_order_release);
+        called.store(true, std::memory_order_release);
+        response->set_ret_code(0);
+        response->set_res_info("OK");
+        response->set_order_id("thread-" + std::to_string(request->price()));
+        if (done) done->Run();
+    }
+
+    std::atomic<bool> called{false};
+    std::atomic<bool> ran_on_event_loop{false};
+};
+
+void testRpcExecutionMode(rocket::RpcExecutionMode default_mode,
+                          bool override_method_inline,
+                          bool expected_event_loop) {
+    const auto port = reserveUnusedPort();
+    auto address = std::make_shared<rocket::IPNetAddr>("127.0.0.1", port);
+    auto service = std::make_shared<ExecutionRecordingOrder>();
+
+    rocket::RpcServer server(address, 2, false, 8);
+    require(server.setDefaultExecutionMode(default_mode),
+            "failed to configure default RPC execution mode");
+    if (override_method_inline) {
+        require(server.setMethodExecutionMode(
+                    "Order.makeOrder", rocket::RpcExecutionMode::Inline),
+                "failed to configure method RPC execution mode");
+    }
+    server.registerService(service);
+
+    std::thread server_thread([&] { server.start(); });
+    std::this_thread::sleep_for(100ms);
+    require(!server.setDefaultExecutionMode(rocket::RpcExecutionMode::Inline),
+            "RPC execution mode changed after server start");
+
+    auto pool = std::make_shared<rocket::RpcConnectionPool>(1, 1);
+    auto channel = std::make_shared<rocket::RpcChannel>(address, pool);
+    makeOrderRequest request;
+    request.set_price(42);
+    makeOrderResponse response;
+    rocket::RpcController controller;
+    const auto* method = Order::descriptor()->FindMethodByName("makeOrder");
+
+    const int call_result = channel->CallMethodBlocking(
+        method, &controller, &request, &response, 2000);
+    pool->shutdown();
+    server.stop();
+    server_thread.join();
+
+    require(call_result == 0, "RPC execution-mode test call failed");
+    require(service->called.load(std::memory_order_acquire),
+            "configured RPC service method was not called");
+    require(service->ran_on_event_loop.load(std::memory_order_acquire) ==
+                expected_event_loop,
+            "RPC service method ran on the wrong executor");
+}
+
+void testRpcExecutionModes() {
+    testRpcExecutionMode(rocket::RpcExecutionMode::WorkerPool, false, false);
+    testRpcExecutionMode(rocket::RpcExecutionMode::WorkerPool, true, true);
+}
+
+class BlockingOrder final : public Order {
+  public:
+    void makeOrder(::google::protobuf::RpcController*,
+                   const ::makeOrderRequest* request,
+                   ::makeOrderResponse* response,
+                   ::google::protobuf::Closure* done) override {
+        if (request->price() == 1) {
+            std::unique_lock<std::mutex> lock(mutex);
+            first_started = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_first; });
+        }
+        response->set_ret_code(0);
+        response->set_res_info("OK");
+        response->set_order_id("overload-" + std::to_string(request->price()));
+        if (done) done->Run();
+    }
+
+    bool waitUntilFirstStarts() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, 1s, [&] { return first_started; });
+    }
+
+    void releaseFirst() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            release_first = true;
+        }
+        cv.notify_all();
+    }
+
+  private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool first_started{false};
+    bool release_first{false};
+};
+
+void testRpcWorkerQueueOverloadIsExplicit() {
+    const auto port = reserveUnusedPort();
+    auto address = std::make_shared<rocket::IPNetAddr>("127.0.0.1", port);
+    auto service = std::make_shared<BlockingOrder>();
+
+    rocket::RpcServer server(address, 1, false, 1);
+    require(server.setDefaultExecutionMode(rocket::RpcExecutionMode::WorkerPool),
+            "failed to enable worker execution for overload test");
+    server.registerService(service);
+    std::thread server_thread([&] { server.start(); });
+    std::this_thread::sleep_for(100ms);
+
+    auto pool = std::make_shared<rocket::RpcConnectionPool>(1, 1);
+    const auto* method = Order::descriptor()->FindMethodByName("makeOrder");
+    std::atomic<int> first_result{-999};
+    std::atomic<int> second_result{-999};
+
+    auto invoke = [&](int price) {
+        auto channel = std::make_shared<rocket::RpcChannel>(address, pool);
+        makeOrderRequest request;
+        request.set_price(price);
+        makeOrderResponse response;
+        rocket::RpcController controller;
+        return channel->CallMethodBlocking(
+            method, &controller, &request, &response, 3000);
+    };
+
+    std::thread first([&] { first_result.store(invoke(1)); });
+    const bool first_started = service->waitUntilFirstStarts();
+
+    std::thread second;
+    bool second_queued = false;
+    int overloaded_result = -999;
+    if (first_started) {
+        second = std::thread([&] { second_result.store(invoke(2)); });
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (server.pendingWorkerTasks() == 1) {
+                second_queued = true;
+                break;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        if (second_queued) overloaded_result = invoke(3);
+    }
+
+    service->releaseFirst();
+    first.join();
+    if (second.joinable()) second.join();
+    pool->shutdown();
+    server.stop();
+    server_thread.join();
+
+    require(first_started, "blocking worker task did not start");
+    require(second_queued, "second worker task was not queued");
+    require(overloaded_result == rocket::error::kRpcServerOverloaded,
+            "full server worker queue did not return overload");
+    require(first_result.load() == 0 && second_result.load() == 0,
+            "accepted worker tasks did not complete");
 }
 
 struct DelayedResume {
@@ -335,6 +546,9 @@ int main() {
         testLiteralLogFormatting();
         testTimingWheelKeepsPartialTicks();
         testTimingWheelEagerlyRemovesLongCancelledTimer();
+        testThreadPoolRejectsWhenBoundedQueueIsFull();
+        testRpcExecutionModes();
+        testRpcWorkerQueueOverloadIsExplicit();
         testTaskRunWaitsForCompletion();
         testConnectFailureAndStandardDone();
         testConnectionPoolFillsConfiguredSize();

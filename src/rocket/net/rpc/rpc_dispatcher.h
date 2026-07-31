@@ -10,15 +10,23 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <atomic>
 
 namespace rocket {
+
+enum class RpcExecutionMode : std::uint8_t {
+    Inline = 0,
+    WorkerPool = 1,
+};
 
 class RpcDispatcher {
   public:
     using Services_ptr = std::shared_ptr<google::protobuf::Service>;
     using s_ptr = std::shared_ptr<RpcDispatcher>;
 
-    explicit RpcDispatcher(std::size_t worker_threads = ThreadPool::kDefaultThreadCount);
+    explicit RpcDispatcher(
+        std::size_t worker_threads = ThreadPool::kDefaultThreadCount,
+        std::size_t max_pending_tasks = ThreadPool::kDefaultMaxPendingTasks);
 
     ~RpcDispatcher() = default;
 
@@ -32,6 +40,13 @@ class RpcDispatcher {
 
     void registerService(Services_ptr service);
 
+    // Configure before RpcServer::start(). Inline keeps the zero-handoff fast
+    // path; WorkerPool isolates synchronous or blocking business methods.
+    void setDefaultExecutionMode(RpcExecutionMode mode) noexcept;
+    bool setMethodExecutionMode(std::string full_method_name, RpcExecutionMode mode);
+
+    [[nodiscard]] std::size_t pendingWorkerTasks() const;
+
     void stop();
 
     static void setTinyPBError(TinyPBProtocol::s_ptr msg, int32_t err_code, std::string_view err_info);
@@ -39,9 +54,21 @@ class RpcDispatcher {
   private:
     static bool parseServiceFullName(std::string_view full_name, std::string_view& service_name,
                                      std::string_view& method_name);
+    [[nodiscard]] RpcExecutionMode executionModeFor(std::string_view full_method_name) const;
+    static void invokeService(const Services_ptr& service,
+                              const google::protobuf::MethodDescriptor* method,
+                              const std::shared_ptr<google::protobuf::Message>& request,
+                              const std::shared_ptr<google::protobuf::Message>& response,
+                              const TinyPBProtocol::s_ptr& request_protocol,
+                              const TinyPBProtocol::s_ptr& response_protocol,
+                              const TcpConnection::s_ptr& conn,
+                              std::string_view method_name);
 
     std::map<std::string, Services_ptr, std::less<>> m_service_map;
+    std::map<std::string, RpcExecutionMode, std::less<>> m_method_execution_modes;
+    RpcExecutionMode m_default_execution_mode{RpcExecutionMode::Inline};
     ThreadPool m_worker_pool;
+    std::atomic<bool> m_stopping{false};
 };
 
 } // namespace rocket

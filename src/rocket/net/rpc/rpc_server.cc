@@ -27,9 +27,10 @@ extern "C" void requestShutdown(int signal_number) {
 } // namespace
 
 RpcServer::RpcServer(NetAddr::s_ptr local_addr, std::size_t worker_threads,
-                     bool handle_process_signals)
+                     bool handle_process_signals,
+                     std::size_t max_pending_tasks)
     : m_server(std::move(local_addr), [] { return std::make_unique<TinyPBCoder>(); }),
-      m_dispatcher(worker_threads),
+      m_dispatcher(worker_threads, max_pending_tasks),
       m_handle_process_signals(handle_process_signals) {
 
     m_server.setMessageCallback([this](const TcpConnection::s_ptr& conn,
@@ -46,7 +47,28 @@ RpcServer::~RpcServer() {
 
 void RpcServer::registerService(Services_ptr service) { m_dispatcher.registerService(std::move(service)); }
 
+bool RpcServer::setDefaultExecutionMode(RpcExecutionMode mode) {
+    if (m_started.load(std::memory_order_acquire)) return false;
+    m_dispatcher.setDefaultExecutionMode(mode);
+    return true;
+}
+
+bool RpcServer::setMethodExecutionMode(std::string full_method_name,
+                                       RpcExecutionMode mode) {
+    if (m_started.load(std::memory_order_acquire)) return false;
+    return m_dispatcher.setMethodExecutionMode(std::move(full_method_name), mode);
+}
+
+std::size_t RpcServer::pendingWorkerTasks() const {
+    return m_dispatcher.pendingWorkerTasks();
+}
+
 void RpcServer::start() {
+    bool expected = false;
+    if (!m_started.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel)) {
+        return;
+    }
     if (m_handle_process_signals) startSignalMonitor();
     m_server.start();
     if (m_handle_process_signals) {
@@ -64,8 +86,10 @@ void RpcServer::stop() {
     }
     m_signal_cv.notify_all();
 
-    m_server.stop();
+    // Reject new dispatches and drain queued business work while the IO loops
+    // are still alive so worker completions can safely enqueue responses.
     m_dispatcher.stop();
+    m_server.stop();
 }
 
 void RpcServer::startSignalMonitor() {

@@ -36,8 +36,8 @@ class SelfDeletingClosure final : public google::protobuf::Closure {
 
 } // namespace
 
-RpcDispatcher::RpcDispatcher(std::size_t worker_threads)
-    : m_worker_pool(worker_threads) {
+RpcDispatcher::RpcDispatcher(std::size_t worker_threads, std::size_t max_pending_tasks)
+    : m_worker_pool(worker_threads, max_pending_tasks) {
 }
 
 void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::s_ptr response,
@@ -62,6 +62,11 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
         setTinyPBError(rsp_protocol, err_code, err_info);
         conn->send(rsp_protocol);
     };
+
+    if (m_stopping.load(std::memory_order_acquire)) {
+        sendError(error::kRpcShutdown, "server is shutting down");
+        return;
+    }
 
     if (!parseServiceFullName(method_full_name, service_name, method_name)) {
         sendError(error::kParseServiceName, "parse service name error");
@@ -96,23 +101,57 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
 
     auto rsp_msg_ptr = std::shared_ptr<google::protobuf::Message>(service->GetResponsePrototype(method).New());
 
+    // Track in-flight for graceful shutdown.
+    conn->incrInFlight();
+
+    const auto mode = executionModeFor(method->full_name());
+    if (mode == RpcExecutionMode::Inline) {
+        invokeService(service, method, req_msg_ptr, rsp_msg_ptr, req_protocol,
+                      rsp_protocol, conn, method->name());
+        return;
+    }
+
+    const bool queued = m_worker_pool.tryExecute(
+        [service, method, req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn] {
+            invokeService(service, method, req_msg_ptr, rsp_msg_ptr, req_protocol,
+                          rsp_protocol, conn, method->name());
+        });
+    if (!queued) {
+        conn->decrInFlight();
+        const bool stopping = m_stopping.load(std::memory_order_acquire);
+        const auto err_code =
+            stopping ? error::kRpcShutdown : error::kRpcServerOverloaded;
+        const std::string_view err_info =
+            stopping ? "server is shutting down" : "server worker queue is full";
+        ROCKET_LOG_WARN("{} | {}", req_protocol->m_msg_id, err_info);
+        sendError(err_code, err_info);
+    }
+}
+
+void RpcDispatcher::invokeService(
+    const Services_ptr& service, const google::protobuf::MethodDescriptor* method,
+    const std::shared_ptr<google::protobuf::Message>& req_msg_ptr,
+    const std::shared_ptr<google::protobuf::Message>& rsp_msg_ptr,
+    const TinyPBProtocol::s_ptr& req_protocol,
+    const TinyPBProtocol::s_ptr& rsp_protocol, const TcpConnection::s_ptr& conn,
+    std::string_view method_name) {
+    auto* runtime = RunTime::GetRunTime();
+    runtime->m_msgid = req_protocol->m_msg_id;
+    runtime->m_method_name = method_name;
+
     auto controller_ptr = std::make_shared<RpcController>();
     controller_ptr->SetLocalAddr(conn->getLocalAddr());
     controller_ptr->SetPeerAddr(conn->getPeerAddr());
     controller_ptr->SetMsgId(req_protocol->m_msg_id);
 
-    RunTime::GetRunTime()->m_msgid = req_protocol->m_msg_id;
-    RunTime::GetRunTime()->m_method_name = method_name;
-
-    // Track in-flight for graceful shutdown.
-    conn->incrInFlight();
-
     auto* closure = new SelfDeletingClosure(
-        [req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn, controller_ptr]() mutable {
+        [req_msg_ptr, rsp_msg_ptr, req_protocol, rsp_protocol, conn,
+         controller_ptr]() mutable {
             conn->decrInFlight();
 
             if (!rsp_msg_ptr->SerializeToString(&(rsp_protocol->m_pb_data))) {
-                ROCKET_LOG_ERROR("{} | serialize error, origin message [{}]", req_protocol->m_msg_id,
+                ROCKET_LOG_ERROR("{} | serialize error, origin message [{}]",
+                                 req_protocol->m_msg_id,
                                  rsp_msg_ptr->ShortDebugString());
                 rsp_protocol->m_err_code = error::kFailedSerialize;
                 rsp_protocol->m_err_info = "serialize error";
@@ -121,16 +160,16 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
             } else {
                 rsp_protocol->m_err_code = 0;
                 rsp_protocol->m_err_info = "";
-                ROCKET_LOG_INFO("{} | dispatch success, request[{}], response[{}]", req_protocol->m_msg_id,
-                                req_msg_ptr->ShortDebugString(), rsp_msg_ptr->ShortDebugString());
+                ROCKET_LOG_INFO(
+                    "{} | dispatch success, request[{}], response[{}]",
+                    req_protocol->m_msg_id, req_msg_ptr->ShortDebugString(),
+                    rsp_msg_ptr->ShortDebugString());
             }
             conn->send(rsp_protocol);
         });
 
-    // Fast path: run directly on the IO thread (brpc/gRPC style).
-    // Slow methods can offload themselves by not calling done->Run()
-    // synchronously — the framework waits for the callback.
-    service->CallMethod(method, controller_ptr.get(), req_msg_ptr.get(), rsp_msg_ptr.get(), closure);
+    service->CallMethod(method, controller_ptr.get(), req_msg_ptr.get(),
+                        rsp_msg_ptr.get(), closure);
 }
 
 bool RpcDispatcher::parseServiceFullName(std::string_view full_name, std::string_view& service_name,
@@ -154,7 +193,33 @@ void RpcDispatcher::registerService(Services_ptr service) {
     m_service_map[service_name] = std::move(service);
 }
 
-void RpcDispatcher::stop() { m_worker_pool.stopAndDrain(); }
+void RpcDispatcher::setDefaultExecutionMode(RpcExecutionMode mode) noexcept {
+    m_default_execution_mode = mode;
+}
+
+bool RpcDispatcher::setMethodExecutionMode(std::string full_method_name,
+                                           RpcExecutionMode mode) {
+    if (full_method_name.empty()) return false;
+    m_method_execution_modes.insert_or_assign(std::move(full_method_name), mode);
+    return true;
+}
+
+RpcExecutionMode
+RpcDispatcher::executionModeFor(std::string_view full_method_name) const {
+    if (m_method_execution_modes.empty()) return m_default_execution_mode;
+    const auto it = m_method_execution_modes.find(full_method_name);
+    return it == m_method_execution_modes.end() ? m_default_execution_mode
+                                                 : it->second;
+}
+
+std::size_t RpcDispatcher::pendingWorkerTasks() const {
+    return m_worker_pool.pendingCount();
+}
+
+void RpcDispatcher::stop() {
+    m_stopping.store(true, std::memory_order_release);
+    m_worker_pool.stopAndDrain();
+}
 
 void RpcDispatcher::setTinyPBError(TinyPBProtocol::s_ptr msg, int32_t err_code, std::string_view err_info) {
     msg->m_err_code = err_code;
