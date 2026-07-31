@@ -42,6 +42,7 @@ class EventLoop {
     void addTask(std::function<void()> cb, bool is_wake_up = false);
 
     void addTimerEvent(const TimerEvent::s_ptr& event);
+    void deleteTimerEvent(const TimerEvent::s_ptr& event);
 
     [[nodiscard]] bool isLooping() const noexcept;
 

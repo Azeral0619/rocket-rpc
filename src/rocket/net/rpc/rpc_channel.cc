@@ -79,7 +79,11 @@ bool RpcChannel::finishRpc(const std::shared_ptr<RequestState>& state,
     }
 
     if (state->timer) {
-        state->timer->cancel();
+        if (state->client && state->client->getLoop()) {
+            state->client->getLoop()->deleteTimerEvent(state->timer);
+        } else {
+            state->timer->cancel();
+        }
         state->timer.reset();
     }
     if (state->client && !state->msg_id.empty()) {

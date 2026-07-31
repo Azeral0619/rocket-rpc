@@ -19,7 +19,22 @@ void TimingWheel::addEvent(const TimerEvent::s_ptr& event) {
 
 void TimingWheel::cancelEvent(const TimerEvent::s_ptr& event) {
     if (!event) return;
-    event->cancel(); // lazy
+    event->cancel();
+
+    // Long RPC deadlines are stored in the ordered overflow map. Successful
+    // calls vastly outnumber timeouts, so retaining every cancelled event
+    // until its original deadline creates a large multi-second backlog.
+    // Locate the small equal-deadline range and erase eagerly. Short L1
+    // timers remain lazily cancelled because finding their vector position
+    // would require scanning the wheel.
+    std::lock_guard<std::mutex> lk(m_mutex);
+    const auto [first, last] = m_overflow.equal_range(event->getArriveTime());
+    for (auto it = first; it != last; ++it) {
+        if (it->second.get() == event.get()) {
+            m_overflow.erase(it);
+            break;
+        }
+    }
 }
 
 std::optional<std::int64_t> TimingWheel::msUntilNextExpire() const {

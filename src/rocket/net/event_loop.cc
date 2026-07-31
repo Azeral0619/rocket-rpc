@@ -174,6 +174,10 @@ void EventLoop::addTimerEvent(const TimerEvent::s_ptr& event) {
     if (m_timer) m_timer->addTimerEvent(event);
 }
 
+void EventLoop::deleteTimerEvent(const TimerEvent::s_ptr& event) {
+    if (m_timer) m_timer->deleteTimerEvent(event);
+}
+
 bool EventLoop::isLooping() const noexcept {
     return m_is_looping.load(std::memory_order_acquire);
 }

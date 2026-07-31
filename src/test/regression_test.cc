@@ -135,6 +135,20 @@ void testTimingWheelKeepsPartialTicks() {
     require(fired.load(), "short polls prevented timing-wheel advancement");
 }
 
+void testTimingWheelEagerlyRemovesLongCancelledTimer() {
+    rocket::TimingWheel wheel;
+    std::atomic<bool> fired{false};
+    auto timer = rocket::TimerEvent::create(5000, false, [&] { fired = true; });
+    wheel.addEvent(timer);
+    require(wheel.pendingCount() == 1, "long timer was not scheduled");
+
+    wheel.cancelEvent(timer);
+    require(timer->isCancelled(), "timer cancellation was not published");
+    require(wheel.pendingCount() == 0,
+            "cancelled long timer remained in the overflow queue");
+    require(!fired.load(), "cancelled timer fired");
+}
+
 struct DelayedResume {
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> handle) const {
@@ -320,6 +334,7 @@ int main() {
         testBufferOverflowIsExplicit();
         testLiteralLogFormatting();
         testTimingWheelKeepsPartialTicks();
+        testTimingWheelEagerlyRemovesLongCancelledTimer();
         testTaskRunWaitsForCompletion();
         testConnectFailureAndStandardDone();
         testConnectionPoolFillsConfiguredSize();

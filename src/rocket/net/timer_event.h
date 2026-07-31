@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,15 +29,21 @@ class TimerEvent {
 
     [[nodiscard]] std::int64_t getInterval() const noexcept { return m_interval; }
 
-    [[nodiscard]] bool isCancelled() const noexcept { return m_is_cancelled; }
+    [[nodiscard]] bool isCancelled() const noexcept {
+        return m_is_cancelled.load(std::memory_order_acquire);
+    }
 
     [[nodiscard]] bool isRepeated() const noexcept { return m_is_repeated; }
 
     [[nodiscard]] const std::function<void()>& getCallback() const noexcept { return m_task; }
 
-    void setCancelled(bool value) noexcept { m_is_cancelled = value; }
+    void setCancelled(bool value) noexcept {
+        m_is_cancelled.store(value, std::memory_order_release);
+    }
 
-    void cancel() noexcept { m_is_cancelled = true; }
+    void cancel() noexcept {
+        m_is_cancelled.store(true, std::memory_order_release);
+    }
 
     void resetArriveTime();
 
@@ -44,7 +51,7 @@ class TimerEvent {
     std::int64_t m_arrive_time{0}; // ms
     std::int64_t m_interval{0};    // ms
     bool m_is_repeated{false};
-    bool m_is_cancelled{false};
+    std::atomic<bool> m_is_cancelled{false};
     std::function<void()> m_task;
 };
 
