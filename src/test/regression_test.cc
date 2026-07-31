@@ -125,6 +125,23 @@ void testLiteralLogFormatting() {
     require(output == "literal log message", "literal log message was dropped");
 }
 
+void testDisabledLogDoesNotEvaluateArguments() {
+    auto& logger = rocket::Logger::getInstance();
+    logger.stop();
+    rocket::Logger::Options options;
+    options.file_path = "/dev/null";
+    options.level = rocket::LogLevel::Error;
+    logger.start(options);
+
+    bool evaluated = false;
+    auto expensive_argument = [&] {
+        evaluated = true;
+        return std::string("should not be evaluated");
+    };
+    ROCKET_LOG_INFO("disabled argument: {}", expensive_argument());
+    require(!evaluated, "disabled log evaluated its arguments");
+}
+
 void testTimingWheelKeepsPartialTicks() {
     rocket::TimingWheel wheel;
     std::atomic<bool> fired{false};
@@ -544,6 +561,7 @@ int main() {
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
         testLiteralLogFormatting();
+        testDisabledLogDoesNotEvaluateArguments();
         testTimingWheelKeepsPartialTicks();
         testTimingWheelEagerlyRemovesLongCancelledTimer();
         testThreadPoolRejectsWhenBoundedQueueIsFull();

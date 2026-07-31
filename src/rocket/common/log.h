@@ -311,6 +311,7 @@ class Logger final : public Singleton<Logger> {
     void setLevel(LogLevel level) noexcept;
     [[nodiscard]] LogLevel level() const noexcept;
     [[nodiscard]] bool isRunning() const noexcept;
+    [[nodiscard]] bool shouldLog(LogLevel level);
     [[nodiscard]] std::uint64_t getDroppedCount() const noexcept {
         return m_dropped_count.load(std::memory_order_relaxed);
     }
@@ -470,22 +471,42 @@ void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args
 } // namespace rocket
 
 #if ROCKET_MIN_LOG_LEVEL <= 0
-#define ROCKET_LOG_DEBUG(fmt, ...) ::rocket::Logger::getInstance().log(::rocket::LogLevel::Debug, fmt, ##__VA_ARGS__)
+#define ROCKET_LOG_DEBUG(fmt, ...)                                                            \
+    do {                                                                                      \
+        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Debug))             \
+            ::rocket::Logger::getInstance().log(                                              \
+                ::rocket::LogLevel::Debug, fmt, ##__VA_ARGS__);                               \
+    } while (false)
 #else
 #define ROCKET_LOG_DEBUG(fmt, ...) (void)0
 #endif
 #if ROCKET_MIN_LOG_LEVEL <= 1
-#define ROCKET_LOG_INFO(fmt, ...)  ::rocket::Logger::getInstance().log(::rocket::LogLevel::Info, fmt, ##__VA_ARGS__)
+#define ROCKET_LOG_INFO(fmt, ...)                                                             \
+    do {                                                                                      \
+        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Info))              \
+            ::rocket::Logger::getInstance().log(                                              \
+                ::rocket::LogLevel::Info, fmt, ##__VA_ARGS__);                                \
+    } while (false)
 #else
 #define ROCKET_LOG_INFO(fmt, ...) (void)0
 #endif
 #if ROCKET_MIN_LOG_LEVEL <= 2
-#define ROCKET_LOG_WARN(fmt, ...)  ::rocket::Logger::getInstance().log(::rocket::LogLevel::Warn, fmt, ##__VA_ARGS__)
+#define ROCKET_LOG_WARN(fmt, ...)                                                             \
+    do {                                                                                      \
+        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Warn))              \
+            ::rocket::Logger::getInstance().log(                                              \
+                ::rocket::LogLevel::Warn, fmt, ##__VA_ARGS__);                                \
+    } while (false)
 #else
 #define ROCKET_LOG_WARN(fmt, ...) (void)0
 #endif
 #if ROCKET_MIN_LOG_LEVEL <= 3
-#define ROCKET_LOG_ERROR(fmt, ...) ::rocket::Logger::getInstance().log(::rocket::LogLevel::Error, fmt, ##__VA_ARGS__)
+#define ROCKET_LOG_ERROR(fmt, ...)                                                            \
+    do {                                                                                      \
+        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Error))             \
+            ::rocket::Logger::getInstance().log(                                              \
+                ::rocket::LogLevel::Error, fmt, ##__VA_ARGS__);                               \
+    } while (false)
 #else
 #define ROCKET_LOG_ERROR(fmt, ...) (void)0
 #endif

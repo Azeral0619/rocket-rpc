@@ -214,6 +214,11 @@ void Logger::flush() {
 void Logger::setLevel(LogLevel l) noexcept { m_level.store(l, std::memory_order_release); }
 LogLevel Logger::level() const noexcept { return m_level.load(std::memory_order_acquire); }
 bool Logger::isRunning() const noexcept { return m_running.load(std::memory_order_acquire); }
+bool Logger::shouldLog(LogLevel level) {
+    ensureStarted();
+    return static_cast<std::uint8_t>(level) >=
+           static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed));
+}
 
 std::shared_ptr<Logger::ThreadSlot> Logger::registerThisThread() {
     auto slot = std::make_shared<ThreadSlot>();
