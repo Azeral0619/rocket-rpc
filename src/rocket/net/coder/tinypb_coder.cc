@@ -7,7 +7,6 @@
 #include "rocket/net/tcp/tcp_buffer.h"
 #include <algorithm>
 #include <arpa/inet.h>
-#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -30,9 +29,9 @@ inline char* writeInt32To(char* p, std::int32_t value) {
 }
 
 inline char* writeMessageIdTo(char* p, MessageId value) {
-    if constexpr (std::endian::native == std::endian::little) {
-        value = std::byteswap(value);
-    }
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    value = __builtin_bswap64(value);
+#endif
     std::memcpy(p, &value, sizeof(value));
     return p + sizeof(value);
 }
@@ -54,9 +53,9 @@ inline std::int32_t readInt32(const char* data) {
 inline MessageId readMessageId(const char* data) {
     MessageId value = 0;
     std::memcpy(&value, data, sizeof(value));
-    if constexpr (std::endian::native == std::endian::little) {
-        value = std::byteswap(value);
-    }
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    value = __builtin_bswap64(value);
+#endif
     return value;
 }
 
