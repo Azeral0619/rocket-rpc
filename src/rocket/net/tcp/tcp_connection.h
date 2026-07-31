@@ -103,6 +103,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void sendInLoop(AbstractProtocol::s_ptr message);
     void sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> messages);
     void drainWriteQueue();
+    void scheduleOutputFlush();
     [[nodiscard]] bool flushOutputInLoop();
     void updateWriteInterest(bool all_written);
     void shutdownInLoop();
@@ -136,6 +137,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // wait-free; the EventLoop (single consumer) drains in batch.
     MpscQueue m_write_queue;
     std::atomic<bool> m_write_queued{false};
+    bool m_flush_queued{false};  // owning EventLoop thread only
 
     static constexpr std::size_t kDefaultBufferSize = 4096;
 };

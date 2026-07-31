@@ -164,15 +164,6 @@ void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> message
         return;
     }
 
-    // Hical-style optimistic write: sockets are non-blocking, so try to hand
-    // the encoded batch straight to the kernel while it is writable.  The
-    // common small-RPC path then avoids both EPOLL_CTL_MOD calls and the extra
-    // epoll round trip.  A partial write/EAGAIN falls back to normal EPOLLOUT.
-    const bool all_written = flushOutputInLoop();
-    if (m_state.load(std::memory_order_acquire) == TcpState::Closed) {
-        return;
-    }
-
     // High-water mark edge trigger (checked once per batch).
     if (m_high_water_mark > 0 && m_out_buffer->readAble() >= m_high_water_mark && !m_sending_above_hwm) {
         m_sending_above_hwm = true;
@@ -181,7 +172,11 @@ void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> message
         }
     }
 
-    updateWriteInterest(all_written);
+    // Defer one optimistic write until the current EventLoop turn has
+    // dispatched every readable frame.  This preserves response/request
+    // batching for pipelined RPC while avoiding EPOLLOUT registration when
+    // the socket can accept the batch immediately.
+    scheduleOutputFlush();
 }
 
 void TcpConnection::drainWriteQueue() {
@@ -222,6 +217,33 @@ void TcpConnection::drainWriteQueue() {
             });
         }
     }
+}
+
+void TcpConnection::scheduleOutputFlush() {
+    m_loop->assertInLoopThread();
+    if (m_flush_queued ||
+        m_fd_event->isListening(FdEvent::TriggerEvent::OUT_EVENT)) {
+        return;
+    }
+
+    m_flush_queued = true;
+    m_loop->addTask(
+        [weak = weak_from_this()] {
+            auto conn = weak.lock();
+            if (!conn) return;
+
+            conn->m_flush_queued = false;
+            const auto state = conn->m_state.load(std::memory_order_acquire);
+            if (state != TcpState::Connected && state != TcpState::HalfClosing) {
+                return;
+            }
+
+            const bool all_written = conn->flushOutputInLoop();
+            if (conn->m_state.load(std::memory_order_acquire) != TcpState::Closed) {
+                conn->updateWriteInterest(all_written);
+            }
+        },
+        false);
 }
 
 void TcpConnection::enableWriting() {

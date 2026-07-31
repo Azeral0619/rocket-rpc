@@ -100,15 +100,23 @@ void EventLoop::processEvents(const std::vector<Poller::ActiveEvent>& events) {
 }
 
 void EventLoop::processPendingTasks() {
-    std::queue<std::function<void()>> tasks;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        tasks.swap(m_pending_tasks);
-    }
-    while (!tasks.empty()) {
-        auto& task = tasks.front();
-        if (task) task();
-        tasks.pop();
+    // A task running on the loop may defer follow-up work without waking the
+    // poller (for example, one batched socket flush after an MPSC drain).
+    // Drain those locally-produced generations before sleeping again.
+    while (true) {
+        std::queue<std::function<void()>> tasks;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            tasks.swap(m_pending_tasks);
+        }
+        if (tasks.empty()) {
+            break;
+        }
+        while (!tasks.empty()) {
+            auto& task = tasks.front();
+            if (task) task();
+            tasks.pop();
+        }
     }
 }
 
