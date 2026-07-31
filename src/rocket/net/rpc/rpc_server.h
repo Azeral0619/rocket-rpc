@@ -54,7 +54,8 @@ class RpcServer {
     TcpServer m_server;
     RpcDispatcher m_dispatcher;
     std::atomic<bool> m_stopping{false};
-    std::atomic<bool> m_started{false};
+    std::mutex m_config_mutex;
+    bool m_started{false};
     std::thread m_signal_thread;
     std::mutex m_signal_mutex;
     std::condition_variable m_signal_cv;

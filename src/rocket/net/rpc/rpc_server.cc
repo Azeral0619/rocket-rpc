@@ -48,14 +48,16 @@ RpcServer::~RpcServer() {
 void RpcServer::registerService(Services_ptr service) { m_dispatcher.registerService(std::move(service)); }
 
 bool RpcServer::setDefaultExecutionMode(RpcExecutionMode mode) {
-    if (m_started.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lock(m_config_mutex);
+    if (m_started) return false;
     m_dispatcher.setDefaultExecutionMode(mode);
     return true;
 }
 
 bool RpcServer::setMethodExecutionMode(std::string full_method_name,
                                        RpcExecutionMode mode) {
-    if (m_started.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lock(m_config_mutex);
+    if (m_started) return false;
     return m_dispatcher.setMethodExecutionMode(std::move(full_method_name), mode);
 }
 
@@ -64,10 +66,10 @@ std::size_t RpcServer::pendingWorkerTasks() const {
 }
 
 void RpcServer::start() {
-    bool expected = false;
-    if (!m_started.compare_exchange_strong(expected, true,
-                                           std::memory_order_acq_rel)) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(m_config_mutex);
+        if (m_started || m_stopping.load(std::memory_order_acquire)) return;
+        m_started = true;
     }
     if (m_handle_process_signals) startSignalMonitor();
     m_server.start();
