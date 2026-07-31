@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace rocket {
@@ -59,8 +60,12 @@ class TinyPBCoder : public AbstractCoder {
      * 4. 计算并写入校验和
      * 5. 写入结束标识 PB_END
      */
-    [[nodiscard]] bool encode(std::vector<AbstractProtocol::s_ptr>& messages,
-                              TcpBuffer::s_ptr out_buffer) override;
+    using AbstractCoder::decode;
+    using AbstractCoder::encode;
+
+    [[nodiscard]] bool encode(
+        std::span<const AbstractProtocol::s_ptr> messages,
+        TcpBuffer& out_buffer) override;
 
     /**
      * @brief 解码：从字节流解析 TinyPB 协议对象
@@ -80,7 +85,8 @@ class TinyPBCoder : public AbstractCoder {
      * - 多个完整包：依次解析所有完整包
      * - 格式错误：跳过当前字节，继续查找下一个起始标识
      */
-    DecodeResult decode(TcpBuffer::s_ptr buffer) override;
+    bool decode(TcpBuffer& buffer,
+                std::vector<AbstractProtocol::s_ptr>& output) override;
 
   private:
     /**

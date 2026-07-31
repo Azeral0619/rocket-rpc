@@ -5,6 +5,7 @@
 #include "rocket/net/tcp/tcp_buffer.h"
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -69,14 +70,18 @@ class StringCoder : public AbstractCoder {
      *
      * 实现：遍历所有消息，依次写入它们的 info 字段
      */
-    [[nodiscard]] bool encode(std::vector<AbstractProtocol::s_ptr>& messages,
-                              TcpBuffer::s_ptr out_buffer) override {
-        for (auto& msg_base : messages) {
-            auto msg = std::dynamic_pointer_cast<StringProtocol>(msg_base);
-            if (!msg || msg->info.empty()) {
+    using AbstractCoder::decode;
+    using AbstractCoder::encode;
+
+    [[nodiscard]] bool encode(
+        std::span<const AbstractProtocol::s_ptr> messages,
+        TcpBuffer& out_buffer) override {
+        for (const auto& msg_base : messages) {
+            auto* msg = dynamic_cast<StringProtocol*>(msg_base.get());
+            if (msg == nullptr || msg->info.empty()) {
                 continue;
             }
-            if (!out_buffer->writeToBuffer(msg->info.c_str(), msg->info.length())) {
+            if (!out_buffer.writeToBuffer(msg->info)) {
                 return false;
             }
         }
@@ -93,22 +98,20 @@ class StringCoder : public AbstractCoder {
      *
      * 注意：这会清空缓冲区的所有数据
      */
-    DecodeResult decode(TcpBuffer::s_ptr buffer) override {
-        DecodeResult result;
-        const std::size_t readable = buffer->readAble();
+    bool decode(TcpBuffer& buffer,
+                std::vector<AbstractProtocol::s_ptr>& output) override {
+        const std::size_t readable = buffer.readAble();
         if (readable == 0) {
-            return result;
+            return true;
         }
 
-        std::vector<char> data;
-        buffer->readFromBuffer(data, readable);
-
         auto msg = std::make_shared<StringProtocol>();
-        msg->info.assign(data.begin(), data.end());
+        msg->info.assign(buffer.readableView());
         msg->m_msg_id = 1;
+        buffer.consumeAll();
 
-        result.messages.push_back(msg);
-        return result;
+        output.push_back(std::move(msg));
+        return true;
     }
 };
 

@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <span>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -21,8 +22,7 @@ TcpConnection::TcpConnection(EventLoop* loop, int fd, NetAddr::s_ptr local_addr,
                              std::unique_ptr<AbstractCoder> coder, TcpConnectionType type)
     : m_loop(loop), m_local_addr(std::move(local_addr)), m_peer_addr(std::move(peer_addr)), m_fd(fd), m_type(type),
       m_fd_event(std::make_unique<FdEvent>(fd)), m_coder(std::move(coder)),
-      m_in_buffer(std::make_shared<TcpBuffer>(kDefaultBufferSize)),
-      m_out_buffer(std::make_shared<TcpBuffer>(kDefaultBufferSize)) {
+      m_in_buffer(kDefaultBufferSize), m_out_buffer(kDefaultBufferSize) {
 
     m_fd_event->setNonBlock();
 
@@ -152,12 +152,12 @@ void TcpConnection::send(AbstractProtocol::s_ptr message) {
 }
 
 void TcpConnection::sendInLoop(AbstractProtocol::s_ptr message) {
-    std::vector<AbstractProtocol::s_ptr> messages;
-    messages.push_back(std::move(message));
-    sendInLoopBatch(std::move(messages));
+    sendInLoopBatch(
+        std::span<const AbstractProtocol::s_ptr>(&message, 1));
 }
 
-void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> messages) {
+void TcpConnection::sendInLoopBatch(
+    std::span<const AbstractProtocol::s_ptr> messages) {
     m_loop->assertInLoopThread();
     const auto state = m_state.load(std::memory_order_acquire);
     if (state == TcpState::HalfClosing || state == TcpState::Closed) {
@@ -174,10 +174,10 @@ void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> message
     }
 
     // High-water mark edge trigger (checked once per batch).
-    if (m_high_water_mark > 0 && m_out_buffer->readAble() >= m_high_water_mark && !m_sending_above_hwm) {
+    if (m_high_water_mark > 0 && m_out_buffer.readAble() >= m_high_water_mark && !m_sending_above_hwm) {
         m_sending_above_hwm = true;
         if (m_hwm_callback) {
-            m_hwm_callback(shared_from_this(), m_out_buffer->readAble());
+            m_hwm_callback(shared_from_this(), m_out_buffer.readAble());
         }
     }
 
@@ -217,7 +217,7 @@ void TcpConnection::drainWriteQueue() {
             ++batch;
         }
         if (!messages.empty()) {
-            sendInLoopBatch(std::move(messages));
+            sendInLoopBatch(messages);
         }
     }
 
@@ -289,14 +289,14 @@ void TcpConnection::handleRead() {
     bool closed = false;
 
     while (true) {
-        if (m_in_buffer->writeAble() == 0) {
-            m_in_buffer->resizeBuffer(std::min(m_in_buffer->capacity() * 2, TcpBuffer::kMaxBufferSize));
+        if (m_in_buffer.writeAble() == 0) {
+            m_in_buffer.resizeBuffer(std::min(m_in_buffer.capacity() * 2, TcpBuffer::kMaxBufferSize));
         }
 
         const bool use_readv = m_use_readv;
-        const std::size_t writable_before_read = m_in_buffer->writeAble();
+        const std::size_t writable_before_read = m_in_buffer.writeAble();
         const ssize_t n =
-            m_in_buffer->readFromFd(m_fd, &saved_errno, use_readv);
+            m_in_buffer.readFromFd(m_fd, &saved_errno, use_readv);
         if (n > 0) {
             if (!use_readv &&
                 static_cast<std::size_t>(n) == writable_before_read) {
@@ -335,24 +335,25 @@ void TcpConnection::handleRead() {
         return;
     }
 
-    auto result = m_coder->decode(m_in_buffer);
-
-    if (result.fatal) {
+    m_decoded_messages.clear();
+    if (!m_coder->decode(m_in_buffer, m_decoded_messages)) {
+        m_decoded_messages.clear();
         ROCKET_LOG_ERROR("decoder reported fatal error, closing connection fd={}", m_fd);
         handleError();
         return;
     }
 
-    if (!result.messages.empty() && m_message_callback) {
+    if (!m_decoded_messages.empty() && m_message_callback) {
         if (m_direct_output_flush) {
             const bool previous_defer = m_defer_output_flush;
-            m_defer_output_flush = result.messages.size() > 1;
-            m_message_callback(shared_from_this(), result.messages);
+            m_defer_output_flush = m_decoded_messages.size() > 1;
+            m_message_callback(shared_from_this(), m_decoded_messages);
             m_defer_output_flush = previous_defer;
         } else {
-            m_message_callback(shared_from_this(), result.messages);
+            m_message_callback(shared_from_this(), m_decoded_messages);
         }
     }
+    m_decoded_messages.clear();
 }
 
 void TcpConnection::handleWrite() {
@@ -374,8 +375,8 @@ bool TcpConnection::flushOutputInLoop() {
 
     int saved_errno = 0;
 
-    while (m_out_buffer->readAble() > 0) {
-        const ssize_t n = m_out_buffer->writeToFd(m_fd, &saved_errno);
+    while (m_out_buffer.readAble() > 0) {
+        const ssize_t n = m_out_buffer.writeToFd(m_fd, &saved_errno);
         if (n > 0) {
             continue;
         }
@@ -395,7 +396,7 @@ bool TcpConnection::flushOutputInLoop() {
         break;
     }
 
-    return m_out_buffer->readAble() == 0;
+    return m_out_buffer.readAble() == 0;
 }
 
 void TcpConnection::updateWriteInterest(bool all_written) {
@@ -413,7 +414,7 @@ void TcpConnection::updateWriteInterest(bool all_written) {
     }
 
     // High-water mark recovery edge trigger.
-    if (m_sending_above_hwm && m_out_buffer->readAble() < m_high_water_mark) {
+    if (m_sending_above_hwm && m_out_buffer.readAble() < m_high_water_mark) {
         m_sending_above_hwm = false;
     }
 
@@ -462,7 +463,7 @@ void TcpConnection::shutdownInLoop() {
     }
     m_state.store(TcpState::HalfClosing, std::memory_order_release);
 
-    if (m_out_buffer->readAble() == 0) {
+    if (m_out_buffer.readAble() == 0) {
         ::shutdown(m_fd, SHUT_WR);
     }
 }

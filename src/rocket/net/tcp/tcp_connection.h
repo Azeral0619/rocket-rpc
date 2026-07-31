@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace rocket {
@@ -105,7 +106,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void handleError();
 
     void sendInLoop(AbstractProtocol::s_ptr message);
-    void sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> messages);
+    void sendInLoopBatch(
+        std::span<const AbstractProtocol::s_ptr> messages);
     void drainWriteQueue();
     void scheduleOutputFlush();
     [[nodiscard]] bool flushOutputInLoop();
@@ -124,8 +126,9 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     std::unique_ptr<FdEvent> m_fd_event;
     std::unique_ptr<AbstractCoder> m_coder;
 
-    TcpBuffer::s_ptr m_in_buffer;
-    TcpBuffer::s_ptr m_out_buffer;
+    TcpBuffer m_in_buffer;
+    TcpBuffer m_out_buffer;
+    std::vector<AbstractProtocol::s_ptr> m_decoded_messages;
 
     MessageCallback m_message_callback;
     ConnectionCallback m_connection_callback;
