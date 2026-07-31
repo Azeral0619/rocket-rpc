@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace rocket {
@@ -84,14 +83,6 @@ class TinyPBCoder : public AbstractCoder {
     DecodeResult decode(TcpBuffer::s_ptr buffer) override;
 
   private:
-    /**
-     * @brief 将单个 TinyPB 协议对象编码为字节流
-     *
-     * @param message 待编码的协议对象
-     * @return 编码后的字节流（使用 std::string 管理内存）
-     */
-    static std::string encodeTinyPB(const TinyPBProtocol::s_ptr& message);
-
     /**
      * @brief 计算 CRC32 校验和
      *
