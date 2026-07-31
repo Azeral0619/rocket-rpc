@@ -281,13 +281,15 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                         return;
                     }
 
-                    const auto& client = state->client;
-                    const auto peer = client->getPeerAddr();
-                    const auto local = client->getLocalAddr();
                     ROCKET_LOG_DEBUG(
                         "{} | success get rpc response, call method name[{}], peer addr[{}], local addr[{}]",
                         rsp_protocol->m_msg_id, rsp_protocol->m_method_name,
-                        peer ? peer->toString() : "?", local ? local->toString() : "?");
+                        state->client->getPeerAddr()
+                            ? state->client->getPeerAddr()->toString()
+                            : "?",
+                        state->client->getLocalAddr()
+                            ? state->client->getLocalAddr()->toString()
+                            : "?");
 
                     if (rsp_protocol->m_err_code != 0) {
                         ROCKET_LOG_ERROR("{} | call rpc method[{}] failed, error code[{}], error info[{}]",
