@@ -145,7 +145,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     bool m_defer_output_flush{false};  // batch frames decoded by one read
     bool m_direct_output_flush{false};
 
-    static constexpr std::size_t kDefaultBufferSize = 4096;
+    // TinyPB control frames are normally well below 1 KiB. TcpBuffer grows
+    // on demand, so keeping the per-connection baseline small substantially
+    // reduces the working set when a process owns thousands of connections.
+    static constexpr std::size_t kDefaultBufferSize = 1024;
 };
 
 } // namespace rocket
