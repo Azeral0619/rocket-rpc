@@ -29,7 +29,6 @@ namespace rocket {
 
 struct RpcChannel::RequestState {
     std::atomic<bool> finished{false};
-    std::uint64_t generation{0};
 
     RpcController* controller{nullptr};
     google::protobuf::Message* response{nullptr};
@@ -102,22 +101,16 @@ bool RpcChannel::finishRpc(const std::shared_ptr<RequestState>& state,
 void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
                             google::protobuf::RpcController* controller, const google::protobuf::Message* request,
                             google::protobuf::Message* response, google::protobuf::Closure* done) {
-    auto* my_controller = dynamic_cast<RpcController*>(controller);
+    (void)callMethodInternal(method, controller, request, response, done);
+}
 
-    bool has_in_flight = false;
-    {
-        std::lock_guard<std::mutex> lk(m_request_mutex);
-        has_in_flight = m_active_request &&
-                        !m_active_request->finished.load(std::memory_order_acquire);
-    }
-    if (has_in_flight) {
-        if (my_controller) {
-            my_controller->SetError(error::kRpcChannelInit,
-                                    "RpcChannel already has an in-flight request");
-        }
-        if (done) done->Run();
-        return;
-    }
+std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
+    const google::protobuf::MethodDescriptor* method,
+    google::protobuf::RpcController* controller,
+    const google::protobuf::Message* request,
+    google::protobuf::Message* response,
+    google::protobuf::Closure* done) {
+    auto* my_controller = dynamic_cast<RpcController*>(controller);
 
     if (my_controller == nullptr || method == nullptr || request == nullptr || response == nullptr) {
         ROCKET_LOG_ERROR("failed callmethod, RpcController convert error");
@@ -126,7 +119,7 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
                                     "method, controller, request or response NULL");
         }
         if (done) done->Run();
-        return;
+        return nullptr;
     }
 
     auto state = std::make_shared<RequestState>();
@@ -134,36 +127,32 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
     state->response = response;
     state->done = done;
 
-    bool lost_start_race = false;
-    {
+    if (m_is_init.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lk(m_request_mutex);
-        lost_start_race = m_active_request &&
-                          !m_active_request->finished.load(std::memory_order_acquire);
-        if (!lost_start_race) {
-            state->generation = ++m_next_generation;
-
-            if (m_is_init) {
-                const bool legacy_matches = m_controller.get() == controller &&
-                                            m_request.get() == request &&
-                                            m_response.get() == response;
-                if (m_controller.get() == controller) state->controller_owner = m_controller;
-                if (m_request.get() == request) state->request_owner = m_request;
-                if (m_response.get() == response) state->response_owner = m_response;
-                if (done == nullptr && legacy_matches && m_closure) {
+        if (m_is_init.load(std::memory_order_relaxed)) {
+            const bool legacy_matches = m_controller.get() == controller &&
+                                        m_request.get() == request &&
+                                        m_response.get() == response;
+            if (legacy_matches) {
+                state->controller_owner = std::move(m_controller);
+                state->request_owner = std::move(m_request);
+                state->response_owner = std::move(m_response);
+                if (done == nullptr && m_closure) {
                     state->done = m_closure.get();
-                    state->closure_owner = m_closure;
+                    state->closure_owner = std::move(m_closure);
                 } else if (m_closure.get() == done) {
-                    state->closure_owner = m_closure;
+                    state->closure_owner = std::move(m_closure);
                 }
+
+                // Init is only an ownership hand-off for the next matching
+                // CallMethod.  Once captured, lifetime belongs to RequestState.
+                m_controller.reset();
+                m_request.reset();
+                m_response.reset();
+                m_closure.reset();
+                m_is_init.store(false, std::memory_order_release);
             }
-            m_active_request = state;
         }
-    }
-    if (lost_start_race) {
-        my_controller->SetError(error::kRpcChannelInit,
-                                "RpcChannel already has an in-flight request");
-        if (done) done->Run();
-        return;
     }
 
     auto req_protocol = std::make_shared<TinyPBProtocol>();
@@ -177,11 +166,11 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
                 state->controller->SetError(error::kRpcPoolExhausted,
                                             "no available instance for " + service);
             });
-            return;
+            return state;
         }
         {
             std::lock_guard<std::mutex> lk(m_request_mutex);
-            m_client = client;
+            std::atomic_store_explicit(&m_client, client, std::memory_order_release);
             m_actual_peer = client->getPeerAddr();
         }
     } else {
@@ -190,39 +179,40 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
             finishRpc(state, [state] {
                 state->controller->SetError(error::kRpcPeerAddr, "peer addr nullptr");
             });
-            return;
+            return state;
         }
         if (m_pool) {
-            // A channel allows only one in-flight request, so its established
-            // client can be reused directly.  Re-entering the pool on every
-            // response serialized all channels on the pool mutex and rebuilt
-            // the address key on the hottest RPC path.
-            {
-                std::lock_guard<std::mutex> lk(m_request_mutex);
-                if (m_client && m_client->isConnected()) {
-                    client = m_client;
-                }
+            // A channel pins its concurrent calls to one established client.
+            // This keeps connection selection off the RPC hot path while the
+            // per-connection msg_id table multiplexes independent CallStates.
+            auto cached = std::atomic_load_explicit(&m_client, std::memory_order_acquire);
+            if (cached && cached->isConnected()) {
+                client = std::move(cached);
             }
             if (!client) {
-                client = m_pool->acquire(m_peer_addr);
+                auto acquired = m_pool->acquire(m_peer_addr);
+                std::lock_guard<std::mutex> lk(m_request_mutex);
+                cached = std::atomic_load_explicit(&m_client, std::memory_order_relaxed);
+                if (cached && cached->isConnected()) {
+                    client = std::move(cached);
+                } else {
+                    std::atomic_store_explicit(&m_client, acquired,
+                                               std::memory_order_release);
+                    client = std::move(acquired);
+                    m_actual_peer = m_peer_addr;
+                }
             }
             if (!client) {
                 finishRpc(state, [state] {
                     state->controller->SetError(error::kRpcPoolExhausted,
                                                 "connection pool exhausted");
                 });
-                return;
-            }
-            {
-                std::lock_guard<std::mutex> lk(m_request_mutex);
-                m_client = client;
-                m_actual_peer = m_peer_addr;
+                return state;
             }
         } else {
             client = std::make_shared<TcpClient>(m_peer_addr,
                 [] { return std::make_unique<TinyPBCoder>(); });
-            std::lock_guard<std::mutex> lk(m_request_mutex);
-            m_client = client;
+            std::atomic_store_explicit(&m_client, client, std::memory_order_release);
         }
     }
     state->client = client;
@@ -251,7 +241,7 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
         finishRpc(state, [state, err_info] {
             state->controller->SetError(error::kFailedSerialize, err_info);
         });
-        return;
+        return state;
     }
 
     state->msg_id = req_protocol->m_msg_id;
@@ -326,22 +316,21 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
             doSendRead();
         });
     }
+    return state;
 }
 
 // ── CallMethodBlocking ─────────────────────────────────────────────────
 
 void RpcChannel::Init(controller_s_ptr controller, message_s_ptr req, message_s_ptr res, closure_s_ptr done) {
-    // Guard: refuse to overwrite while an RPC is still in flight.
+    // Legacy ownership hand-off for the next matching CallMethod invocation.
+    // The slot is consumed immediately by callMethodInternal, so completed
+    // and in-flight calls never retain channel-global request state.
     std::lock_guard<std::mutex> lk(m_request_mutex);
-    if (m_active_request &&
-        !m_active_request->finished.load(std::memory_order_acquire)) {
-        return;
-    }
     m_controller = std::move(controller);
     m_request = std::move(req);
     m_response = std::move(res);
     m_closure = std::move(done);
-    m_is_init = true;
+    m_is_init.store(true, std::memory_order_release);
 }
 
 google::protobuf::RpcController* RpcChannel::getController() {
@@ -361,19 +350,7 @@ google::protobuf::Closure* RpcChannel::getClosure() {
     return m_closure.get();
 }
 TcpClient* RpcChannel::getTcpClient() {
-    std::lock_guard<std::mutex> lk(m_request_mutex);
-    return m_client.get();
-}
-
-void RpcChannel::clearInitState(const std::shared_ptr<RequestState>& state) {
-    std::lock_guard<std::mutex> lk(m_request_mutex);
-    if (!state || m_active_request != state) return;
-    m_active_request.reset();
-    m_is_init = false;
-    m_controller.reset();
-    m_request.reset();
-    m_response.reset();
-    m_closure.reset();
+    return std::atomic_load_explicit(&m_client, std::memory_order_acquire).get();
 }
 
 NetAddr::s_ptr RpcChannel::FindAddr(std::string_view str) {
@@ -419,15 +396,8 @@ int RpcChannel::CallMethodBlocking(const google::protobuf::MethodDescriptor* met
          std::shared_ptr<google::protobuf::Message>(response, [](auto*) {}),
          closure);
 
-    CallMethod(method, controller, request, response, closure.get());
-
-    std::shared_ptr<RequestState> request_state;
-    {
-        std::lock_guard<std::mutex> lk(m_request_mutex);
-        if (m_active_request && m_active_request->controller == my_controller) {
-            request_state = m_active_request;
-        }
-    }
+    auto request_state =
+        callMethodInternal(method, controller, request, response, closure.get());
 
     bool local_timeout = false;
     {
@@ -461,12 +431,10 @@ int RpcChannel::CallMethodBlocking(const google::protobuf::MethodDescriptor* met
     NetAddr::s_ptr actual_peer;
     {
         std::lock_guard<std::mutex> lk(m_request_mutex);
-        client = m_client;
+        client = std::atomic_load_explicit(&m_client, std::memory_order_relaxed);
         actual_peer = m_actual_peer ? m_actual_peer : m_peer_addr;
     }
     if (m_pool && client) m_pool->release(actual_peer, client);
-
-    clearInitState(request_state);
 
     if (local_timeout) return -1;
     if (my_controller && my_controller->GetErrorCode() != 0)

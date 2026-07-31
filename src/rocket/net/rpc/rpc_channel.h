@@ -30,6 +30,8 @@ inline std::shared_ptr<RpcController> NewRpcController();
 
 inline std::shared_ptr<RpcChannel> NewRpcChannel(std::string_view addr);
 
+// Thread-safe, multi-flight RPC facade.  A channel reuses an established
+// TcpClient while every invocation owns an independent RequestState.
 class RpcChannel : public google::protobuf::RpcChannel, public std::enable_shared_from_this<RpcChannel> {
 
   public:
@@ -84,11 +86,17 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
   private:
     struct RequestState;
 
+    std::shared_ptr<RequestState> callMethodInternal(
+        const google::protobuf::MethodDescriptor* method,
+        google::protobuf::RpcController* controller,
+        const google::protobuf::Message* request,
+        google::protobuf::Message* response,
+        google::protobuf::Closure* done);
+
     // Complete exactly one request generation.  Timer, response and connect
     // callbacks all race through this per-request gate.
     static bool finishRpc(const std::shared_ptr<RequestState>& state,
                           std::function<void()> before_done = {});
-    void clearInitState(const std::shared_ptr<RequestState>& state);
 
     std::shared_ptr<NetAddr> m_peer_addr{nullptr};
     std::shared_ptr<NetAddr> m_local_addr{nullptr};
@@ -98,10 +106,10 @@ class RpcChannel : public google::protobuf::RpcChannel, public std::enable_share
     message_s_ptr m_response{nullptr};
     closure_s_ptr m_closure{nullptr};
 
-    bool m_is_init{false};
+    std::atomic<bool> m_is_init{false};
+    // Protects the legacy Init ownership hand-off and cached connection.
+    // Per-call RequestState is intentionally not stored on the channel.
     mutable std::mutex m_request_mutex;
-    std::shared_ptr<RequestState> m_active_request;
-    std::uint64_t m_next_generation{0};
 
     std::shared_ptr<TcpClient> m_client{nullptr};
     RpcConnectionPool::s_ptr m_pool;      // optional shared pool

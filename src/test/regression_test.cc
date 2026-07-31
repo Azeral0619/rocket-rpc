@@ -1,4 +1,5 @@
 #include "order.pb.h"
+#include "rocket/common/ecode.h"
 #include "rocket/common/log.h"
 #include "rocket/net/coder/tinypb_coder.h"
 #include "rocket/net/coder/tinypb_protocol.h"
@@ -206,34 +207,42 @@ void testConnectFailureAndStandardDone() {
         }
     } done(state);
 
-    Order_Stub(channel.get()).makeOrder(&controller, &request, &response, &done);
-    std::unique_lock<std::mutex> lk(state.mutex);
-    require(state.cv.wait_for(lk, 2s, [&] { return state.called; }),
-            "protobuf done callback was not invoked without Init()");
-    require(controller.GetErrorCode() != 0,
-            "refused non-blocking connect was reported as successful");
-    const std::string first_msg_id = controller.GetMsgId();
-    require(!first_msg_id.empty(), "first RPC did not receive a message ID");
-    lk.unlock();
-
     makeOrderResponse second_response;
     rocket::RpcController second_controller;
     second_controller.SetTimeout(500);
     DoneState second_state;
     DoneClosure second_done(second_state);
 
-    Order_Stub(channel.get()).makeOrder(
-        &second_controller, &request, &second_response, &second_done);
+    Order_Stub stub(channel.get());
+    stub.makeOrder(&controller, &request, &response, &done);
+    // Start a second request before the first one completes.  A shared channel
+    // must create an independent RequestState instead of rejecting it as
+    // "already in flight".
+    stub.makeOrder(&second_controller, &request, &second_response, &second_done);
+
+    std::unique_lock<std::mutex> lk(state.mutex);
+    require(state.cv.wait_for(lk, 2s, [&] { return state.called; }),
+            "protobuf done callback was not invoked without Init()");
+    require(controller.GetErrorCode() != 0,
+            "refused non-blocking connect was reported as successful");
+    require(controller.GetErrorCode() != rocket::error::kRpcChannelInit,
+            "shared channel rejected a concurrent RPC");
+    const std::string first_msg_id = controller.GetMsgId();
+    require(!first_msg_id.empty(), "first RPC did not receive a message ID");
+    lk.unlock();
+
     std::unique_lock<std::mutex> second_lk(second_state.mutex);
     require(second_state.cv.wait_for(
                 second_lk, 2s, [&] { return second_state.called; }),
             "second protobuf done callback was not invoked");
     require(second_controller.GetErrorCode() != 0,
             "second refused connect was reported as successful");
+    require(second_controller.GetErrorCode() != rocket::error::kRpcChannelInit,
+            "second concurrent RPC was rejected by the channel");
     require(!second_controller.GetMsgId().empty(),
             "second RPC did not receive a message ID");
     require(second_controller.GetMsgId() != first_msg_id,
-            "sequential RPCs reused the thread runtime message ID");
+            "concurrent RPCs reused the thread runtime message ID");
 }
 
 void testConnectionPoolFillsConfiguredSize() {

@@ -43,19 +43,16 @@ int main(int argc, char* argv[]) {
     svr.detach();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    // Shared pool: one TcpClient connection, one channel per worker for
-    // concurrent multiplexing over the same TCP connection.
+    // All workers share one multi-flight channel.  The channel pins to one
+    // TcpClient and routes concurrent responses by msg_id.
     auto pool = std::make_shared<rocket::RpcConnectionPool>(4);
+    auto ch = std::make_shared<rocket::RpcChannel>(addr, pool);
 
     std::atomic<int> ok{0};
     std::atomic<int> err{0};
     auto t0 = std::chrono::steady_clock::now();
 
     auto do_work = [&](int tid) {
-        // Each worker gets its own RpcChannel.  All channels share
-        // the same pool, which means they share one TcpClient / TCP
-        // connection (multiplexing via msg_id routing).
-        auto ch = std::make_shared<rocket::RpcChannel>(addr, pool);
         for (int i = 0; i < n_rounds; ++i) {
             makeOrderRequest r;
             r.set_price(tid * n_rounds + i);

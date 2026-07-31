@@ -1,5 +1,5 @@
-// True async benchmark: all channels driven by IO-thread callbacks.
-// No per-channel blocking threads — one callback fires the next request.
+// True async benchmark: all in-flight lanes are driven by IO-thread callbacks.
+// No per-request blocking threads — one callback fires the next request.
 //
 // Usage: async_bench [connections] [duration_s] [pipeline] [timeout_ms] [server_io]
 #include "order.pb.h"
@@ -24,14 +24,15 @@
 class LatencyRecorder {
   public:
     void record(int64_t us) { std::lock_guard lk(m_mutex); m_samples.push_back(us); }
-    void print(int64_t total, double s) {
+    void print() {
         std::lock_guard lk(m_mutex);
         if (m_samples.empty()) return;
         std::sort(m_samples.begin(), m_samples.end());
-        printf("  p50=%.3fms  p99=%.3fms  max=%.3fms\n",
+        printf("  p50=%.3fms  p99=%.3fms  max=%.3fms  samples=%zu\n",
                m_samples[m_samples.size()*50/100]/1000.0,
                m_samples[m_samples.size()*99/100]/1000.0,
-               static_cast<double>(m_samples.back())/1000.0);
+               static_cast<double>(m_samples.back())/1000.0,
+               m_samples.size());
     }
   private:
     std::mutex m_mutex;
@@ -57,6 +58,7 @@ struct CbSlot { CbSlot* next; };
 inline thread_local CbSlot* t_cb_head = nullptr;
 inline thread_local size_t t_cb_count = 0;
 constexpr size_t kCbPoolMax = 256;
+constexpr int64_t kLatencySampleMask = 255;  // sample 1/256 completions
 
 BenchCallback* allocCallback();
 
@@ -97,21 +99,29 @@ struct BenchCallback : public google::protobuf::Closure {
     void Run() override {
         Chan& ch = state->chans[cid];
 
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t_send).count();
-        state->latency.record(static_cast<int64_t>(us));
-
         // Validate the response is a real RPC result.
         bool ok = (ch.ctrl->GetErrorCode() == 0)
                && (ch.rsp->ret_code() == 0)
                && (!ch.rsp->order_id().empty());
+        int64_t completed = 0;
         if (ok) {
-            state->total.fetch_add(1);
+            completed = state->total.fetch_add(1) + 1;
         } else {
             state->errors.fetch_add(1);
         }
+        // A global mutex on every completion serialized the client IO loops
+        // and measured the recorder rather than RPC capacity.  A deterministic
+        // sample still yields thousands of latency observations per run.
+        if (ok && (completed & kLatencySampleMask) == 0) {
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_send).count();
+            state->latency.record(static_cast<int64_t>(us));
+        }
 
-        if (state->stop.load(std::memory_order_relaxed)) return;
+        if (state->stop.load(std::memory_order_relaxed)) {
+            delete this;
+            return;
+        }
 
         // Reuse req/rsp/ctrl — Clear() instead of NewMessage (Hical pattern).
         ch.req->Clear();
@@ -124,12 +134,9 @@ struct BenchCallback : public google::protobuf::Closure {
         auto send_time = std::chrono::steady_clock::now();
         auto* cb = allocCallback();
         cb->init(state, cid, send_time);
-        // shared_ptr with default deleter → operator delete returns to pool.
-        std::shared_ptr<google::protobuf::Closure> closure(cb);
-
-        ch.ch->Init(ch.ctrl, ch.req, ch.rsp, closure);
         ch.ch->CallMethod(ch.method, ch.ctrl.get(),
-                          ch.req.get(), ch.rsp.get(), nullptr);
+                          ch.req.get(), ch.rsp.get(), cb);
+        delete this;
     }
 
     // Override operator delete: return to thread_local pool (Hical pattern).
@@ -163,7 +170,7 @@ int main(int argc, char* argv[]) {
     int timeout_ms  = argc > 4 ? std::atoi(argv[4]) : 5000;
     int server_io   = argc > 5 ? std::atoi(argv[5]) : 4;
 
-    int n_channels = n_conns * pipeline;
+    int n_inflight = n_conns * pipeline;
 
     setbuf(stdout, nullptr);
     rocket::Logger::Options opts;
@@ -195,8 +202,8 @@ int main(int argc, char* argv[]) {
     svr.detach();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    printf("async_bench: c=%d pipeline=%d channels=%d duration=%ds server_io=%d\n",
-           n_conns, pipeline, n_channels, duration_s, server_io);
+    printf("async_bench: connections=%d pipeline=%d inflight=%d duration=%ds server_io=%d\n",
+           n_conns, pipeline, n_inflight, duration_s, server_io);
 
     // c connections, each shared by pipeline channels (Hical-style pipelining).
     auto pool = std::make_shared<rocket::RpcConnectionPool>(4, n_conns);
@@ -212,17 +219,27 @@ int main(int argc, char* argv[]) {
     auto method = Order::descriptor()->FindMethodByName("makeOrder");
 
     BenchState state;
-    state.chans.reserve(n_channels);
-    for (int i = 0; i < n_channels; ++i) {
-        auto ch = std::make_shared<rocket::RpcChannel>(addr, pool);
+    std::vector<std::shared_ptr<rocket::RpcChannel>> connection_channels;
+    connection_channels.reserve(n_conns);
+    for (int i = 0; i < n_conns; ++i) {
+        connection_channels.push_back(
+            std::make_shared<rocket::RpcChannel>(addr, pool));
+    }
+
+    state.chans.reserve(n_inflight);
+    for (int i = 0; i < n_inflight; ++i) {
+        // One multi-flight channel per real TCP connection.  Pipeline lanes
+        // share that channel and become independent RequestStates instead of
+        // multiplying channel objects.
+        auto ch = connection_channels[static_cast<std::size_t>(i / pipeline)];
         auto req = rocket::NewMessage<makeOrderRequest>();
         auto rsp = rocket::NewMessage<makeOrderResponse>();
         auto ctrl = rocket::NewRpcController();
         state.chans.push_back(Chan{ch, method, timeout_ms, req, rsp, ctrl});
     }
 
-    // Fire first request for every channel.
-    for (int cid = 0; cid < n_channels; ++cid) {
+    // Fire the first request for every in-flight lane.
+    for (int cid = 0; cid < n_inflight; ++cid) {
         auto& ch = state.chans[cid];
         ch.req->set_price(cid * 1000);
         ch.req->set_goods("async");
@@ -231,8 +248,7 @@ int main(int argc, char* argv[]) {
         auto* cb = allocCallback();
         auto send_time = std::chrono::steady_clock::now();
         cb->init(&state, cid, send_time);
-        ch.ch->Init(ch.ctrl, ch.req, ch.rsp, std::shared_ptr<google::protobuf::Closure>(cb));
-        ch.ch->CallMethod(method, ch.ctrl.get(), ch.req.get(), ch.rsp.get(), nullptr);
+        ch.ch->CallMethod(method, ch.ctrl.get(), ch.req.get(), ch.rsp.get(), cb);
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -252,11 +268,12 @@ int main(int argc, char* argv[]) {
     double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count()/1000.0;
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    printf("\nchannels=%d  duration=%.1fs  model=async(callback)\n", n_channels, elapsed);
+    printf("\nconnections=%d  inflight=%d  duration=%.1fs  model=async(callback)\n",
+           n_conns, n_inflight, elapsed);
     printf("total=%lld  errors=%lld  rps=%.0f\n",
            (long long)state.total.load(), (long long)state.errors.load(),
            state.total.load()/elapsed);
-    state.latency.print(state.total.load(), elapsed);
+    state.latency.print();
     // Keep alive for profiling
     _exit(0);
 }
