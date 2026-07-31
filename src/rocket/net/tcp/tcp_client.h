@@ -9,12 +9,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
-#include <map>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 
 namespace rocket {
 
@@ -23,6 +24,7 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
     using s_ptr = std::shared_ptr<TcpClient>;
     using CoderFactory = std::function<std::unique_ptr<AbstractCoder>()>;
     using ReadCallback = std::function<void(AbstractProtocol::s_ptr)>;
+    using RegisterCallback = std::function<bool(MessageId)>;
 
     // Owned mode: creates its own EventLoop + thread (backward compat).
     TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory);
@@ -43,6 +45,12 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
     int connectSync(int timeout_ms = 5000);
 
     void send(AbstractProtocol::s_ptr msg);
+    // Atomically bind an ID to the request, register its response callback and
+    // send it from the connection's owning IO thread.  The optional timer is
+    // armed in that same operation. RegisterCallback may reject a request
+    // which completed before its queued setup reached the IO thread.
+    void sendRequest(AbstractProtocol::s_ptr msg, TimerEvent::s_ptr timer,
+                     ReadCallback cb, RegisterCallback on_registered = {});
     void readMessage(MessageId msg_id, ReadCallback cb);
     void cancelRead(MessageId msg_id);
 
@@ -69,6 +77,10 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
   private:
     void onMessage(const TcpConnection::s_ptr& conn, std::vector<AbstractProtocol::s_ptr>& msgs);
     void onClose(const TcpConnection::s_ptr& conn);
+    void sendRequestInLoop(AbstractProtocol::s_ptr msg, TimerEvent::s_ptr timer,
+                           ReadCallback cb, RegisterCallback on_registered);
+    void registerReadInLoop(MessageId msg_id, ReadCallback cb);
+    void cancelReadInLoop(MessageId msg_id);
     void initLocalAddr(int fd);
     void setConnectError(int code, std::string info);
 
@@ -90,7 +102,13 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
     std::atomic<int> m_connect_error_code{0};
     std::string m_connect_error_info;
 
-    std::map<MessageId, ReadCallback> m_read_callbacks;
+    // Accessed only by m_loop. The unsynchronized PMR pool recycles erased
+    // nodes, avoiding both the old tree walk and per-RPC malloc/free. A small
+    // reserve prevents warm-path bucket growth without imposing a large fixed
+    // cost on 10k-connection deployments.
+    std::pmr::unsynchronized_pool_resource m_pending_resource;
+    std::pmr::unordered_map<MessageId, ReadCallback> m_read_callbacks{
+        &m_pending_resource};
 
     mutable std::mutex m_mutex;
     std::atomic<bool> m_stopped{false};

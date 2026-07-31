@@ -3,8 +3,8 @@
 #include "rocket/common/config.h"
 #include "rocket/common/ecode.h"
 #include "rocket/common/log.h"
-#include "rocket/common/service_registry.h"
 #include "rocket/common/msg_id_util.h"
+#include "rocket/common/service_registry.h"
 #include "rocket/common/runtime.h"
 #include "rocket/net/coder/abstract_protocol.h"
 #include "rocket/net/coder/tinypb_protocol.h"
@@ -41,7 +41,7 @@ struct RpcChannel::RequestState {
 
     TcpClient::s_ptr client;
     TimerEvent::s_ptr timer;
-    MessageId msg_id{kInvalidMessageId};
+    std::atomic<MessageId> msg_id{kInvalidMessageId};
 };
 
 RpcChannel::RpcChannel(NetAddr::s_ptr peer_addr)
@@ -87,9 +87,10 @@ bool RpcChannel::finishRpc(const std::shared_ptr<RequestState>& state,
         }
         state->timer.reset();
     }
+    const MessageId msg_id = state->msg_id.load(std::memory_order_acquire);
     if (cancel_pending_read && state->client &&
-        state->msg_id != kInvalidMessageId) {
-        state->client->cancelRead(state->msg_id);
+        msg_id != kInvalidMessageId) {
+        state->client->cancelRead(msg_id);
     }
 
     if (before_done) before_done();
@@ -223,22 +224,14 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
     }
     state->client = client;
 
-    if (my_controller->GetMsgId() == kInvalidMessageId) {
-        // A response callback is keyed by msg_id, so every in-flight RPC must
-        // have its own ID.  RunTime::m_msgid is logging/trace context and can
-        // outlive the request that populated it; inheriting it here lets two
-        // calls made on the same thread overwrite each other's callbacks.
-        req_protocol->m_msg_id = MsgIDUtil::GenMsgID();
-        my_controller->SetMsgId(req_protocol->m_msg_id);
-    } else {
+    if (my_controller->GetMsgId() != kInvalidMessageId) {
+        // Preserve an explicitly-provided trace ID. Generated IDs are chosen
+        // later by TcpClient on the connection's owning IO thread.
         req_protocol->m_msg_id = my_controller->GetMsgId();
     }
 
     req_protocol->m_method_name = method->full_name();
-    RunTime::GetRunTime()->m_msgid = req_protocol->m_msg_id;
     RunTime::GetRunTime()->m_method_name = req_protocol->m_method_name;
-
-    ROCKET_LOG_INFO("{} | call method name [{}]", req_protocol->m_msg_id, req_protocol->m_method_name);
 
     if (!request->SerializeToString(&(req_protocol->m_pb_data))) {
         std::string err_info = "failed to serialize";
@@ -250,8 +243,6 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
         return state;
     }
 
-    state->msg_id = req_protocol->m_msg_id;
-
     const int timeout_ms = std::max(1, my_controller->GetTimeout());
     state->timer = TimerEvent::create(timeout_ms, false, [state] {
         finishRpc(state, [state] {
@@ -262,22 +253,24 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                            "rpc call timeout " + std::to_string(ctrl->GetTimeout()));
         });
     });
-    client->getLoop()->addTimerEvent(state->timer);
-
-    // ── Send + readMessage ───────────────────────────────────────────
-    auto doSendRead = [req_protocol, state, client] {
+    // ID allocation, pending callback insertion, timer registration and send
+    // are one connection-IO-thread operation. This prevents a fast response
+    // or timeout from observing a half-registered request.
+    auto doSendRead = [req_protocol, state, client](bool arm_timer) {
         if (state->finished.load(std::memory_order_acquire)) return;
 
-        client->readMessage(
-            req_protocol->m_msg_id, [state, client](const std::shared_ptr<AbstractProtocol>& msg) {
-                finishRpc(state, [state, client, msg] {
-                    auto rsp_protocol = std::dynamic_pointer_cast<TinyPBProtocol>(msg);
-                    if (!rsp_protocol) {
+        client->sendRequest(
+            req_protocol, arm_timer ? state->timer : nullptr,
+            [state](std::shared_ptr<AbstractProtocol> msg) {
+                auto* rsp_protocol = dynamic_cast<TinyPBProtocol*>(msg.get());
+                finishRpc(state, [state, rsp_protocol] {
+                    if (rsp_protocol == nullptr) {
                         state->controller->SetError(error::kFailedDeserialize,
                                                     "invalid RPC response protocol");
                         return;
                     }
 
+                    const auto& client = state->client;
                     const auto peer = client->getPeerAddr();
                     const auto local = client->getLocalAddr();
                     ROCKET_LOG_INFO(
@@ -300,26 +293,55 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                                                     "response deserialize error");
                     }
                 }, /*cancel_pending_read=*/false);
+            },
+            [state, req_protocol](MessageId msg_id) {
+                if (state->finished.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                req_protocol->m_msg_id = msg_id;
+                state->msg_id.store(msg_id, std::memory_order_release);
+                state->controller->SetMsgId(msg_id);
+
+                auto* runtime = RunTime::GetRunTime();
+                runtime->m_msgid = msg_id;
+                runtime->m_method_name = req_protocol->m_method_name;
+                ROCKET_LOG_INFO("{} | call method name [{}]", msg_id,
+                                req_protocol->m_method_name);
+                return !state->finished.load(std::memory_order_acquire);
             });
-        if (state->finished.load(std::memory_order_acquire)) {
-            client->cancelRead(req_protocol->m_msg_id);
-            return;
-        }
-        client->send(req_protocol);
     };
 
     if (m_pool) {
-        doSendRead();  // already connected via pool::acquire → connectSync
+        // Already connected via pool::acquire -> connectSync. Arm the timeout
+        // together with the pending callback and send.
+        doSendRead(true);
     } else {
-        client->connect([state, doSendRead, client]() mutable {
+        // A standalone client's asynchronous connect can consume most of the
+        // deadline, so arm its timer immediately rather than after connect.
+        client->getLoop()->addTimerEvent(state->timer);
+        client->connect([state, req_protocol, doSendRead, client]() mutable {
             if (client->getConnectErrorCode() != 0) {
+                // Connect completion runs on this client's IO thread. Assign
+                // an ID here even though no pending callback will be created,
+                // preserving diagnostics for failed attempts while keeping ID
+                // ownership on the connection loop.
+                if (state->msg_id.load(std::memory_order_acquire) ==
+                    kInvalidMessageId) {
+                    MessageId msg_id = req_protocol->m_msg_id;
+                    if (msg_id == kInvalidMessageId) {
+                        msg_id = MsgIDUtil::GenMsgID();
+                    }
+                    req_protocol->m_msg_id = msg_id;
+                    state->msg_id.store(msg_id, std::memory_order_release);
+                    state->controller->SetMsgId(msg_id);
+                }
                 finishRpc(state, [state, client] {
                     state->controller->SetError(client->getConnectErrorCode(),
                                                 client->getConnectErrorInfo());
                 });
                 return;
             }
-            doSendRead();
+            doSendRead(false);
         });
     }
     return state;

@@ -1,6 +1,7 @@
 #include "rocket/net/tcp/tcp_client.h"
 
 #include "rocket/common/log.h"
+#include "rocket/common/msg_id_util.h"
 #include "rocket/net/tcp/net_addr.h"
 
 #include <cerrno>
@@ -22,6 +23,7 @@ TcpClient::TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory)
       m_owned_loop(std::make_unique<EventLoop>()) {
     m_loop = m_owned_loop.get();
     m_owns_loop = true;
+    m_read_callbacks.reserve(32);
 }
 
 // ── Shared mode: external EventLoop (from IOThreadGroup) ─────────────
@@ -30,6 +32,7 @@ TcpClient::TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory,
                      EventLoop* loop, bool direct_output_flush)
     : m_peer_addr(std::move(peer_addr)), m_coder_factory(std::move(coder_factory)),
       m_loop(loop), m_direct_output_flush(direct_output_flush) {
+    m_read_callbacks.reserve(32);
 }
 
 TcpClient::~TcpClient() { stop(); }
@@ -157,13 +160,93 @@ void TcpClient::send(AbstractProtocol::s_ptr msg) {
     });
 }
 
+void TcpClient::sendRequest(AbstractProtocol::s_ptr msg, TimerEvent::s_ptr timer,
+                            ReadCallback cb,
+                            RegisterCallback on_registered) {
+    if (!msg || !m_loop) return;
+
+    // Responses, timeouts and recursively-issued calls normally arrive on
+    // this branch. Avoid constructing an EventLoop task on that hot path.
+    if (m_loop->isInLoopThread()) {
+        sendRequestInLoop(std::move(msg), std::move(timer), std::move(cb),
+                          std::move(on_registered));
+        return;
+    }
+
+    m_loop->queueInLoop(
+        [weak = weak_from_this(), msg = std::move(msg),
+         timer = std::move(timer), cb = std::move(cb),
+         on_registered = std::move(on_registered)]() mutable {
+            if (auto client = weak.lock()) {
+                client->sendRequestInLoop(
+                    std::move(msg), std::move(timer), std::move(cb),
+                    std::move(on_registered));
+            }
+        });
+}
+
+void TcpClient::sendRequestInLoop(AbstractProtocol::s_ptr msg,
+                                  TimerEvent::s_ptr timer, ReadCallback cb,
+                                  RegisterCallback on_registered) {
+    m_loop->assertInLoopThread();
+    if (!msg) return;
+
+    // IDs only need to be unique among requests pending on this connection.
+    // Allocate them here so ID selection, callback insertion and the socket
+    // send form one ordered IO-thread operation. A caller-provided trace ID is
+    // retained unless it collides with an already-pending request.
+    MessageId msg_id = msg->m_msg_id;
+    while (msg_id == kInvalidMessageId ||
+           m_read_callbacks.contains(msg_id)) {
+        msg_id = MsgIDUtil::GenMsgID();
+    }
+    msg->m_msg_id = msg_id;
+
+    if (on_registered && !on_registered(msg_id)) {
+        return;
+    }
+
+    m_read_callbacks.emplace(msg_id, std::move(cb));
+    if (timer) {
+        m_loop->addTimerEvent(timer);
+    }
+    if (m_connection) {
+        m_connection->send(std::move(msg));
+    }
+}
+
 void TcpClient::readMessage(MessageId msg_id, ReadCallback cb) {
-    std::lock_guard<std::mutex> lk(m_mutex);
-    m_read_callbacks[msg_id] = std::move(cb);
+    if (msg_id == kInvalidMessageId || !m_loop) return;
+    if (m_loop->isInLoopThread()) {
+        registerReadInLoop(msg_id, std::move(cb));
+        return;
+    }
+    m_loop->queueInLoop(
+        [weak = weak_from_this(), msg_id, cb = std::move(cb)]() mutable {
+            if (auto client = weak.lock()) {
+                client->registerReadInLoop(msg_id, std::move(cb));
+            }
+        });
 }
 
 void TcpClient::cancelRead(MessageId msg_id) {
-    std::lock_guard<std::mutex> lk(m_mutex);
+    if (msg_id == kInvalidMessageId || !m_loop) return;
+    if (m_loop->isInLoopThread()) {
+        cancelReadInLoop(msg_id);
+        return;
+    }
+    m_loop->queueInLoop([weak = weak_from_this(), msg_id] {
+        if (auto client = weak.lock()) client->cancelReadInLoop(msg_id);
+    });
+}
+
+void TcpClient::registerReadInLoop(MessageId msg_id, ReadCallback cb) {
+    m_loop->assertInLoopThread();
+    m_read_callbacks.insert_or_assign(msg_id, std::move(cb));
+}
+
+void TcpClient::cancelReadInLoop(MessageId msg_id) {
+    m_loop->assertInLoopThread();
     const auto it = m_read_callbacks.find(msg_id);
     if (it != m_read_callbacks.end()) {
         m_read_callbacks.erase(it);
@@ -225,10 +308,9 @@ void TcpClient::stop() {
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        m_read_callbacks.clear();
-    }
+    // connectDestroyed() above ran on (or synchronized with) m_loop, so no
+    // message callback can race this owner-thread-only table any more.
+    m_read_callbacks.clear();
 
     // Owned loops must always receive stop, including the short window before
     // loop() has published isLooping=true.
@@ -249,15 +331,12 @@ void TcpClient::stop() {
 void TcpClient::onMessage(const TcpConnection::s_ptr& /*conn*/, std::vector<AbstractProtocol::s_ptr>& msgs) {
     for (auto& msg : msgs) {
         ReadCallback cb;
-        {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            auto it = m_read_callbacks.find(msg->m_msg_id);
-            if (it != m_read_callbacks.end()) {
-                cb = it->second;
-                m_read_callbacks.erase(it);
-            }
+        auto it = m_read_callbacks.find(msg->m_msg_id);
+        if (it != m_read_callbacks.end()) {
+            cb = std::move(it->second);
+            m_read_callbacks.erase(it);
         }
-        if (cb) cb(msg);
+        if (cb) cb(std::move(msg));
     }
 }
 
