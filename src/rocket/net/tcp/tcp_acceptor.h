@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rocket/net/tcp/net_addr.h"
+#include <cerrno>
 #include <memory>
 #include <string>
 
@@ -20,10 +21,14 @@ class TcpAcceptor {
 
     struct AcceptResult {
         int client_fd{-1};
+        int error_code{0};
         NetAddr::s_ptr peer_addr;
         std::string error_msg;
 
         [[nodiscard]] constexpr bool isValid() const noexcept { return client_fd >= 0; }
+        [[nodiscard]] constexpr bool wouldBlock() const noexcept {
+            return error_code == EAGAIN || error_code == EWOULDBLOCK;
+        }
     };
 
     explicit TcpAcceptor(NetAddr::s_ptr local_addr);

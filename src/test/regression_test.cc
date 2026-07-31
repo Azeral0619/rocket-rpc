@@ -10,6 +10,7 @@
 #include "rocket/net/rpc/rpc_controller.h"
 #include "rocket/net/rpc/rpc_server.h"
 #include "rocket/net/tcp/net_addr.h"
+#include "rocket/net/tcp/tcp_acceptor.h"
 #include "rocket/net/tcp/tcp_buffer.h"
 #include "rocket/net/tcp/tcp_client.h"
 #include "rocket/net/timing_wheel.h"
@@ -144,6 +145,55 @@ void testBufferWritesContiguousBytesToFd() {
 
     ::close(fds[0]);
     ::close(fds[1]);
+}
+
+void testAcceptorDrainsWithoutBlocking() {
+    auto address = std::make_shared<rocket::IPNetAddr>("127.0.0.1", 0);
+    rocket::TcpAcceptor acceptor(address);
+    require(acceptor.isListening(), "acceptor failed to listen");
+
+    sockaddr_in bound_address{};
+    socklen_t bound_length = sizeof(bound_address);
+    require(::getsockname(
+                acceptor.getListenFd(),
+                reinterpret_cast<sockaddr*>(&bound_address),
+                &bound_length) == 0,
+            "failed to read acceptor address");
+
+    constexpr int kConnections = 16;
+    std::vector<int> clients;
+    clients.reserve(kConnections);
+    for (int i = 0; i < kConnections; ++i) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        require(fd >= 0, "failed to create acceptor test client");
+        require(::connect(fd, reinterpret_cast<sockaddr*>(&bound_address),
+                          sizeof(bound_address)) == 0,
+                "failed to connect acceptor test client");
+        clients.push_back(fd);
+    }
+
+    std::vector<int> accepted;
+    for (;;) {
+        auto result = acceptor.accept();
+        if (!result.isValid()) {
+            require(result.wouldBlock(),
+                    "acceptor drain ended with an unexpected error");
+            break;
+        }
+        const int status_flags = ::fcntl(result.client_fd, F_GETFL, 0);
+        const int descriptor_flags = ::fcntl(result.client_fd, F_GETFD, 0);
+        require(status_flags >= 0 && (status_flags & O_NONBLOCK) != 0,
+                "accepted socket was blocking");
+        require(descriptor_flags >= 0 &&
+                    (descriptor_flags & FD_CLOEXEC) != 0,
+                "accepted socket could leak across exec");
+        accepted.push_back(result.client_fd);
+    }
+
+    require(accepted.size() == clients.size(),
+            "acceptor did not drain every queued connection");
+    for (int fd : accepted) ::close(fd);
+    for (int fd : clients) ::close(fd);
 }
 
 void testLiteralLogFormatting() {
@@ -610,6 +660,7 @@ int main() {
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
         testBufferWritesContiguousBytesToFd();
+        testAcceptorDrainsWithoutBlocking();
         testLiteralLogFormatting();
         testDisabledLogDoesNotEvaluateArguments();
         testTimingWheelKeepsPartialTicks();

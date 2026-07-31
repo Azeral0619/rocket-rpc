@@ -10,6 +10,12 @@
 
 namespace rocket {
 
+namespace {
+
+constexpr std::size_t kMaxAcceptsPerRound = 128;
+
+} // namespace
+
 TcpServer::TcpServer(NetAddr::s_ptr local_addr, CoderFactory coder_factory)
     : m_local_addr(std::move(local_addr)), m_coder_factory(std::move(coder_factory)) {
     init();
@@ -33,53 +39,61 @@ void TcpServer::init() {
 void TcpServer::onAccept() {
     if (!m_running.load(std::memory_order_acquire)) return;
 
-    auto re = m_acceptor->accept();
-    if (!re.isValid()) {
-        ROCKET_LOG_ERROR("accept failed: {}", re.error_msg);
-        return;
+    for (std::size_t accepted = 0; accepted < kMaxAcceptsPerRound; ++accepted) {
+        auto re = m_acceptor->accept();
+        if (!re.isValid()) {
+            if (!re.wouldBlock()) {
+                ROCKET_LOG_ERROR("accept failed: {}", re.error_msg);
+            }
+            return;
+        }
+
+        int client_fd = re.client_fd;
+        auto peer_addr = std::move(re.peer_addr);
+        if (!m_io_group) {
+            ::close(client_fd);
+            return;
+        }
+        IOThread* io_thread = m_io_group->getIOThread();
+        if (!io_thread || !io_thread->getEventLoop()) {
+            ::close(client_fd);
+            return;
+        }
+
+        auto* io_loop = io_thread->getEventLoop();
+        auto conn = std::make_shared<TcpConnection>(
+            io_loop, client_fd,
+            m_local_addr, peer_addr,
+            m_coder_factory(),
+            TcpConnectionType::Server);
+
+        conn->setMessageCallback(m_message_cb);
+        conn->setConnectionCallback(m_connection_cb);
+        if (m_hwm_cb) {
+            conn->setHighWaterMarkCallback(m_hwm_cb, m_high_water_mark);
+        }
+
+        conn->setCloseCallback([this](const TcpConnection::s_ptr& c) {
+            removeConnection(c);
+        });
+
+        // Register with the IO thread's loop, then establish.
+        const auto connection_count =
+            io_loop->m_connection_count.fetch_add(1, std::memory_order_relaxed) +
+            1;
+        conn->setDirectOutputFlush(
+            connection_count >= TcpConnection::kDirectFlushConnectionThreshold);
+        io_loop->queueInLoop([conn] {
+            conn->connectEstablished();
+        });
+
+        {
+            std::lock_guard<std::mutex> lk(m_connections_mutex);
+            m_connections.insert(conn);
+        }
+        ROCKET_LOG_INFO("TcpServer new client fd={} peer={}", client_fd,
+                        peer_addr->toString());
     }
-
-    int client_fd = re.client_fd;
-    auto peer_addr = std::move(re.peer_addr);
-    if (!m_io_group) {
-        ::close(client_fd);
-        return;
-    }
-    IOThread* io_thread = m_io_group->getIOThread();
-    if (!io_thread || !io_thread->getEventLoop()) {
-        ::close(client_fd);
-        return;
-    }
-
-    auto* io_loop = io_thread->getEventLoop();
-    auto conn = std::make_shared<TcpConnection>(
-        io_loop, client_fd,
-        m_local_addr, peer_addr,
-        m_coder_factory(),
-        TcpConnectionType::Server);
-
-    conn->setMessageCallback(m_message_cb);
-    conn->setConnectionCallback(m_connection_cb);
-    if (m_hwm_cb) conn->setHighWaterMarkCallback(m_hwm_cb, m_high_water_mark);
-
-    conn->setCloseCallback([this](const TcpConnection::s_ptr& c) {
-        removeConnection(c);
-    });
-
-    // Register with the IO thread's loop, then establish.
-    const auto connection_count =
-        io_loop->m_connection_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    conn->setDirectOutputFlush(
-        connection_count >= TcpConnection::kDirectFlushConnectionThreshold);
-    io_loop->queueInLoop([conn] {
-        conn->connectEstablished();
-    });
-
-    {
-        std::lock_guard<std::mutex> lk(m_connections_mutex);
-        m_connections.insert(conn);
-    }
-    ROCKET_LOG_INFO("TcpServer new client fd={} peer={}", client_fd, peer_addr->toString());
 }
 
 void TcpServer::removeConnection(const TcpConnection::s_ptr& conn) {
