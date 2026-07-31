@@ -299,8 +299,12 @@ bool TinyPBCoder::decode(
 }
 
 std::uint32_t TinyPBCoder::calculateChecksum(const char* data, std::size_t len) {
-    std::uint32_t crc = CRC::Calculate(data, len, CRC::CRC_32());
-    return crc;
+    // Passing CRC_32() directly selects CRC++'s bit-at-a-time overload,
+    // which performs eight polynomial steps for every byte in every frame.
+    // Build the 256-entry table once and use the byte-at-a-time overload;
+    // both paths implement the exact same CRC-32 parameters and wire value.
+    static const CRC::Table<std::uint32_t, 32> table(CRC::CRC_32());
+    return CRC::Calculate(data, len, table);
 }
 
 } // namespace rocket
