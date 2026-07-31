@@ -335,8 +335,8 @@ bool TinyPBCoder::decode(
         // Consume both the valid frame and any garbage prefix preceding it.
         buffer.moveReadIndex(pk_end_index + 1);
         message->parse_success = true;
-        ROCKET_LOG_INFO("Decoded message [{}], method: {}", message->m_msg_id,
-                        message->m_method_name);
+        ROCKET_LOG_DEBUG("Decoded message [{}], method: {}", message->m_msg_id,
+                         message->m_method_name);
         output.push_back(std::move(message));
     }
 }

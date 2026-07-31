@@ -135,7 +135,7 @@ class ServerCallState final : public google::protobuf::Closure {
             m_response_protocol->m_err_info.clear();
         }
         if (m_response_protocol->m_err_code == 0) {
-            ROCKET_LOG_INFO(
+            ROCKET_LOG_DEBUG(
                 "{} | dispatch success, request[{}], response[{}]",
                 m_request_protocol->m_msg_id, m_request->ShortDebugString(),
                 m_response->ShortDebugString());
@@ -204,29 +204,32 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
         return;
     }
 
-    if (!parseServiceFullName(method_full_name, service_name, method_name)) {
-        sendError(error::kParseServiceName, "parse service name error");
-        return;
-    }
+    const auto route_it = m_method_routes.find(method_full_name);
+    if (route_it == m_method_routes.end()) {
+        if (!parseServiceFullName(method_full_name, service_name, method_name)) {
+            sendError(error::kParseServiceName, "parse service name error");
+            return;
+        }
 
-    auto it = m_service_map.find(service_name);
-    if (it == m_service_map.end()) {
-        ROCKET_LOG_ERROR("{} | service name[{}] not found", req_protocol->m_msg_id, service_name);
-        sendError(error::kServiceNotFound, "service not found");
-        return;
-    }
+        const auto service_it = m_service_map.find(service_name);
+        if (service_it == m_service_map.end()) {
+            ROCKET_LOG_ERROR("{} | service name[{}] not found",
+                             req_protocol->m_msg_id, service_name);
+            sendError(error::kServiceNotFound, "service not found");
+            return;
+        }
 
-    const auto& service = it->second;
-    const auto* method = service->GetDescriptor()->FindMethodByName(method_name);
-    if (method == nullptr) {
-        ROCKET_LOG_ERROR("{} | method name[{}] not found in service[{}]", req_protocol->m_msg_id, method_name,
-                         service_name);
+        ROCKET_LOG_ERROR("{} | method name[{}] not found in service[{}]",
+                         req_protocol->m_msg_id, method_name, service_name);
         sendError(error::kMethodNotFound, "method not found");
         return;
     }
+    const MethodRoute& route = route_it->second;
+    const auto& service = route.service;
+    const auto* method = route.method;
 
     auto request_message = std::unique_ptr<google::protobuf::Message>(
-        service->GetRequestPrototype(method).New());
+        route.request_prototype->New());
     const std::string_view request_payload = req_protocol->pbDataView();
     if (!request_message->ParseFromArray(
             request_payload.data(), static_cast<int>(request_payload.size()))) {
@@ -235,11 +238,11 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
         return;
     }
 
-    ROCKET_LOG_INFO("{} | get rpc request[{}]", req_protocol->m_msg_id,
-                    request_message->ShortDebugString());
+    ROCKET_LOG_DEBUG("{} | get rpc request[{}]", req_protocol->m_msg_id,
+                     request_message->ShortDebugString());
 
     auto response_message = std::unique_ptr<google::protobuf::Message>(
-        service->GetResponsePrototype(method).New());
+        route.response_prototype->New());
 
     auto* call = new ServerCallState(
         service, method, std::move(request_message),
@@ -249,8 +252,7 @@ void RpcDispatcher::dispatch(AbstractProtocol::s_ptr request, AbstractProtocol::
     // Track in-flight for graceful shutdown.
     call->markInFlight();
 
-    const auto mode = executionModeFor(method->full_name());
-    if (mode == RpcExecutionMode::Inline) {
+    if (route.execution_mode == RpcExecutionMode::Inline) {
         call->invoke();
         return;
     }
@@ -285,18 +287,59 @@ bool RpcDispatcher::parseServiceFullName(std::string_view full_name, std::string
 }
 
 void RpcDispatcher::registerService(Services_ptr service) {
-    std::string service_name(service->GetDescriptor()->full_name());
-    m_service_map[service_name] = std::move(service);
+    if (!service) return;
+
+    const auto* descriptor = service->GetDescriptor();
+    const auto descriptor_name = descriptor->full_name();
+    const std::string service_name(descriptor_name.data(), descriptor_name.size());
+
+    if (const auto old = m_service_map.find(service_name);
+        old != m_service_map.end()) {
+        const auto* old_descriptor = old->second->GetDescriptor();
+        for (int i = 0; i < old_descriptor->method_count(); ++i) {
+            const auto old_method_name =
+                old_descriptor->method(i)->full_name();
+            m_method_routes.erase(std::string(old_method_name.data(),
+                                              old_method_name.size()));
+        }
+    }
+
+    m_service_map.insert_or_assign(service_name, service);
+    m_method_routes.reserve(m_method_routes.size() +
+                            static_cast<std::size_t>(descriptor->method_count()));
+    for (int i = 0; i < descriptor->method_count(); ++i) {
+        const auto* method = descriptor->method(i);
+        const auto descriptor_method_name = method->full_name();
+        const std::string method_name(descriptor_method_name.data(),
+                                      descriptor_method_name.size());
+        MethodRoute route;
+        route.service = service;
+        route.method = method;
+        route.request_prototype = &service->GetRequestPrototype(method);
+        route.response_prototype = &service->GetResponsePrototype(method);
+        route.execution_mode = executionModeFor(method_name);
+        m_method_routes.insert_or_assign(method_name, std::move(route));
+    }
 }
 
 void RpcDispatcher::setDefaultExecutionMode(RpcExecutionMode mode) noexcept {
     m_default_execution_mode = mode;
+    for (auto& [method_name, route] : m_method_routes) {
+        if (m_method_execution_modes.find(method_name) ==
+            m_method_execution_modes.end()) {
+            route.execution_mode = mode;
+        }
+    }
 }
 
 bool RpcDispatcher::setMethodExecutionMode(std::string full_method_name,
                                            RpcExecutionMode mode) {
     if (full_method_name.empty()) return false;
-    m_method_execution_modes.insert_or_assign(std::move(full_method_name), mode);
+    m_method_execution_modes.insert_or_assign(full_method_name, mode);
+    if (const auto route = m_method_routes.find(full_method_name);
+        route != m_method_routes.end()) {
+        route->second.execution_mode = mode;
+    }
     return true;
 }
 

@@ -412,7 +412,14 @@ template <typename... Args>
 void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args) {
     if (static_cast<std::uint8_t>(level) < static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed)))
         return;
-    ensureStarted();
+    if (!m_running.load(std::memory_order_acquire)) [[unlikely]] {
+        ensureStarted();
+        // start() loads the configured level, which may be stricter than the
+        // construction default used by the first shouldLog() check.
+        if (static_cast<std::uint8_t>(level) <
+            static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed)))
+            return;
+    }
 
     static thread_local std::uint64_t cached_tid = []() {
 #if defined(__linux__)

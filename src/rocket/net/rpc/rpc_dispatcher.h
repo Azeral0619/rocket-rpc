@@ -4,13 +4,15 @@
 #include "rocket/net/coder/abstract_protocol.h"
 #include "rocket/net/coder/tinypb_protocol.h"
 #include "rocket/net/tcp/tcp_connection.h"
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <google/protobuf/service.h>
 #include <map>
 #include <memory>
 #include <string>
 #include <string_view>
-#include <atomic>
+#include <unordered_map>
 
 namespace rocket {
 
@@ -52,11 +54,34 @@ class RpcDispatcher {
     static void setTinyPBError(TinyPBProtocol::s_ptr msg, int32_t err_code, std::string_view err_info);
 
   private:
+    struct TransparentStringHash {
+        using is_transparent = void;
+
+        std::size_t operator()(std::string_view value) const noexcept {
+            return std::hash<std::string_view>{}(value);
+        }
+
+        std::size_t operator()(const std::string& value) const noexcept {
+            return (*this)(std::string_view(value));
+        }
+    };
+
+    struct MethodRoute {
+        Services_ptr service;
+        const google::protobuf::MethodDescriptor* method{nullptr};
+        const google::protobuf::Message* request_prototype{nullptr};
+        const google::protobuf::Message* response_prototype{nullptr};
+        RpcExecutionMode execution_mode{RpcExecutionMode::Inline};
+    };
+
     static bool parseServiceFullName(std::string_view full_name, std::string_view& service_name,
                                      std::string_view& method_name);
     [[nodiscard]] RpcExecutionMode executionModeFor(std::string_view full_method_name) const;
     std::map<std::string, Services_ptr, std::less<>> m_service_map;
     std::map<std::string, RpcExecutionMode, std::less<>> m_method_execution_modes;
+    std::unordered_map<std::string, MethodRoute, TransparentStringHash,
+                       std::equal_to<>>
+        m_method_routes;
     RpcExecutionMode m_default_execution_mode{RpcExecutionMode::Inline};
     ThreadPool m_worker_pool;
     std::atomic<bool> m_stopping{false};

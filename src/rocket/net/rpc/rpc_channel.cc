@@ -258,7 +258,7 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
     state->timer = TimerEvent::create(timeout_ms, false, [state] {
         finishRpc(state, [state] {
             auto* ctrl = state->controller;
-            ROCKET_LOG_INFO("{} | call rpc timeout arrive", ctrl->GetMsgId());
+            ROCKET_LOG_WARN("{} | call rpc timeout arrive", ctrl->GetMsgId());
             ctrl->StartCancel();
             ctrl->SetError(error::kRpcCallTimeout,
                            "rpc call timeout " + std::to_string(ctrl->GetTimeout()));
@@ -284,7 +284,7 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                     const auto& client = state->client;
                     const auto peer = client->getPeerAddr();
                     const auto local = client->getLocalAddr();
-                    ROCKET_LOG_INFO(
+                    ROCKET_LOG_DEBUG(
                         "{} | success get rpc response, call method name[{}], peer addr[{}], local addr[{}]",
                         rsp_protocol->m_msg_id, rsp_protocol->m_method_name,
                         peer ? peer->toString() : "?", local ? local->toString() : "?");
@@ -320,8 +320,8 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                 auto* runtime = RunTime::GetRunTime();
                 runtime->m_msgid = msg_id;
                 runtime->m_method_name = req_protocol->m_method_name;
-                ROCKET_LOG_INFO("{} | call method name [{}]", msg_id,
-                                req_protocol->m_method_name);
+                ROCKET_LOG_DEBUG("{} | call method name [{}]", msg_id,
+                                 req_protocol->m_method_name);
                 return !state->finished.load(std::memory_order_acquire);
             });
     };

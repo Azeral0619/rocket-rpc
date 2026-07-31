@@ -29,7 +29,9 @@ struct StringTransparentHasher {
 struct ConfigData {
     static constexpr int kDefaultLogMaxFileSize = 1024 * 1024 * 1024; // 1GB
     static constexpr int kDefaultLogSyncInterval = 500;               // ms
-    static constexpr int kDefaultLogQueueCapacity = 1 << 14;
+    // Logger queue capacity is expressed in bytes. Keep this aligned with
+    // Logger's 256 KiB per-thread default rather than the legacy entry count.
+    static constexpr int kDefaultLogQueueCapacity = 256 * 1024;
     static constexpr int kDefaultServerPort = 12345;
 
     std::string log_level{"DEBUG"};
