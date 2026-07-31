@@ -148,10 +148,16 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
         if (stale) stale->stop();
     }
 
+    const auto io_thread_count = m_io_group.getIOThreadSize();
+    const bool direct_output_flush =
+        io_thread_count > 0 &&
+        m_conns_per_addr >=
+            TcpConnection::kDirectFlushConnectionThreshold * io_thread_count;
     auto client = std::make_shared<TcpClient>(
         std::move(addr),
         [] { return std::make_unique<TinyPBCoder>(); },
-        loop);
+        loop,
+        direct_output_flush);
 
     int err = client->connectSync(timeout_ms);
     if (err != 0) {

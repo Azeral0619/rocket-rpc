@@ -78,7 +78,7 @@ class EventLoop {
 
   public:
     // Connection count for least-connections load balancing (Hical pattern).
-    // Updated by the pool when creating/destroying TcpClients on this loop.
+    // Updated by client pools and TcpServer as connections enter/leave.
     std::atomic<std::size_t> m_connection_count{0};
 };
 

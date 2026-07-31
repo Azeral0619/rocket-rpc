@@ -51,8 +51,9 @@ void TcpServer::onAccept() {
         return;
     }
 
+    auto* io_loop = io_thread->getEventLoop();
     auto conn = std::make_shared<TcpConnection>(
-        io_thread->getEventLoop(), client_fd,
+        io_loop, client_fd,
         m_local_addr, peer_addr,
         m_coder_factory(),
         TcpConnectionType::Server);
@@ -66,7 +67,11 @@ void TcpServer::onAccept() {
     });
 
     // Register with the IO thread's loop, then establish.
-    io_thread->getEventLoop()->queueInLoop([conn] {
+    const auto connection_count =
+        io_loop->m_connection_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    conn->setDirectOutputFlush(
+        connection_count >= TcpConnection::kDirectFlushConnectionThreshold);
+    io_loop->queueInLoop([conn] {
         conn->connectEstablished();
     });
 
@@ -82,7 +87,9 @@ void TcpServer::removeConnection(const TcpConnection::s_ptr& conn) {
         std::lock_guard<std::mutex> lk(m_connections_mutex);
         m_connections.erase(conn);
     }
-    conn->getLoop()->queueInLoop([conn] {
+    auto* loop = conn->getLoop();
+    loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
+    loop->queueInLoop([conn] {
         conn->connectDestroyed();
     });
 }

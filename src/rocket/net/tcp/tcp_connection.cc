@@ -172,11 +172,20 @@ void TcpConnection::sendInLoopBatch(std::vector<AbstractProtocol::s_ptr> message
         }
     }
 
-    // Defer one optimistic write until the current EventLoop turn has
-    // dispatched every readable frame.  This preserves response/request
-    // batching for pipelined RPC while avoiding EPOLLOUT registration when
-    // the socket can accept the batch immediately.
-    scheduleOutputFlush();
+    // A single decoded RPC usually fits in the socket send buffer.  Write it
+    // immediately and avoid allocating/locking an EventLoop task merely to
+    // perform the same non-blocking write at the end of the turn.  When one
+    // read decoded multiple frames, defer once so all synchronous responses
+    // are encoded into one output batch.
+    if (m_direct_output_flush && !m_defer_output_flush && !m_flush_queued &&
+        !m_fd_event->isListening(FdEvent::TriggerEvent::OUT_EVENT)) {
+        const bool all_written = flushOutputInLoop();
+        if (m_state.load(std::memory_order_acquire) != TcpState::Closed) {
+            updateWriteInterest(all_written);
+        }
+    } else {
+        scheduleOutputFlush();
+    }
 }
 
 void TcpConnection::drainWriteQueue() {
@@ -314,7 +323,14 @@ void TcpConnection::handleRead() {
     }
 
     if (!result.messages.empty() && m_message_callback) {
-        m_message_callback(shared_from_this(), result.messages);
+        if (m_direct_output_flush) {
+            const bool previous_defer = m_defer_output_flush;
+            m_defer_output_flush = result.messages.size() > 1;
+            m_message_callback(shared_from_this(), result.messages);
+            m_defer_output_flush = previous_defer;
+        } else {
+            m_message_callback(shared_from_this(), result.messages);
+        }
     }
 }
 

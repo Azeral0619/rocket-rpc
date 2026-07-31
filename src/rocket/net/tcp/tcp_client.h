@@ -29,7 +29,8 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
 
     // Shared mode: uses an externally-managed EventLoop (e.g. from IOThreadGroup).
     // The caller must ensure the EventLoop outlives this TcpClient.
-    TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory, EventLoop* loop);
+    TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory, EventLoop* loop,
+              bool direct_output_flush = false);
 
     ~TcpClient();
 
@@ -80,6 +81,7 @@ class TcpClient : public std::enable_shared_from_this<TcpClient> {
     // Non-null only in owned mode — holds the self-created EventLoop.
     std::unique_ptr<EventLoop> m_owned_loop;
     bool m_owns_loop{false};
+    bool m_direct_output_flush{false};
     // Thread for owned mode only (shared mode uses IOThreadGroup's threads).
     std::thread m_thread;
 

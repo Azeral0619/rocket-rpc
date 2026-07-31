@@ -26,9 +26,10 @@ TcpClient::TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory)
 
 // ── Shared mode: external EventLoop (from IOThreadGroup) ─────────────
 
-TcpClient::TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory, EventLoop* loop)
+TcpClient::TcpClient(NetAddr::s_ptr peer_addr, CoderFactory coder_factory,
+                     EventLoop* loop, bool direct_output_flush)
     : m_peer_addr(std::move(peer_addr)), m_coder_factory(std::move(coder_factory)),
-      m_loop(loop) {
+      m_loop(loop), m_direct_output_flush(direct_output_flush) {
 }
 
 TcpClient::~TcpClient() { stop(); }
@@ -57,6 +58,7 @@ void TcpClient::connect(std::function<void()> done) {
         // Connection initiated; create TcpConnection on the event loop.
         m_connection = std::make_shared<TcpConnection>(
             m_loop, fd, nullptr, m_peer_addr, m_coder_factory(), TcpConnectionType::Client);
+        m_connection->setDirectOutputFlush(m_direct_output_flush);
 
         m_connection->setMessageCallback([weak = weak_from_this()](const TcpConnection::s_ptr& conn,
                                                                    std::vector<AbstractProtocol::s_ptr>& msgs) {

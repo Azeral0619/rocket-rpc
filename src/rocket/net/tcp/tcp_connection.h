@@ -34,6 +34,7 @@ enum class TcpConnectionType : std::uint8_t {
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
   public:
     using s_ptr = std::shared_ptr<TcpConnection>;
+    static constexpr std::size_t kDirectFlushConnectionThreshold = 256;
     using w_ptr = std::weak_ptr<TcpConnection>;
     using MessageCallback = std::function<void(const s_ptr&, std::vector<AbstractProtocol::s_ptr>&)>;
     using ConnectionCallback = std::function<void(const s_ptr&)>;
@@ -88,6 +89,9 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     [[nodiscard]] NetAddr::s_ptr getLocalAddr() const { return m_local_addr; }
     [[nodiscard]] NetAddr::s_ptr getPeerAddr() const { return m_peer_addr; }
     [[nodiscard]] int getFd() const noexcept { return m_fd; }
+    void setDirectOutputFlush(bool enabled) noexcept {
+        m_direct_output_flush = enabled;
+    }
 
     // In-flight request/response count (used by graceful shutdown).
     void incrInFlight() noexcept { m_in_flight.fetch_add(1, std::memory_order_relaxed); }
@@ -138,6 +142,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     MpscQueue m_write_queue;
     std::atomic<bool> m_write_queued{false};
     bool m_flush_queued{false};  // owning EventLoop thread only
+    bool m_defer_output_flush{false};  // batch frames decoded by one read
+    bool m_direct_output_flush{false};
 
     static constexpr std::size_t kDefaultBufferSize = 4096;
 };
