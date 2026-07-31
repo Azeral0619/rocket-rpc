@@ -158,6 +158,12 @@ void EventLoop::deleteEpollEvent(FdEvent* event) {
 }
 
 bool EventLoop::isInLoopThread() const noexcept {
+    // All hot-path calls made by the owner can be answered from TLS without
+    // touching the state mutex. Foreign threads still take the lock so the
+    // initial publication of m_thread_id remains synchronized.
+    if (t_current_event_loop == this) {
+        return true;
+    }
     std::lock_guard<std::mutex> lock(m_state_mutex);
     return m_thread_id == std::this_thread::get_id();
 }
