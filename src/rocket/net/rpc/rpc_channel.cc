@@ -193,7 +193,19 @@ void RpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
             return;
         }
         if (m_pool) {
-            client = m_pool->acquire(m_peer_addr);
+            // A channel allows only one in-flight request, so its established
+            // client can be reused directly.  Re-entering the pool on every
+            // response serialized all channels on the pool mutex and rebuilt
+            // the address key on the hottest RPC path.
+            {
+                std::lock_guard<std::mutex> lk(m_request_mutex);
+                if (m_client && m_client->isConnected()) {
+                    client = m_client;
+                }
+            }
+            if (!client) {
+                client = m_pool->acquire(m_peer_addr);
+            }
             if (!client) {
                 finishRpc(state, [state] {
                     state->controller->SetError(error::kRpcPoolExhausted,

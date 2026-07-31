@@ -286,6 +286,12 @@ void testConnectionPoolFillsConfiguredSize() {
         require(first && second && third, "connection pool failed to connect");
         require(first != second && first != third && second != third,
                 "connection pool did not create the configured slots");
+
+        const std::vector<rocket::TcpClient::s_ptr> slots{first, second, third};
+        for (std::size_t i = 0; i < 300; ++i) {
+            require(pool.acquire(peer, 1000) == slots[i % slots.size()],
+                    "full connection pool did not use stable round-robin slots");
+        }
         pool.shutdown();
     } catch (...) {
         failure = std::current_exception();

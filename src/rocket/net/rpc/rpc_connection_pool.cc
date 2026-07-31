@@ -71,6 +71,7 @@ EventLoop* RpcConnectionPool::pickLoop() {
 
 TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms) {
     std::string key = addr->toString();
+    std::vector<TcpClient::s_ptr> stale_clients;
 
     std::unique_lock<std::mutex> lk(m_mutex);
     if (m_shutdown) return nullptr;
@@ -79,27 +80,31 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
     if (it != m_clients.end()) {
         auto& vec = it->second;
 
-        // Prune dead connections, but keep at least one slot for reconnection.
-        for (auto iter = vec.begin(); iter != vec.end(); ) {
-            if (*iter && (*iter)->isConnected()) {
-                ++iter;
-            } else {
-                ROCKET_LOG_WARN("RpcConnectionPool: evicting dead connection for {}", key);
-                auto* loop = *iter ? (*iter)->getLoop() : nullptr;
-                if (loop) loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
-                if (*iter) (*iter)->stop();
-                iter = vec.erase(iter);
-            }
-        }
-
-        // Keep filling the configured pool before switching to round-robin.
-        // Sequential acquire() calls must not get stuck forever on slot zero.
+        // Healthy steady-state lookup must stay O(1).  The previous code
+        // scanned every connection on every request, so a 10k-connection pool
+        // performed 10k state checks while holding the global mutex for each
+        // RPC.  Check the round-robin slot first and scan only on failover.
         if (vec.size() >= m_conns_per_addr) {
             size_t& idx = m_rr_counters[key];
             idx = idx % vec.size();
-            auto client = vec[idx];
-            idx = (idx + 1) % vec.size();
-            return client;
+            for (std::size_t checked = 0; checked < vec.size(); ++checked) {
+                auto client = vec[idx];
+                idx = (idx + 1) % vec.size();
+                if (client && client->isConnected()) {
+                    return client;
+                }
+            }
+
+            // Only the exceptional all-dead path pays for a full cleanup.
+            for (auto& client : vec) {
+                ROCKET_LOG_WARN("RpcConnectionPool: evicting dead connection for {}", key);
+                auto* loop = client ? client->getLoop() : nullptr;
+                if (loop) {
+                    loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
+                }
+            }
+            stale_clients.swap(vec);
+            m_rr_counters[key] = 0;
         }
     }
 
@@ -107,11 +112,41 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
     // m_conns_per_addr, create a new slot.  Otherwise reuse the first
     // slot (the vector was cleared above due to dead connections).
     EventLoop* loop = pickLoop();
+    // connectSync() waits for the selected loop to report writability.  Never
+    // wait on the loop currently executing this acquire call.
+    if (loop && loop->isInLoopThread()) {
+        const std::size_t n = m_io_group.getIOThreadSize();
+        EventLoop* alternative = nullptr;
+        std::size_t best_count = std::numeric_limits<std::size_t>::max();
+        for (std::size_t i = 0; i < n; ++i) {
+            auto* io = m_io_group.getIOThreadAt(i);
+            auto* candidate = io ? io->getEventLoop() : nullptr;
+            if (!candidate || candidate == loop) continue;
+            const auto count =
+                candidate->m_connection_count.load(std::memory_order_relaxed);
+            if (count < best_count) {
+                best_count = count;
+                alternative = candidate;
+            }
+        }
+        loop = alternative;
+    }
     if (!loop) {
-        ROCKET_LOG_ERROR("RpcConnectionPool: no IO loop available for {}", key);
+        ROCKET_LOG_ERROR(
+            "RpcConnectionPool: no non-blocking IO loop available for {}", key);
+        lk.unlock();
+        for (auto& stale : stale_clients) {
+            if (stale) stale->stop();
+        }
         return nullptr;
     }
     lk.unlock();
+
+    // TcpClient::stop() can wait for its owning loop, so never call it while
+    // holding the pool mutex: an IO callback may concurrently be acquiring.
+    for (auto& stale : stale_clients) {
+        if (stale) stale->stop();
+    }
 
     auto client = std::make_shared<TcpClient>(
         std::move(addr),
@@ -142,11 +177,16 @@ TcpClient::s_ptr RpcConnectionPool::acquire(NetAddr::s_ptr addr, int timeout_ms)
     }
     // All slots full (another thread filled them) — use one from the pool.
     // Undo our connection count since we won't keep this extra connection.
+    size_t& idx = m_rr_counters[key];
+    idx %= vec.size();
+    auto pooled = vec[idx];
+    idx = (idx + 1) % vec.size();
     if (loop) {
         loop->m_connection_count.fetch_sub(1, std::memory_order_relaxed);
     }
+    lk.unlock();
     client->stop();
-    return vec.front();
+    return pooled;
 }
 
 void RpcConnectionPool::release(NetAddr::s_ptr /*addr*/, TcpClient::s_ptr /*client*/) {
