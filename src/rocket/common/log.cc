@@ -230,7 +230,7 @@ void Logger::consumerRun() {
     closeLogFile(); openLogFile();
     std::string& wb = m_fmt_buf;
     LogEntry entry;
-    auto last_flush = std::chrono::steady_clock::now();
+    auto last_idle_wait = std::chrono::steady_clock::now();
 
     // Second-level cache for localtime_r.
     struct {
@@ -316,14 +316,30 @@ void Logger::consumerRun() {
                     if (slp && !slp->dead && !slp->queue->empty())
                         { has_data = true; break; }
             }
-            if (has_data || !m_running.load(std::memory_order_acquire) ||
-                m_need_flush.load(std::memory_order_acquire))
+            if (has_data || !m_running.load(std::memory_order_acquire)) {
                 continue;
+            }
+            if (m_need_flush.load(std::memory_order_acquire)) {
+                // Wake the writer even when there is no formatted payload:
+                // it owns the fsync and clears m_need_flush.
+                {
+                    std::lock_guard<std::mutex> lk(m_write_mutex);
+                    m_write_ready = true;
+                }
+                m_write_cv.notify_one();
+                continue;
+            }
 
             std::unique_lock<std::mutex> cvlk(m_consumer_mutex);
             auto now = std::chrono::steady_clock::now();
-            auto rem = last_flush + std::chrono::milliseconds(m_flush_interval_ms) - now;
-            if (rem < std::chrono::milliseconds(0)) continue;
+            auto rem = last_idle_wait + std::chrono::milliseconds(m_flush_interval_ms) - now;
+            if (rem <= std::chrono::milliseconds(0)) {
+                // Advance the idle deadline.  Leaving it in the past makes the
+                // consumer spin forever while repeatedly taking m_slot_mutex,
+                // which can starve newly starting IO threads.
+                last_idle_wait = now;
+                rem = std::chrono::milliseconds(m_flush_interval_ms);
+            }
             m_consumer_cv.wait_for(cvlk, rem, [this]{
                 if (!m_running.load(std::memory_order_acquire) ||
                     m_need_flush.load(std::memory_order_acquire)) return true;

@@ -166,7 +166,11 @@ int main(int argc, char* argv[]) {
     int n_channels = n_conns * pipeline;
 
     setbuf(stdout, nullptr);
-    rocket::Logger::Options opts; opts.file_path = "/dev/null";
+    rocket::Logger::Options opts;
+    opts.file_path = "/dev/null";
+    // Measure RPC transport/dispatch capacity, not INFO-log formatting.
+    // RpcChannel and RpcDispatcher emit multiple INFO records per request.
+    opts.level = rocket::LogLevel::Error;
     rocket::Logger::getInstance().start(opts);
 
     // Set server IO threads via temp config (default 4 from ConfigData).
@@ -195,6 +199,15 @@ int main(int argc, char* argv[]) {
 
     // c connections, each shared by pipeline channels (Hical-style pipelining).
     auto pool = std::make_shared<rocket::RpcConnectionPool>(4, n_conns);
+    // Fill the pool before callbacks begin recursively issuing requests.
+    // Otherwise an early response can re-enter acquire() on a pool IO thread
+    // while the pool is still growing and block that loop in connectSync().
+    for (int i = 0; i < n_conns; ++i) {
+        if (!pool->acquire(addr, timeout_ms)) {
+            fprintf(stderr, "failed to warm connection %d/%d\n", i + 1, n_conns);
+            return 1;
+        }
+    }
     auto method = Order::descriptor()->FindMethodByName("makeOrder");
 
     BenchState state;
