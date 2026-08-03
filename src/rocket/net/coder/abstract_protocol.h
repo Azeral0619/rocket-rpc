@@ -37,8 +37,9 @@ struct AbstractProtocol : public std::enable_shared_from_this<AbstractProtocol> 
      */
     [[nodiscard]] virtual std::string_view getProtocolType() const = 0;
 
-    // Approximate bytes contributed to the wire/output buffer. Cross-thread
-    // write mailboxes use this for byte-based backpressure before encoding.
+    // Approximate bytes contributed to the socket output buffer. Cross-thread
+    // write queues use this for byte-based backpressure before encoding.
+    // Custom protocols remain source-compatible and may override for accuracy.
     [[nodiscard]] virtual std::size_t estimatedWireSize() const noexcept {
         return 1;
     }

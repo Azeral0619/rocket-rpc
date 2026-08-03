@@ -3,6 +3,7 @@
 #include "rocket/net/coder/abstract_coder.h"
 #include "rocket/net/coder/abstract_protocol.h"
 #include "rocket/net/fd_event.h"
+#include "rocket/net/mpsc_queue.h"
 #include "rocket/net/tcp/net_addr.h"
 #include "rocket/net/tcp/tcp_buffer.h"
 #include <atomic>
@@ -99,7 +100,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     [[nodiscard]] int inFlight() const noexcept { return m_in_flight.load(std::memory_order_relaxed); }
 
   private:
-    friend class EventLoop;
+    struct QueuedWrite {
+        AbstractProtocol::s_ptr message;
+        std::size_t estimated_bytes{0};
+    };
 
     void handleRead();
     void handleWrite();
@@ -107,17 +111,19 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void handleError();
 
     void sendInLoop(AbstractProtocol::s_ptr message);
-    void sendFromMailboxInLoop(AbstractProtocol::s_ptr message);
     void sendInLoopBatch(
         std::span<const AbstractProtocol::s_ptr> messages);
+    void drainWriteQueue();
+    void discardWriteQueue() noexcept;
+    [[nodiscard]] bool tryReserveWriteQueue(std::size_t bytes) noexcept;
+    void releaseWriteQueue(std::size_t bytes) noexcept;
+    void handleWriteQueueOverload();
     void scheduleOutputFlush();
     [[nodiscard]] bool flushOutputInLoop();
     void updateWriteInterest(bool all_written);
     void shutdownInLoop();
     void enableWriting();
     void disableWriting();
-    [[nodiscard]] bool tryReserveMailboxWrite(std::size_t bytes) noexcept;
-    void releaseMailboxWrite(std::size_t bytes) noexcept;
 
     EventLoop* m_loop{nullptr};
     NetAddr::s_ptr m_local_addr;
@@ -143,10 +149,13 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 
     std::atomic<int> m_in_flight{0};
 
-    // Cross-thread messages live in the owning EventLoop's mailbox. Per-
-    // connection reservations prevent one slow peer consuming the whole loop.
-    std::atomic<std::size_t> m_mailbox_queued_messages{0};
-    std::atomic<std::size_t> m_mailbox_queued_bytes{0};
+    // MPSC lock-free write queue: multiple producer threads push messages
+    // wait-free; the EventLoop (single consumer) drains in batch.
+    MpscQueue m_write_queue;
+    std::atomic<bool> m_write_queued{false};
+    std::atomic<std::size_t> m_queued_write_messages{0};
+    std::atomic<std::size_t> m_queued_write_bytes{0};
+    std::atomic<bool> m_write_overload_queued{false};
     bool m_flush_queued{false};  // owning EventLoop thread only
     bool m_defer_output_flush{false};  // batch frames decoded by one read
     bool m_direct_output_flush{false};
@@ -156,8 +165,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // on demand, so keeping the per-connection baseline small substantially
     // reduces the working set when a process owns thousands of connections.
     static constexpr std::size_t kDefaultBufferSize = 1024;
-    static constexpr std::size_t kMaxMailboxQueuedMessages = 4096;
-    static constexpr std::size_t kMaxMailboxQueuedBytes = 4ULL * 1024 * 1024;
+    static constexpr std::size_t kMaxQueuedWriteMessages = 4096;
+    static constexpr std::size_t kMaxQueuedWriteBytes = 4ULL * 1024 * 1024;
 };
 
 } // namespace rocket

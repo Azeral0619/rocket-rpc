@@ -1,17 +1,13 @@
 #include "rocket/net/event_loop.h"
 
 #include "rocket/common/log.h"
-#include "rocket/net/coder/abstract_protocol.h"
 #include "rocket/net/timer.h"
 #include "rocket/net/poller/wakeup_channel.h"
-#include "rocket/net/tcp/tcp_connection.h"
 
-#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -21,46 +17,7 @@ namespace rocket {
 namespace {
 constexpr int kEpollWaitTimeoutMs = -1; // infinite
 constexpr int kMaxPendingTaskRounds = 8;
-constexpr std::size_t kMaxWritesPerRound = 1024;
-constexpr std::size_t kWriteClockCheckMask = 63;
-constexpr auto kMaxWriteTimePerRound = std::chrono::microseconds(200);
 thread_local EventLoop* t_current_event_loop = nullptr;
-
-struct PendingWrite {
-    std::shared_ptr<TcpConnection> connection;
-    std::shared_ptr<AbstractProtocol> message;
-    std::size_t estimated_bytes{0};
-};
-
-using PendingWriteNode = TypedMpscNode<PendingWrite>;
-
-class WriteProducerPermit {
-  public:
-    explicit WriteProducerPermit(std::atomic<std::uint32_t>& state) noexcept
-        : m_state(&state) {}
-    ~WriteProducerPermit() {
-        m_state->fetch_sub(1, std::memory_order_release);
-    }
-
-    WriteProducerPermit(const WriteProducerPermit&) = delete;
-    WriteProducerPermit& operator=(const WriteProducerPermit&) = delete;
-
-  private:
-    std::atomic<std::uint32_t>* m_state;
-};
-
-bool tryReserve(std::atomic<std::size_t>& counter, std::size_t amount,
-                std::size_t limit) noexcept {
-    std::size_t current = counter.load(std::memory_order_relaxed);
-    while (current <= limit && amount <= limit - current) {
-        if (counter.compare_exchange_weak(
-                current, current + amount, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-    return false;
-}
 } // namespace
 
 EventLoop::EventLoop() {
@@ -76,13 +33,6 @@ EventLoop::EventLoop() {
 }
 
 EventLoop::~EventLoop() {
-    m_write_producer_state.fetch_or(kWriteProducerClosed,
-                                    std::memory_order_acq_rel);
-    while ((m_write_producer_state.load(std::memory_order_acquire) &
-            kWriteProducerCountMask) != 0) {
-        std::this_thread::yield();
-    }
-    discardWriteMailbox();
     if (t_current_event_loop == this) t_current_event_loop = nullptr;
 }
 
@@ -123,7 +73,6 @@ void EventLoop::loop() {
         }
 
         processEvents(active);
-        processWriteMailbox();
         processTimerEvents();
         processPendingTasks();
     }
@@ -151,129 +100,6 @@ void EventLoop::processEvents(const std::vector<Poller::ActiveEvent>& events) {
     }
 }
 
-bool EventLoop::tryQueueWrite(
-    std::shared_ptr<TcpConnection> connection,
-    std::shared_ptr<AbstractProtocol> message) {
-    if (!connection || !message || connection->getLoop() != this ||
-        !tryAcquireWriteProducer()) {
-        return false;
-    }
-    WriteProducerPermit producer_permit(m_write_producer_state);
-    if (m_stop_flag.load(std::memory_order_acquire)) return false;
-
-    const std::size_t estimated_bytes =
-        std::max<std::size_t>(1, message->estimatedWireSize());
-    if (!connection->tryReserveMailboxWrite(estimated_bytes)) {
-        return false;
-    }
-    if (!tryReserve(m_queued_write_messages, 1,
-                    kMaxQueuedWriteMessages)) {
-        connection->releaseMailboxWrite(estimated_bytes);
-        return false;
-    }
-    if (!tryReserve(m_queued_write_bytes, estimated_bytes,
-                    kMaxQueuedWriteBytes)) {
-        m_queued_write_messages.fetch_sub(1, std::memory_order_acq_rel);
-        connection->releaseMailboxWrite(estimated_bytes);
-        return false;
-    }
-
-    auto* node = new (std::nothrow) PendingWriteNode(
-        PendingWrite{connection, std::move(message), estimated_bytes});
-    if (!node) {
-        m_queued_write_bytes.fetch_sub(estimated_bytes,
-                                       std::memory_order_acq_rel);
-        m_queued_write_messages.fetch_sub(1, std::memory_order_acq_rel);
-        connection->releaseMailboxWrite(estimated_bytes);
-        return false;
-    }
-
-    m_write_mailbox.push(node);
-    if (!m_write_mailbox_pending.exchange(true,
-                                           std::memory_order_acq_rel)) {
-        wakeup();
-    }
-    return true;
-}
-
-bool EventLoop::tryAcquireWriteProducer() noexcept {
-    std::uint32_t state =
-        m_write_producer_state.load(std::memory_order_relaxed);
-    for (;;) {
-        if ((state & kWriteProducerClosed) != 0 ||
-            (state & kWriteProducerCountMask) ==
-                kWriteProducerCountMask) {
-            return false;
-        }
-        if (m_write_producer_state.compare_exchange_weak(
-                state, state + 1, std::memory_order_acquire,
-                std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-}
-
-void EventLoop::processWriteMailbox() {
-    assertInLoopThread();
-    if (!m_write_mailbox_pending.load(std::memory_order_acquire)) return;
-
-    const auto start = std::chrono::steady_clock::now();
-    std::size_t processed = 0;
-    while (processed < kMaxWritesPerRound) {
-        MpscNode* raw = m_write_mailbox.pop();
-        if (!raw) break;
-
-        auto* node = static_cast<PendingWriteNode*>(raw);
-        PendingWrite command = std::move(node->data);
-        delete node;
-
-        m_queued_write_messages.fetch_sub(1, std::memory_order_acq_rel);
-        m_queued_write_bytes.fetch_sub(command.estimated_bytes,
-                                       std::memory_order_acq_rel);
-        if (command.connection) {
-            command.connection->releaseMailboxWrite(command.estimated_bytes);
-            if (command.connection->getLoop() == this && command.message) {
-                command.connection->sendFromMailboxInLoop(
-                    std::move(command.message));
-            }
-        }
-
-        ++processed;
-        if ((processed & kWriteClockCheckMask) == 0 &&
-            std::chrono::steady_clock::now() - start >=
-                kMaxWriteTimePerRound) {
-            break;
-        }
-    }
-
-    m_write_mailbox_pending.store(false, std::memory_order_release);
-    if (!m_write_mailbox.empty()) {
-        bool expected = false;
-        if (m_write_mailbox_pending.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel)) {
-            // Give socket events and timers a chance before the next bounded
-            // mailbox drain.
-            wakeup();
-        }
-    }
-}
-
-void EventLoop::discardWriteMailbox() noexcept {
-    while (MpscNode* raw = m_write_mailbox.pop()) {
-        auto* node = static_cast<PendingWriteNode*>(raw);
-        PendingWrite command = std::move(node->data);
-        delete node;
-
-        m_queued_write_messages.fetch_sub(1, std::memory_order_relaxed);
-        m_queued_write_bytes.fetch_sub(command.estimated_bytes,
-                                       std::memory_order_relaxed);
-        if (command.connection) {
-            command.connection->releaseMailboxWrite(command.estimated_bytes);
-        }
-    }
-    m_write_mailbox_pending.store(false, std::memory_order_relaxed);
-}
-
 void EventLoop::processPendingTasks() {
     // A task running on the loop may defer follow-up work without waking the
     // poller (for example, one batched socket flush after an MPSC drain).
@@ -283,6 +109,7 @@ void EventLoop::processPendingTasks() {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             tasks.swap(m_pending_tasks);
+            m_task_wakeup_pending.store(false, std::memory_order_release);
         }
         if (tasks.empty()) {
             return;
@@ -303,7 +130,10 @@ void EventLoop::processPendingTasks() {
         has_pending = !m_pending_tasks.empty();
     }
     if (has_pending) {
-        wakeup();
+        if (!m_task_wakeup_pending.exchange(true,
+                                            std::memory_order_acq_rel)) {
+            wakeup();
+        }
     }
 }
 
@@ -347,7 +177,11 @@ void EventLoop::addTask(std::function<void()> cb, bool is_wake_up) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pending_tasks.push(std::move(cb));
     }
-    if (is_wake_up) wakeup();
+    if (is_wake_up &&
+        !m_task_wakeup_pending.exchange(true,
+                                        std::memory_order_acq_rel)) {
+        wakeup();
+    }
 }
 
 void EventLoop::addTimerEvent(const TimerEvent::s_ptr& event) {

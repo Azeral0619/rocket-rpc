@@ -20,6 +20,7 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
@@ -271,10 +272,10 @@ void testBufferWritesContiguousBytesToFd() {
     ::close(fds[1]);
 }
 
-void testEventLoopWriteMailboxHandlesConcurrentProducers() {
+void testBoundedConnectionWriteQueueHandlesConcurrentProducers() {
     int fds[2] = {-1, -1};
     require(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
-            "write-mailbox socketpair failed");
+            "write-queue socketpair failed");
 
     constexpr int kProducerCount = 4;
     constexpr int kMessagesPerProducer = 256;
@@ -314,7 +315,7 @@ void testEventLoopWriteMailboxHandlesConcurrentProducers() {
     {
         std::unique_lock<std::mutex> lock(mutex);
         require(cv.wait_for(lock, 1s, [&] { return ready; }),
-                "write-mailbox EventLoop did not start");
+                "write-queue EventLoop did not start");
     }
 
     std::vector<std::thread> producers;
@@ -339,36 +340,38 @@ void testEventLoopWriteMailboxHandlesConcurrentProducers() {
         pollfd descriptor{fds[1], POLLIN, 0};
         const int poll_result = ::poll(&descriptor, 1, 20);
         if (poll_result < 0 && errno == EINTR) continue;
-        require(poll_result >= 0, "write-mailbox peer poll failed");
+        require(poll_result >= 0, "write-queue peer poll failed");
         if (poll_result == 0 || (descriptor.revents & POLLIN) == 0) continue;
 
         char buffer[4096];
         const ssize_t bytes = ::read(fds[1], buffer, sizeof(buffer));
-        require(bytes > 0, "write-mailbox peer read failed");
+        require(bytes > 0, "write-queue peer read failed");
         received.append(buffer, static_cast<std::size_t>(bytes));
     }
 
     require(received.size() == kExpectedBytes,
-            "write mailbox lost cross-thread messages");
+            "bounded write queue lost cross-thread messages");
     for (std::size_t offset = 0; offset < received.size();
          offset += kMessageSize) {
         const char marker = received[offset];
         require(marker >= 'A' && marker < 'A' + kProducerCount,
-                "write mailbox corrupted a producer marker");
+                "bounded write queue corrupted a producer marker");
         for (std::size_t i = 1; i < kMessageSize; ++i) {
             require(received[offset + i] == marker,
-                    "write mailbox interleaved encoded messages");
+                    "bounded write queue interleaved encoded messages");
         }
     }
 
-    const auto drain_deadline = std::chrono::steady_clock::now() + 1s;
-    while (loop->pendingWriteCount() != 0 &&
-           std::chrono::steady_clock::now() < drain_deadline) {
+    auto oversized = std::make_shared<rocket::StringProtocol>();
+    oversized->info.resize(4ULL * 1024 * 1024 + 1, 'x');
+    connection->send(std::move(oversized));
+    const auto close_deadline = std::chrono::steady_clock::now() + 1s;
+    while (connection->getState() != rocket::TcpState::Closed &&
+           std::chrono::steady_clock::now() < close_deadline) {
         std::this_thread::yield();
     }
-    require(loop->pendingWriteCount() == 0 &&
-                loop->pendingWriteBytes() == 0,
-            "write-mailbox reservations were not released");
+    require(connection->getState() == rocket::TcpState::Closed,
+            "oversized cross-thread write did not close the connection");
 
     loop->stop();
     io_thread.join();
@@ -1040,7 +1043,7 @@ int main() {
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
         testBufferWritesContiguousBytesToFd();
-        testEventLoopWriteMailboxHandlesConcurrentProducers();
+        testBoundedConnectionWriteQueueHandlesConcurrentProducers();
         testAcceptorDrainsWithoutBlocking();
         testLiteralLogFormatting();
         testDisabledLogDoesNotEvaluateArguments();

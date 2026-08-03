@@ -3,6 +3,7 @@
 #include "rocket/common/log.h"
 #include "rocket/net/event_loop.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -15,19 +16,6 @@ namespace rocket {
 namespace {
 
 constexpr std::size_t kMaxReadPerRound = 64 * 1024;
-
-bool tryReserve(std::atomic<std::size_t>& counter, std::size_t amount,
-                std::size_t limit) noexcept {
-    std::size_t current = counter.load(std::memory_order_relaxed);
-    while (current <= limit && amount <= limit - current) {
-        if (counter.compare_exchange_weak(
-                current, current + amount, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-    return false;
-}
 
 } // namespace
 
@@ -48,6 +36,7 @@ TcpConnection::TcpConnection(EventLoop* loop, int fd, NetAddr::s_ptr local_addr,
 }
 
 TcpConnection::~TcpConnection() {
+    discardWriteQueue();
     if (m_fd >= 0) {
         ::close(m_fd);
     }
@@ -148,13 +137,28 @@ void TcpConnection::send(AbstractProtocol::s_ptr message) {
         return;
     }
 
-    // Connections sharing an EventLoop also share one bounded write mailbox.
-    // The owning IO thread remains the only mutator of m_out_buffer.
-    if (!m_loop->tryQueueWrite(shared_from_this(), std::move(message))) {
-        ROCKET_LOG_ERROR(
-            "EventLoop write mailbox overloaded, closing fd={}", m_fd);
+    // Cross-thread fast path: push to this connection's MPSC queue. Keeping
+    // the producer hot spot per connection avoids one shared EventLoop tail.
+    // Only the first message in a batch schedules a drain callback;
+    // subsequent messages are picked up by the same drain.
+    const std::size_t estimated_bytes =
+        std::max<std::size_t>(1, message->estimatedWireSize());
+    auto* node = MpscNodePool::alloc<QueuedWrite>(
+        QueuedWrite{std::move(message), estimated_bytes});
+    if (!tryReserveWriteQueue(estimated_bytes)) {
+        MpscNodePool::free(node);
+        handleWriteQueueOverload();
+        return;
+    }
+
+    m_write_queue.push(node);
+
+    bool expected = false;
+    if (m_write_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         m_loop->queueInLoop([weak = weak_from_this()] {
-            if (auto conn = weak.lock()) conn->handleError();
+            if (auto conn = weak.lock()) {
+                conn->drainWriteQueue();
+            }
         });
     }
 }
@@ -162,14 +166,6 @@ void TcpConnection::send(AbstractProtocol::s_ptr message) {
 void TcpConnection::sendInLoop(AbstractProtocol::s_ptr message) {
     sendInLoopBatch(
         std::span<const AbstractProtocol::s_ptr>(&message, 1));
-}
-
-void TcpConnection::sendFromMailboxInLoop(AbstractProtocol::s_ptr message) {
-    m_loop->assertInLoopThread();
-    const bool previous_defer = m_defer_output_flush;
-    m_defer_output_flush = true;
-    sendInLoop(std::move(message));
-    m_defer_output_flush = previous_defer;
 }
 
 void TcpConnection::sendInLoopBatch(
@@ -213,23 +209,95 @@ void TcpConnection::sendInLoopBatch(
     }
 }
 
-bool TcpConnection::tryReserveMailboxWrite(std::size_t bytes) noexcept {
-    if (!tryReserve(m_mailbox_queued_messages, 1,
-                    kMaxMailboxQueuedMessages)) {
+void TcpConnection::drainWriteQueue() {
+    m_loop->assertInLoopThread();
+
+    // Collect drained messages and encode them all at once (batch encode).
+    // This avoids N per-message encode+enableWriting cycles.
+    std::vector<AbstractProtocol::s_ptr> messages;
+    messages.reserve(256);
+    for (int round = 0; round < 3; ++round) {
+        int batch = 0;
+        messages.clear();
+        while (batch < 256) {
+            MpscNode* raw = m_write_queue.pop();
+            if (!raw) break;
+
+            auto* node = static_cast<TypedMpscNode<QueuedWrite>*>(raw);
+            releaseWriteQueue(node->data.estimated_bytes);
+            if (m_state.load(std::memory_order_acquire) == TcpState::Connected) {
+                messages.push_back(std::move(node->data.message));
+            }
+            MpscNodePool::free(node);
+            ++batch;
+        }
+        if (!messages.empty()) {
+            sendInLoopBatch(messages);
+        }
+    }
+
+    m_write_queued.store(false, std::memory_order_release);
+
+    // Re-check: a producer may have pushed between the last pop and
+    // the store above.  If so, re-arm the drain.
+    if (!m_write_queue.empty()) {
+        bool expected = false;
+        if (m_write_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            m_loop->queueInLoop([weak = weak_from_this()] {
+                if (auto conn = weak.lock()) {
+                    conn->drainWriteQueue();
+                }
+            });
+        }
+    }
+}
+
+void TcpConnection::discardWriteQueue() noexcept {
+    while (MpscNode* raw = m_write_queue.pop()) {
+        auto* node = static_cast<TypedMpscNode<QueuedWrite>*>(raw);
+        releaseWriteQueue(node->data.estimated_bytes);
+        MpscNodePool::free(node);
+    }
+    m_write_queued.store(false, std::memory_order_relaxed);
+}
+
+bool TcpConnection::tryReserveWriteQueue(std::size_t bytes) noexcept {
+    if (bytes > kMaxQueuedWriteBytes) return false;
+
+    const std::size_t previous_messages =
+        m_queued_write_messages.fetch_add(1, std::memory_order_relaxed);
+    if (previous_messages >= kMaxQueuedWriteMessages) {
+        m_queued_write_messages.fetch_sub(1, std::memory_order_relaxed);
         return false;
     }
-    if (!tryReserve(m_mailbox_queued_bytes, bytes,
-                    kMaxMailboxQueuedBytes)) {
-        m_mailbox_queued_messages.fetch_sub(1,
-                                             std::memory_order_acq_rel);
+
+    const std::size_t previous_bytes =
+        m_queued_write_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (previous_bytes > kMaxQueuedWriteBytes - bytes) {
+        m_queued_write_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        m_queued_write_messages.fetch_sub(1, std::memory_order_relaxed);
         return false;
     }
     return true;
 }
 
-void TcpConnection::releaseMailboxWrite(std::size_t bytes) noexcept {
-    m_mailbox_queued_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
-    m_mailbox_queued_messages.fetch_sub(1, std::memory_order_acq_rel);
+void TcpConnection::releaseWriteQueue(std::size_t bytes) noexcept {
+    m_queued_write_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    m_queued_write_messages.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void TcpConnection::handleWriteQueueOverload() {
+    if (m_write_overload_queued.exchange(true,
+                                         std::memory_order_acq_rel)) {
+        return;
+    }
+    ROCKET_LOG_ERROR(
+        "connection write queue overloaded, closing fd={} queued={} bytes={}",
+        m_fd, m_queued_write_messages.load(std::memory_order_relaxed),
+        m_queued_write_bytes.load(std::memory_order_relaxed));
+    m_loop->queueInLoop([weak = weak_from_this()] {
+        if (auto conn = weak.lock()) conn->handleError();
+    });
 }
 
 void TcpConnection::scheduleOutputFlush() {
