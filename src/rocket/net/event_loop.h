@@ -71,9 +71,6 @@ class EventLoop {
 
     std::queue<std::function<void()>> m_pending_tasks;
     mutable std::mutex m_mutex;
-    // Coalesce cross-thread task notifications. The task queue remains the
-    // control plane; only the empty-to-pending transition writes eventfd/pipe.
-    std::atomic<bool> m_task_wakeup_pending{false};
 
     std::unique_ptr<Timer> m_timer;
 

@@ -109,7 +109,6 @@ void EventLoop::processPendingTasks() {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             tasks.swap(m_pending_tasks);
-            m_task_wakeup_pending.store(false, std::memory_order_release);
         }
         if (tasks.empty()) {
             return;
@@ -130,10 +129,7 @@ void EventLoop::processPendingTasks() {
         has_pending = !m_pending_tasks.empty();
     }
     if (has_pending) {
-        if (!m_task_wakeup_pending.exchange(true,
-                                            std::memory_order_acq_rel)) {
-            wakeup();
-        }
+        wakeup();
     }
 }
 
@@ -177,11 +173,7 @@ void EventLoop::addTask(std::function<void()> cb, bool is_wake_up) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pending_tasks.push(std::move(cb));
     }
-    if (is_wake_up &&
-        !m_task_wakeup_pending.exchange(true,
-                                        std::memory_order_acq_rel)) {
-        wakeup();
-    }
+    if (is_wake_up) wakeup();
 }
 
 void EventLoop::addTimerEvent(const TimerEvent::s_ptr& event) {
