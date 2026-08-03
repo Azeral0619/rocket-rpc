@@ -129,6 +129,12 @@ target("capacity_test")
     add_deps("rocket")
     add_packages("protobuf-cpp", "yaml-cpp", "fmt")
 
+target("log_hot_path_bench")
+    set_kind("binary")
+    add_files("src/test/log_hot_path_bench.cc")
+    add_deps("rocket")
+    add_packages("protobuf-cpp", "yaml-cpp", "fmt")
+
 target("regression_test")
     set_kind("binary")
     add_includedirs("proto")
