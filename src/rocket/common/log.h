@@ -33,7 +33,31 @@
 #include <pthread.h>
 #endif
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#endif
+
 namespace rocket {
+
+namespace detail {
+
+// Keep timestamp capture on the producer path as cheap as the queue write.
+// Conversion to wall-clock nanoseconds happens on the consumer thread.
+[[nodiscard]] inline std::uint64_t ReadLogClockTicks() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    return __rdtsc();
+#elif defined(__aarch64__)
+    std::uint64_t ticks{0};
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
+#else
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
+
+} // namespace detail
 
 #ifndef ROCKET_MIN_LOG_LEVEL
 #ifdef NDEBUG
@@ -62,6 +86,7 @@ class Logger final : public Singleton<Logger> {
     // 256 KB ≅ 3500 entries @ 72 B/entry — plenty for burst absorption.
     static constexpr std::size_t kPerThreadQueueBytes = 256 * 1024;
     static constexpr std::size_t kDefaultFlushIntervalMs = 50;
+    static constexpr std::chrono::nanoseconds kDefaultBackendSleepDuration{100'000};
     static constexpr std::size_t kDefaultMaxFileSize = 1024ULL * 1024ULL * 1024ULL;
 
     struct LogEntry {
@@ -263,7 +288,7 @@ class Logger final : public Singleton<Logger> {
 
       public:
         std::uint64_t thread_id{0};
-        std::uint64_t timestamp_ns{0};
+        std::uint64_t timestamp_ticks{0};
         std::uint8_t level{0};
         // Numeric message IDs stay allocation-free in the async log record.
         std::uint64_t msgid{0};
@@ -280,6 +305,9 @@ class Logger final : public Singleton<Logger> {
         std::filesystem::path file_path{"./rocket_rpc.log"};
         std::size_t per_thread_queue_bytes{kPerThreadQueueBytes};
         std::size_t flush_interval_ms{kDefaultFlushIntervalMs};
+        // How long the backend waits between empty queue polls. Zero enables
+        // busy polling for latency benchmarks and dedicated logging cores.
+        std::chrono::nanoseconds backend_sleep_duration{kDefaultBackendSleepDuration};
         std::size_t max_file_size{kDefaultMaxFileSize};
         LogLevel level{LogLevel::Debug};
     };
@@ -361,13 +389,11 @@ class Logger final : public Singleton<Logger> {
     static constexpr std::size_t kMaxDequeuePerRound = 1024;       // ~150KB per round
     static constexpr std::size_t kWriteThreshold = 256ULL * 1024;  // batch to this size before ::write
     static constexpr std::size_t kWriteBufferReserve = 256ULL * 1024;
-    static constexpr std::uint32_t kNotifyEveryNEnqueue = 16;
-    static constexpr std::uint32_t kNotifyMask = kNotifyEveryNEnqueue - 1;
-
     // config
     std::size_t m_per_thread_bytes{kPerThreadQueueBytes};
     std::filesystem::path m_file_path;
     std::size_t m_flush_interval_ms{kDefaultFlushIntervalMs};
+    std::chrono::nanoseconds m_backend_sleep_duration{kDefaultBackendSleepDuration};
     std::size_t m_max_file_size{kDefaultMaxFileSize};
     std::atomic<bool> m_running{false};
     std::atomic<LogLevel> m_level{LogLevel::Debug};
@@ -375,7 +401,8 @@ class Logger final : public Singleton<Logger> {
 
     // clock calibration
     std::uint64_t m_epoch_ns{0};
-    std::chrono::steady_clock::time_point m_base_steady{};
+    std::uint64_t m_base_clock_ticks{0};
+    double m_nanoseconds_per_tick{1.0};
 
     // sync (destroyed AFTER thread/queues)
     std::mutex m_lifecycle_mutex;
@@ -405,7 +432,6 @@ class Logger final : public Singleton<Logger> {
 
     // counters
     std::atomic<std::uint64_t> m_dropped_count{0};
-    alignas(SpscBoundedQueue<LogEntry>::kCacheLine) std::atomic<std::uint32_t> m_enqueue_notify_counter{0};
 };
 
 template <typename... Args>
@@ -433,15 +459,7 @@ void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args
 #endif
     }();
 
-    // ── steady_clock based timestamp (saves ~30ns vs system_clock) ──────
-    const auto now_steady = std::chrono::steady_clock::now();
-    const std::uint64_t now_ns = m_epoch_ns +
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now_steady - m_base_steady).count());
-
-    constexpr std::uint64_t NS_PER_SEC = 1'000'000'000ULL;
-    const auto secs = static_cast<std::time_t>(now_ns / NS_PER_SEC);
-    const auto millis = static_cast<int>((now_ns % NS_PER_SEC) / 1'000'000ULL);
+    const std::uint64_t timestamp_ticks = detail::ReadLogClockTicks();
 
     // ── lazy-init per-thread SPSC queue ──────────────────────────────────
     static thread_local std::shared_ptr<ThreadSlot> t_slot;
@@ -457,7 +475,7 @@ void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args
     // ── capture metadata ───────────────────────────────────────────────
     auto& entry = *slot;
     entry.thread_id = cached_tid;
-    entry.timestamp_ns = now_ns;
+    entry.timestamp_ticks = timestamp_ticks;
     entry.level = static_cast<std::uint8_t>(level);
     auto* rt = RunTime::GetRunTime();
     entry.msgid = rt->m_msgid;
@@ -467,9 +485,6 @@ void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args
     entry.setArgs(fmt.str, std::forward<Args>(args)...);
 
     t_slot->queue->publish();
-
-    if ((m_enqueue_notify_counter.fetch_add(1, std::memory_order_relaxed) & kNotifyMask) == kNotifyMask)
-        m_consumer_cv.notify_one();
 }
 
 } // namespace rocket

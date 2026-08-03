@@ -209,6 +209,9 @@ int main() {
     options.file_path = "/tmp/rocket_log_hot_path.log";
     options.per_thread_queue_bytes = 256 * 1024;
     options.flush_interval_ms = 50;
+    // Quill's hot_path_latency benchmark sets BackendOptions::sleep_duration
+    // to zero so the measured producer path does not include wake-up costs.
+    options.backend_sleep_duration = std::chrono::nanoseconds::zero();
 
     auto& logger = rocket::Logger::getInstance();
     logger.start(options);

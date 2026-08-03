@@ -67,6 +67,34 @@ std::size_t NextPow2(std::size_t v) {
     return v + 1;
 }
 
+double CalibrateNanosecondsPerLogClockTick() {
+#if defined(__aarch64__)
+    std::uint64_t frequency{0};
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+    return frequency == 0 ? 1.0 : 1'000'000'000.0 / static_cast<double>(frequency);
+#elif defined(__x86_64__) || defined(__i386__)
+    // Calibrate once per process. A 20 ms window is long enough to make
+    // scheduler and clock-read noise insignificant for millisecond log output.
+    constexpr auto kWindow = std::chrono::milliseconds{20};
+    const auto begin_time = std::chrono::steady_clock::now();
+    const auto begin_ticks = detail::ReadLogClockTicks();
+    std::this_thread::sleep_until(begin_time + kWindow);
+    const auto end_ticks = detail::ReadLogClockTicks();
+    const auto end_time = std::chrono::steady_clock::now();
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                end_time - begin_time).count();
+    return static_cast<double>(elapsed_ns) /
+           static_cast<double>(end_ticks - begin_ticks);
+#else
+    return 1.0;
+#endif
+}
+
+double NanosecondsPerLogClockTick() {
+    static const double value = CalibrateNanosecondsPerLogClockTick();
+    return value;
+}
+
 } // namespace
 
 // ============================================================================
@@ -132,18 +160,22 @@ void Logger::start(const Options& opts) {
     m_slots.clear();
     m_poll_index = 0;
     m_generation.fetch_add(1, std::memory_order_release);
-    auto now_sys = std::chrono::system_clock::now();
-    m_base_steady = std::chrono::steady_clock::now();
+    m_nanoseconds_per_tick = NanosecondsPerLogClockTick();
+    const auto begin_ticks = detail::ReadLogClockTicks();
+    const auto now_sys = std::chrono::system_clock::now();
+    const auto end_ticks = detail::ReadLogClockTicks();
+    m_base_clock_ticks = begin_ticks + (end_ticks - begin_ticks) / 2;
     m_epoch_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now_sys.time_since_epoch()).count());
 
     m_file_path = opts.file_path;
     m_per_thread_bytes = std::max<std::size_t>(4096, opts.per_thread_queue_bytes);
     m_flush_interval_ms = std::max<std::size_t>(1, opts.flush_interval_ms);
+    m_backend_sleep_duration = std::max(opts.backend_sleep_duration,
+                                        std::chrono::nanoseconds::zero());
     m_max_file_size = std::max<std::size_t>(1, opts.max_file_size);
     m_level.store(opts.level, std::memory_order_release);
     m_dropped_count.store(0, std::memory_order_release);
-    m_enqueue_notify_counter.store(0, std::memory_order_release);
 
     m_running.store(true, std::memory_order_release);
     m_fmt_buf.reserve(kWriteBufferReserve);
@@ -234,7 +266,6 @@ void Logger::consumerRun() {
     closeLogFile(); openLogFile();
     std::string& wb = m_fmt_buf;
     LogEntry entry;
-    auto last_idle_wait = std::chrono::steady_clock::now();
 
     // Second-level cache for localtime_r.
     struct {
@@ -245,8 +276,11 @@ void Logger::consumerRun() {
 
     auto formatLine = [&](LogEntry& e) {
         constexpr std::uint64_t NS = 1'000'000'000ULL;
-        auto secs = static_cast<std::time_t>(e.timestamp_ns / NS);
-        int ms = static_cast<int>((e.timestamp_ns % NS) / 1'000'000ULL);
+        const auto elapsed_ticks = e.timestamp_ticks - m_base_clock_ticks;
+        const auto timestamp_ns = m_epoch_ns + static_cast<std::uint64_t>(
+            static_cast<double>(elapsed_ticks) * m_nanoseconds_per_tick);
+        auto secs = static_cast<std::time_t>(timestamp_ns / NS);
+        int ms = static_cast<int>((timestamp_ns % NS) / 1'000'000ULL);
         if (secs != dtc.last_sec) {
             std::tm tm_buf{};
             localtime_r(&secs, &tm_buf);
@@ -334,23 +368,18 @@ void Logger::consumerRun() {
                 continue;
             }
 
-            std::unique_lock<std::mutex> cvlk(m_consumer_mutex);
-            auto now = std::chrono::steady_clock::now();
-            auto rem = last_idle_wait + std::chrono::milliseconds(m_flush_interval_ms) - now;
-            if (rem <= std::chrono::milliseconds(0)) {
-                // Advance the idle deadline.  Leaving it in the past makes the
-                // consumer spin forever while repeatedly taking m_slot_mutex,
-                // which can starve newly starting IO threads.
-                last_idle_wait = now;
-                rem = std::chrono::milliseconds(m_flush_interval_ms);
+            if (m_backend_sleep_duration == std::chrono::nanoseconds::zero()) {
+                cpu_pause();
+                continue;
             }
-            m_consumer_cv.wait_for(cvlk, rem, [this]{
-                if (!m_running.load(std::memory_order_acquire) ||
-                    m_need_flush.load(std::memory_order_acquire)) return true;
-                std::lock_guard<std::mutex> lk(m_slot_mutex);
-                for (auto& slp : m_slots)
-                    if (slp && !slp->dead && !slp->queue->empty()) return true;
-                return false;
+
+            // Producers never touch a shared notification counter. Polling at
+            // a bounded interval keeps their hot path to one SPSC publish,
+            // while stop()/flush() can still wake this thread immediately.
+            std::unique_lock<std::mutex> cvlk(m_consumer_mutex);
+            m_consumer_cv.wait_for(cvlk, m_backend_sleep_duration, [this]{
+                return !m_running.load(std::memory_order_acquire) ||
+                       m_need_flush.load(std::memory_order_acquire);
             });
         }
     }
