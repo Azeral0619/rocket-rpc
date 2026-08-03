@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fmt/base.h>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -20,6 +21,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 #include <fmt/format.h>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -159,6 +161,7 @@ void Logger::start(const Options& opts) {
 
     m_slots.clear();
     m_poll_index = 0;
+    m_slot_version.fetch_add(1, std::memory_order_release);
     m_generation.fetch_add(1, std::memory_order_release);
     m_nanoseconds_per_tick = NanosecondsPerLogClockTick();
     const auto begin_ticks = detail::ReadLogClockTicks();
@@ -258,6 +261,7 @@ std::shared_ptr<Logger::ThreadSlot> Logger::registerThisThread() {
     slot->generation = m_generation.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lk(m_slot_mutex);
     m_slots.push_back(slot);
+    m_slot_version.fetch_add(1, std::memory_order_release);
     return slot;
 }
 
@@ -266,6 +270,19 @@ void Logger::consumerRun() {
     closeLogFile(); openLogFile();
     std::string& wb = m_fmt_buf;
     LogEntry entry;
+    std::vector<std::shared_ptr<ThreadSlot>> active_slots;
+    std::uint64_t active_slot_version = std::numeric_limits<std::uint64_t>::max();
+
+    auto refreshActiveSlots = [&](bool force = false) {
+        const auto version = m_slot_version.load(std::memory_order_acquire);
+        if (!force && version == active_slot_version) return;
+
+        std::lock_guard<std::mutex> lk(m_slot_mutex);
+        active_slots.assign(m_slots.begin(), m_slots.end());
+        active_slot_version = m_slot_version.load(std::memory_order_relaxed);
+        if (!active_slots.empty()) m_poll_index %= active_slots.size();
+        else m_poll_index = 0;
+    };
 
     // Second-level cache for localtime_r.
     struct {
@@ -314,22 +331,23 @@ void Logger::consumerRun() {
     auto batch = std::make_unique<LogEntry[]>(kMaxDequeuePerRound);
 
     while (m_running.load(std::memory_order_acquire)) {
+        refreshActiveSlots();
         std::size_t total = 0;
-        {
-            std::lock_guard<std::mutex> lk(m_slot_mutex);
-            std::size_t polled = 0;
-            std::size_t idx = m_poll_index % (m_slots.empty() ? 1 : m_slots.size());
-            while (!m_slots.empty() && polled < m_slots.size() && total < kMaxDequeuePerRound) {
-                auto& slp = m_slots[idx];
-                if (slp && !slp->dead) {
-                    while (total < kMaxDequeuePerRound && slp->queue->tryDequeue(batch[total]))
-                        ++total;
+        std::size_t polled = 0;
+        std::size_t idx = m_poll_index;
+        while (!active_slots.empty() && polled < active_slots.size() &&
+               total < kMaxDequeuePerRound) {
+            auto& slp = active_slots[idx];
+            if (slp && !slp->dead.load(std::memory_order_relaxed)) {
+                while (total < kMaxDequeuePerRound &&
+                       slp->queue->tryDequeue(batch[total])) {
+                    ++total;
                 }
-                idx = (idx + 1) % m_slots.size();
-                ++polled;
             }
-            m_poll_index = idx;
+            idx = (idx + 1) % active_slots.size();
+            ++polled;
         }
+        m_poll_index = idx;
 
         for (std::size_t i = 0; i < total; ++i)
             formatLine(batch[i]);
@@ -347,12 +365,14 @@ void Logger::consumerRun() {
                 }
             }
 
+            refreshActiveSlots();
             bool has_data = false;
-            {
-                std::lock_guard<std::mutex> lk(m_slot_mutex);
-                for (auto& slp : m_slots)
-                    if (slp && !slp->dead && !slp->queue->empty())
-                        { has_data = true; break; }
+            for (auto& slp : active_slots) {
+                if (slp && !slp->dead.load(std::memory_order_relaxed) &&
+                    !slp->queue->empty()) {
+                    has_data = true;
+                    break;
+                }
             }
             if (has_data || !m_running.load(std::memory_order_acquire)) {
                 continue;
@@ -385,16 +405,14 @@ void Logger::consumerRun() {
     }
 
     // Final drain
-    {
-        std::lock_guard<std::mutex> lk(m_slot_mutex);
-        for (auto& slp : m_slots) {
-            if (!slp) continue;
-            for (;;) {
-                std::size_t n = 0;
-                while (n < kMaxDequeuePerRound && slp->queue->tryDequeue(batch[n])) ++n;
-                if (n == 0) break;
-                for (std::size_t i = 0; i < n; ++i) formatLine(batch[i]);
-            }
+    refreshActiveSlots(true);
+    for (auto& slp : active_slots) {
+        if (!slp) continue;
+        for (;;) {
+            std::size_t n = 0;
+            while (n < kMaxDequeuePerRound && slp->queue->tryDequeue(batch[n])) ++n;
+            if (n == 0) break;
+            for (std::size_t i = 0; i < n; ++i) formatLine(batch[i]);
         }
     }
     {

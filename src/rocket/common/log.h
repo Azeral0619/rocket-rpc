@@ -372,7 +372,7 @@ class Logger final : public Singleton<Logger> {
         std::unique_ptr<SpscBoundedQueue<LogEntry>> queue;
         std::thread::id tid;
         std::uint64_t generation{0};
-        bool dead{false}; // guarded by m_slot_mutex
+        std::atomic<bool> dead{false};
     };
 
     friend class Singleton<Logger>;
@@ -411,6 +411,7 @@ class Logger final : public Singleton<Logger> {
 
     // per-thread queue registry
     std::atomic<std::uint64_t> m_generation{0};
+    std::atomic<std::uint64_t> m_slot_version{0};
     std::mutex m_slot_mutex;
     std::deque<std::shared_ptr<ThreadSlot>> m_slots;
     std::size_t m_poll_index{0};
