@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -35,6 +36,12 @@ struct AbstractProtocol : public std::enable_shared_from_this<AbstractProtocol> 
      * @return 协议类型字符串（如 "TinyPB", "HTTP"）
      */
     [[nodiscard]] virtual std::string_view getProtocolType() const = 0;
+
+    // Approximate bytes contributed to the wire/output buffer. Cross-thread
+    // write mailboxes use this for byte-based backpressure before encoding.
+    [[nodiscard]] virtual std::size_t estimatedWireSize() const noexcept {
+        return 1;
+    }
 
     MessageId m_msg_id{kInvalidMessageId}; ///< 消息唯一标识符（用于请求-响应匹配）
 };

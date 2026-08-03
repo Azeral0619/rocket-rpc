@@ -63,6 +63,10 @@ struct TinyPBProtocol : public AbstractProtocol {
     TinyPBProtocol& operator=(TinyPBProtocol&&) = default;
 
     [[nodiscard]] std::string_view getProtocolType() const override { return "TinyPB"; }
+    [[nodiscard]] std::size_t estimatedWireSize() const noexcept override {
+        return HEADER_SIZE + m_method_name.size() + m_err_info.size() +
+               pbDataView().size();
+    }
 
     // Incoming RPC frames can borrow their payload from TcpBuffer until the
     // connection's message callback returns. Generic TinyPBCoder users remain

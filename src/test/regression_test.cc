@@ -2,6 +2,7 @@
 #include "rocket/common/ecode.h"
 #include "rocket/common/log.h"
 #include "rocket/common/thread_pool.h"
+#include "rocket/net/coder/string_coder.h"
 #include "rocket/net/coder/tinypb_coder.h"
 #include "rocket/net/coder/tinypb_protocol.h"
 #include "rocket/net/event_loop.h"
@@ -14,6 +15,7 @@
 #include "rocket/net/tcp/tcp_acceptor.h"
 #include "rocket/net/tcp/tcp_buffer.h"
 #include "rocket/net/tcp/tcp_client.h"
+#include "rocket/net/tcp/tcp_connection.h"
 #include "rocket/net/timing_wheel.h"
 
 #include <arpa/inet.h>
@@ -29,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -265,6 +268,111 @@ void testBufferWritesContiguousBytesToFd() {
     require(input.retrieveAll() == "pong", "buffer direct-read corrupted bytes");
 
     ::close(fds[0]);
+    ::close(fds[1]);
+}
+
+void testEventLoopWriteMailboxHandlesConcurrentProducers() {
+    int fds[2] = {-1, -1};
+    require(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+            "write-mailbox socketpair failed");
+
+    constexpr int kProducerCount = 4;
+    constexpr int kMessagesPerProducer = 256;
+    constexpr std::size_t kMessageSize = 32;
+    constexpr std::size_t kExpectedBytes =
+        kProducerCount * kMessagesPerProducer * kMessageSize;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    rocket::EventLoop* loop = nullptr;
+    rocket::TcpConnection::s_ptr connection;
+    bool ready = false;
+
+    std::thread io_thread([&] {
+        rocket::EventLoop event_loop;
+        auto address =
+            std::make_shared<rocket::IPNetAddr>("127.0.0.1", 0);
+        auto owned_connection = std::make_shared<rocket::TcpConnection>(
+            &event_loop, fds[0], address, address,
+            std::make_unique<rocket::StringCoder>(),
+            rocket::TcpConnectionType::Server);
+        event_loop.queueInLoop([&] {
+            owned_connection->connectEstablished();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                loop = &event_loop;
+                connection = owned_connection;
+                ready = true;
+            }
+            cv.notify_one();
+        });
+
+        event_loop.loop();
+        owned_connection->connectDestroyed();
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        require(cv.wait_for(lock, 1s, [&] { return ready; }),
+                "write-mailbox EventLoop did not start");
+    }
+
+    std::vector<std::thread> producers;
+    producers.reserve(kProducerCount);
+    for (int producer = 0; producer < kProducerCount; ++producer) {
+        producers.emplace_back([connection, producer] {
+            const char marker = static_cast<char>('A' + producer);
+            for (int i = 0; i < kMessagesPerProducer; ++i) {
+                auto message = std::make_shared<rocket::StringProtocol>();
+                message->info.assign(kMessageSize, marker);
+                connection->send(std::move(message));
+            }
+        });
+    }
+    for (auto& producer : producers) producer.join();
+
+    std::string received;
+    received.reserve(kExpectedBytes);
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (received.size() < kExpectedBytes &&
+           std::chrono::steady_clock::now() < deadline) {
+        pollfd descriptor{fds[1], POLLIN, 0};
+        const int poll_result = ::poll(&descriptor, 1, 20);
+        if (poll_result < 0 && errno == EINTR) continue;
+        require(poll_result >= 0, "write-mailbox peer poll failed");
+        if (poll_result == 0 || (descriptor.revents & POLLIN) == 0) continue;
+
+        char buffer[4096];
+        const ssize_t bytes = ::read(fds[1], buffer, sizeof(buffer));
+        require(bytes > 0, "write-mailbox peer read failed");
+        received.append(buffer, static_cast<std::size_t>(bytes));
+    }
+
+    require(received.size() == kExpectedBytes,
+            "write mailbox lost cross-thread messages");
+    for (std::size_t offset = 0; offset < received.size();
+         offset += kMessageSize) {
+        const char marker = received[offset];
+        require(marker >= 'A' && marker < 'A' + kProducerCount,
+                "write mailbox corrupted a producer marker");
+        for (std::size_t i = 1; i < kMessageSize; ++i) {
+            require(received[offset + i] == marker,
+                    "write mailbox interleaved encoded messages");
+        }
+    }
+
+    const auto drain_deadline = std::chrono::steady_clock::now() + 1s;
+    while (loop->pendingWriteCount() != 0 &&
+           std::chrono::steady_clock::now() < drain_deadline) {
+        std::this_thread::yield();
+    }
+    require(loop->pendingWriteCount() == 0 &&
+                loop->pendingWriteBytes() == 0,
+            "write-mailbox reservations were not released");
+
+    loop->stop();
+    io_thread.join();
+    connection.reset();
     ::close(fds[1]);
 }
 
@@ -932,6 +1040,7 @@ int main() {
         testTinyPBRejectsMalformedFrames();
         testBufferOverflowIsExplicit();
         testBufferWritesContiguousBytesToFd();
+        testEventLoopWriteMailboxHandlesConcurrentProducers();
         testAcceptorDrainsWithoutBlocking();
         testLiteralLogFormatting();
         testDisabledLogDoesNotEvaluateArguments();

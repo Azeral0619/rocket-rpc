@@ -16,6 +16,19 @@ namespace {
 
 constexpr std::size_t kMaxReadPerRound = 64 * 1024;
 
+bool tryReserve(std::atomic<std::size_t>& counter, std::size_t amount,
+                std::size_t limit) noexcept {
+    std::size_t current = counter.load(std::memory_order_relaxed);
+    while (current <= limit && amount <= limit - current) {
+        if (counter.compare_exchange_weak(
+                current, current + amount, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 TcpConnection::TcpConnection(EventLoop* loop, int fd, NetAddr::s_ptr local_addr, NetAddr::s_ptr peer_addr,
@@ -135,18 +148,13 @@ void TcpConnection::send(AbstractProtocol::s_ptr message) {
         return;
     }
 
-    // Cross-thread fast path: push to MPSC lock-free queue.
-    // Only the first message in a batch schedules a drain callback;
-    // subsequent messages are picked up by the same drain.
-    auto* node = MpscNodePool::alloc<AbstractProtocol::s_ptr>(std::move(message));
-    m_write_queue.push(node);
-
-    bool expected = false;
-    if (m_write_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    // Connections sharing an EventLoop also share one bounded write mailbox.
+    // The owning IO thread remains the only mutator of m_out_buffer.
+    if (!m_loop->tryQueueWrite(shared_from_this(), std::move(message))) {
+        ROCKET_LOG_ERROR(
+            "EventLoop write mailbox overloaded, closing fd={}", m_fd);
         m_loop->queueInLoop([weak = weak_from_this()] {
-            if (auto conn = weak.lock()) {
-                conn->drainWriteQueue();
-            }
+            if (auto conn = weak.lock()) conn->handleError();
         });
     }
 }
@@ -154,6 +162,14 @@ void TcpConnection::send(AbstractProtocol::s_ptr message) {
 void TcpConnection::sendInLoop(AbstractProtocol::s_ptr message) {
     sendInLoopBatch(
         std::span<const AbstractProtocol::s_ptr>(&message, 1));
+}
+
+void TcpConnection::sendFromMailboxInLoop(AbstractProtocol::s_ptr message) {
+    m_loop->assertInLoopThread();
+    const bool previous_defer = m_defer_output_flush;
+    m_defer_output_flush = true;
+    sendInLoop(std::move(message));
+    m_defer_output_flush = previous_defer;
 }
 
 void TcpConnection::sendInLoopBatch(
@@ -197,44 +213,23 @@ void TcpConnection::sendInLoopBatch(
     }
 }
 
-void TcpConnection::drainWriteQueue() {
-    m_loop->assertInLoopThread();
-
-    // Collect drained messages and encode them all at once (batch encode).
-    // This avoids N per-message encode+enableWriting cycles.
-    for (int round = 0; round < 3; ++round) {
-        int batch = 0;
-        std::vector<AbstractProtocol::s_ptr> messages;
-        while (batch < 256) {
-            MpscNode* raw = m_write_queue.pop();
-            if (!raw) break;
-
-            auto* node = static_cast<TypedMpscNode<AbstractProtocol::s_ptr>*>(raw);
-            if (m_state.load(std::memory_order_acquire) == TcpState::Connected) {
-                messages.push_back(std::move(node->data));
-            }
-            MpscNodePool::free(node);
-            ++batch;
-        }
-        if (!messages.empty()) {
-            sendInLoopBatch(messages);
-        }
+bool TcpConnection::tryReserveMailboxWrite(std::size_t bytes) noexcept {
+    if (!tryReserve(m_mailbox_queued_messages, 1,
+                    kMaxMailboxQueuedMessages)) {
+        return false;
     }
-
-    m_write_queued.store(false, std::memory_order_release);
-
-    // Re-check: a producer may have pushed between the last pop and
-    // the store above.  If so, re-arm the drain.
-    if (!m_write_queue.empty()) {
-        bool expected = false;
-        if (m_write_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            m_loop->queueInLoop([weak = weak_from_this()] {
-                if (auto conn = weak.lock()) {
-                    conn->drainWriteQueue();
-                }
-            });
-        }
+    if (!tryReserve(m_mailbox_queued_bytes, bytes,
+                    kMaxMailboxQueuedBytes)) {
+        m_mailbox_queued_messages.fetch_sub(1,
+                                             std::memory_order_acq_rel);
+        return false;
     }
+    return true;
+}
+
+void TcpConnection::releaseMailboxWrite(std::size_t bytes) noexcept {
+    m_mailbox_queued_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+    m_mailbox_queued_messages.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void TcpConnection::scheduleOutputFlush() {

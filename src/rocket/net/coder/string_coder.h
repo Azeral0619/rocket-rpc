@@ -36,6 +36,9 @@ class StringProtocol : public AbstractProtocol {
     StringProtocol& operator=(StringProtocol&&) = default;
 
     [[nodiscard]] std::string_view getProtocolType() const override { return "String"; }
+    [[nodiscard]] std::size_t estimatedWireSize() const noexcept override {
+        return info.size();
+    }
 
     std::string info; ///< 消息内容
 };
