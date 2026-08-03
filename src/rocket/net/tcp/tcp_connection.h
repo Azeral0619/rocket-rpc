@@ -116,7 +116,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void drainWriteQueue();
     void discardWriteQueue() noexcept;
     [[nodiscard]] bool tryReserveWriteQueue(std::size_t bytes) noexcept;
-    void releaseWriteQueue(std::size_t bytes) noexcept;
+    void releaseWriteQueue(std::size_t messages, std::size_t bytes) noexcept;
     void handleWriteQueueOverload();
     void scheduleOutputFlush();
     [[nodiscard]] bool flushOutputInLoop();
@@ -153,8 +153,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // wait-free; the EventLoop (single consumer) drains in batch.
     MpscQueue m_write_queue;
     std::atomic<bool> m_write_queued{false};
-    std::atomic<std::size_t> m_queued_write_messages{0};
-    std::atomic<std::size_t> m_queued_write_bytes{0};
+    // High 32 bits: message count. Low 32 bits: estimated bytes. Packing both
+    // quotas turns two producer RMWs into one; the IO thread releases a whole
+    // drained batch with one RMW as well.
+    std::atomic<std::uint64_t> m_queued_write_state{0};
     std::atomic<bool> m_write_overload_queued{false};
     bool m_flush_queued{false};  // owning EventLoop thread only
     bool m_defer_output_flush{false};  // batch frames decoded by one read
@@ -167,6 +169,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     static constexpr std::size_t kDefaultBufferSize = 1024;
     static constexpr std::size_t kMaxQueuedWriteMessages = 4096;
     static constexpr std::size_t kMaxQueuedWriteBytes = 4ULL * 1024 * 1024;
+    static constexpr unsigned kQueuedWriteCountShift = 32;
+    static constexpr std::uint64_t kQueuedWriteBytesMask = 0xffffffffULL;
 };
 
 } // namespace rocket

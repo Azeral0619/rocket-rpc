@@ -218,18 +218,23 @@ void TcpConnection::drainWriteQueue() {
     messages.reserve(256);
     for (int round = 0; round < 3; ++round) {
         int batch = 0;
+        std::size_t drained_bytes = 0;
         messages.clear();
         while (batch < 256) {
             MpscNode* raw = m_write_queue.pop();
             if (!raw) break;
 
             auto* node = static_cast<TypedMpscNode<QueuedWrite>*>(raw);
-            releaseWriteQueue(node->data.estimated_bytes);
+            drained_bytes += node->data.estimated_bytes;
             if (m_state.load(std::memory_order_acquire) == TcpState::Connected) {
                 messages.push_back(std::move(node->data.message));
             }
             MpscNodePool::free(node);
             ++batch;
+        }
+        if (batch > 0) {
+            releaseWriteQueue(static_cast<std::size_t>(batch),
+                              drained_bytes);
         }
         if (!messages.empty()) {
             sendInLoopBatch(messages);
@@ -253,10 +258,16 @@ void TcpConnection::drainWriteQueue() {
 }
 
 void TcpConnection::discardWriteQueue() noexcept {
+    std::size_t discarded_messages = 0;
+    std::size_t discarded_bytes = 0;
     while (MpscNode* raw = m_write_queue.pop()) {
         auto* node = static_cast<TypedMpscNode<QueuedWrite>*>(raw);
-        releaseWriteQueue(node->data.estimated_bytes);
+        ++discarded_messages;
+        discarded_bytes += node->data.estimated_bytes;
         MpscNodePool::free(node);
+    }
+    if (discarded_messages > 0) {
+        releaseWriteQueue(discarded_messages, discarded_bytes);
     }
     m_write_queued.store(false, std::memory_order_relaxed);
 }
@@ -264,26 +275,29 @@ void TcpConnection::discardWriteQueue() noexcept {
 bool TcpConnection::tryReserveWriteQueue(std::size_t bytes) noexcept {
     if (bytes > kMaxQueuedWriteBytes) return false;
 
+    const std::uint64_t delta =
+        (std::uint64_t{1} << kQueuedWriteCountShift) |
+        static_cast<std::uint64_t>(bytes);
+    const std::uint64_t previous =
+        m_queued_write_state.fetch_add(delta, std::memory_order_relaxed);
     const std::size_t previous_messages =
-        m_queued_write_messages.fetch_add(1, std::memory_order_relaxed);
-    if (previous_messages >= kMaxQueuedWriteMessages) {
-        m_queued_write_messages.fetch_sub(1, std::memory_order_relaxed);
-        return false;
-    }
-
+        static_cast<std::size_t>(previous >> kQueuedWriteCountShift);
     const std::size_t previous_bytes =
-        m_queued_write_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    if (previous_bytes > kMaxQueuedWriteBytes - bytes) {
-        m_queued_write_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-        m_queued_write_messages.fetch_sub(1, std::memory_order_relaxed);
+        static_cast<std::size_t>(previous & kQueuedWriteBytesMask);
+    if (previous_messages >= kMaxQueuedWriteMessages ||
+        previous_bytes > kMaxQueuedWriteBytes - bytes) {
+        m_queued_write_state.fetch_sub(delta, std::memory_order_relaxed);
         return false;
     }
     return true;
 }
 
-void TcpConnection::releaseWriteQueue(std::size_t bytes) noexcept {
-    m_queued_write_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-    m_queued_write_messages.fetch_sub(1, std::memory_order_relaxed);
+void TcpConnection::releaseWriteQueue(std::size_t messages,
+                                      std::size_t bytes) noexcept {
+    const std::uint64_t delta =
+        (static_cast<std::uint64_t>(messages) << kQueuedWriteCountShift) |
+        static_cast<std::uint64_t>(bytes);
+    m_queued_write_state.fetch_sub(delta, std::memory_order_relaxed);
 }
 
 void TcpConnection::handleWriteQueueOverload() {
@@ -291,10 +305,12 @@ void TcpConnection::handleWriteQueueOverload() {
                                          std::memory_order_acq_rel)) {
         return;
     }
+    const std::uint64_t queued =
+        m_queued_write_state.load(std::memory_order_relaxed);
     ROCKET_LOG_ERROR(
         "connection write queue overloaded, closing fd={} queued={} bytes={}",
-        m_fd, m_queued_write_messages.load(std::memory_order_relaxed),
-        m_queued_write_bytes.load(std::memory_order_relaxed));
+        m_fd, queued >> kQueuedWriteCountShift,
+        queued & kQueuedWriteBytesMask);
     m_loop->queueInLoop([weak = weak_from_this()] {
         if (auto conn = weak.lock()) conn->handleError();
     });
