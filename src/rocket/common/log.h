@@ -501,18 +501,23 @@ class Logger final : public Singleton<Logger> {
         std::size_t m_capacity{0};
         std::unique_ptr<std::byte[]> m_buffer;
 
-        // Producer-owned state. The completed record is made visible by one
+        // Cross-thread cursors live on cache lines separate from both sides'
+        // private bookkeeping. The consumer polling published_write must not
+        // invalidate m_write/m_cached_read in the producer's L1 cache.
+        alignas(kCacheLine) std::atomic<std::size_t> m_published_write{0};
+
+        // Producer-owned state. A completed record is made visible by one
         // release store to published_write.
         alignas(kCacheLine) std::size_t m_write{0};
         std::size_t m_pending_write{0};
         std::size_t m_cached_read{0};
-        std::atomic<std::size_t> m_published_write{0};
+
+        alignas(kCacheLine) std::atomic<std::size_t> m_published_read{0};
 
         // Consumer-owned position. The producer refreshes published_read only
         // when its cached free-space calculation says the ring may be full.
         alignas(kCacheLine) std::size_t m_read{0};
         std::size_t m_cached_write{0};
-        std::atomic<std::size_t> m_published_read{0};
     };
 
     // ── Per-thread state ────────────────────────────────────────────────
@@ -525,14 +530,36 @@ class Logger final : public Singleton<Logger> {
     };
 
     struct ThreadLocalState {
-        std::shared_ptr<ThreadSlot> slot;
+        // The hot path uses only these raw, thread-local values. owner keeps
+        // the slot alive but its reference count is touched only by the slow
+        // registration/retirement paths.
+        SpscByteQueue* queue{nullptr};
+        RunTime* runtime{nullptr};
+        std::uint64_t thread_id{0};
+        std::uint64_t generation{0};
+        ThreadSlot* slot{nullptr};
+        std::shared_ptr<ThreadSlot> owner;
 
         ~ThreadLocalState() { retire(); }
+
+        void activate(std::shared_ptr<ThreadSlot> new_owner) noexcept {
+            owner = std::move(new_owner);
+            slot = owner.get();
+            queue = slot->queue.get();
+            runtime = slot->runtime;
+            thread_id = slot->thread_id;
+            generation = slot->generation;
+        }
 
         void retire() noexcept {
             if (!slot) return;
             slot->dead.store(true, std::memory_order_release);
-            slot.reset();
+            queue = nullptr;
+            runtime = nullptr;
+            thread_id = 0;
+            generation = 0;
+            slot = nullptr;
+            owner.reset();
         }
     };
 
@@ -542,7 +569,10 @@ class Logger final : public Singleton<Logger> {
     void consumerRun();
     void writeThreadRun();
     void ensureStarted();
-    static ThreadLocalState& threadLocalState();
+    [[nodiscard]] static ThreadLocalState& threadLocalState() noexcept {
+        static thread_local ThreadLocalState state;
+        return state;
+    }
     std::shared_ptr<ThreadSlot> registerThisThread();
     void openLogFile();
     void closeLogFile();
@@ -647,11 +677,11 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     // ── lazy-init per-thread SPSC queue ──────────────────────────────────
     auto& tls = threadLocalState();
     const auto generation = m_generation.load(std::memory_order_acquire);
-    if (!tls.slot || tls.slot->generation != generation) [[unlikely]] {
+    if (!tls.queue || tls.generation != generation) [[unlikely]] {
         tls.retire();
-        tls.slot = registerThisThread();
+        tls.activate(registerThisThread());
     }
-    auto* thread_slot = tls.slot.get();
+    auto* queue = tls.queue;
 
     const std::size_t payload_size = LogEntry::encodedPayloadSize(
         metadata != nullptr, args...);
@@ -663,7 +693,7 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     const std::size_t record_size =
         (sizeof(LogEntry) + payload_size + 7U) & ~std::size_t{7U};
 
-    auto* record = thread_slot->queue->tryClaim(record_size);
+    auto* record = queue->tryClaim(record_size);
     if (!record) [[unlikely]] {
         m_dropped_count.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -673,10 +703,10 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     auto* slot = ::new (static_cast<void*>(record)) LogEntry;
     auto& entry = *slot;
     entry.record_size = static_cast<std::uint32_t>(record_size);
-    entry.thread_id = thread_slot->thread_id;
+    entry.thread_id = tls.thread_id;
     entry.timestamp_ticks = timestamp_ticks;
     entry.level = static_cast<std::uint8_t>(level);
-    auto* rt = thread_slot->runtime;
+    auto* rt = tls.runtime;
     entry.msgid = rt->m_msgid;
     entry.method = rt->m_method;
     auto* payload = reinterpret_cast<char*>(record + sizeof(LogEntry));
@@ -688,7 +718,7 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
         entry.setArgs(payload, format, std::forward<Args>(args)...);
     }
 
-    thread_slot->queue->publish();
+    queue->publish();
 }
 
 } // namespace rocket

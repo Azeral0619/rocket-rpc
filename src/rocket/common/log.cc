@@ -356,11 +356,6 @@ bool Logger::shouldLog(LogLevel level) {
            static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed));
 }
 
-Logger::ThreadLocalState& Logger::threadLocalState() {
-    static thread_local ThreadLocalState state;
-    return state;
-}
-
 std::shared_ptr<Logger::ThreadSlot> Logger::registerThisThread() {
     auto slot = std::make_shared<ThreadSlot>();
     slot->queue = std::make_unique<SpscByteQueue>(m_per_thread_bytes);
