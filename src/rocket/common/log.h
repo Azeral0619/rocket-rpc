@@ -448,6 +448,12 @@ class Logger final : public Singleton<Logger> {
     void log(const LogMetadata* metadata, fmt::format_string<Args...> fmt,
              Args&&... args);
 
+    // Macro fast path: shouldLog() has already checked the current level and
+    // guarded argument evaluation. A first-use start still rechecks config.
+    template <typename... Args>
+    void logEnabled(const LogMetadata* metadata,
+                    fmt::format_string<Args...> fmt, Args&&... args);
+
     void flush();
 
     // Emergency flush: attempt to write all buffered data to disk.
@@ -465,6 +471,9 @@ class Logger final : public Singleton<Logger> {
     [[nodiscard]] bool shouldLog(LogLevel level);
     [[nodiscard]] std::uint64_t getDroppedCount() const noexcept {
         return m_dropped_count.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t getThreadQueueCount() const noexcept {
+        return m_thread_queue_count.load(std::memory_order_relaxed);
     }
 
   private:
@@ -509,9 +518,22 @@ class Logger final : public Singleton<Logger> {
     // ── Per-thread state ────────────────────────────────────────────────
     struct ThreadSlot {
         std::unique_ptr<SpscByteQueue> queue;
-        std::thread::id tid;
+        std::uint64_t thread_id{0};
+        RunTime* runtime{nullptr};
         std::uint64_t generation{0};
         std::atomic<bool> dead{false};
+    };
+
+    struct ThreadLocalState {
+        std::shared_ptr<ThreadSlot> slot;
+
+        ~ThreadLocalState() { retire(); }
+
+        void retire() noexcept {
+            if (!slot) return;
+            slot->dead.store(true, std::memory_order_release);
+            slot.reset();
+        }
     };
 
     friend class Singleton<Logger>;
@@ -520,12 +542,13 @@ class Logger final : public Singleton<Logger> {
     void consumerRun();
     void writeThreadRun();
     void ensureStarted();
+    static ThreadLocalState& threadLocalState();
     std::shared_ptr<ThreadSlot> registerThisThread();
     void openLogFile();
     void closeLogFile();
     void rotateIfNeeded();
 
-    template <typename... Args>
+    template <bool CheckLevel, typename... Args>
     void enqueue(LogLevel level, const LogMetadata* metadata,
                  fmt::string_view format, Args&&... args);
 
@@ -560,6 +583,7 @@ class Logger final : public Singleton<Logger> {
     std::mutex m_slot_mutex;
     std::deque<std::shared_ptr<ThreadSlot>> m_slots;
     std::size_t m_poll_index{0};
+    std::atomic<std::size_t> m_thread_queue_count{0};
 
     // consumer (format thread)
     std::jthread m_consumer;
@@ -582,20 +606,33 @@ class Logger final : public Singleton<Logger> {
 
 template <typename... Args>
 void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args) {
-    enqueue(level, nullptr, fmt.str, std::forward<Args>(args)...);
+    enqueue<true>(level, nullptr, fmt.str, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 void Logger::log(const LogMetadata* metadata, fmt::format_string<Args...> fmt,
                  Args&&... args) {
-    enqueue(metadata->level, metadata, fmt.str, std::forward<Args>(args)...);
+    enqueue<true>(metadata->level, metadata, fmt.str,
+                  std::forward<Args>(args)...);
 }
 
 template <typename... Args>
+void Logger::logEnabled(const LogMetadata* metadata,
+                        fmt::format_string<Args...> fmt, Args&&... args) {
+    enqueue<false>(metadata->level, metadata, fmt.str,
+                   std::forward<Args>(args)...);
+}
+
+template <bool CheckLevel, typename... Args>
 void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
                      fmt::string_view format, Args&&... args) {
-    if (static_cast<std::uint8_t>(level) < static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed)))
-        return;
+    if constexpr (CheckLevel) {
+        if (static_cast<std::uint8_t>(level) <
+            static_cast<std::uint8_t>(
+                m_level.load(std::memory_order_relaxed))) {
+            return;
+        }
+    }
     if (!m_running.load(std::memory_order_acquire)) [[unlikely]] {
         ensureStarted();
         // start() loads the configured level, which may be stricter than the
@@ -605,24 +642,16 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
             return;
     }
 
-    static thread_local std::uint64_t cached_tid = []() {
-#if defined(__linux__)
-        return static_cast<std::uint64_t>(::syscall(SYS_gettid));
-#elif defined(_WIN32)
-        return static_cast<std::uint64_t>(::GetCurrentThreadId());
-#elif defined(__APPLE__)
-        std::uint64_t tid{0}; ::pthread_threadid_np(nullptr, &tid); return tid;
-#else
-        return std::hash<std::thread::id>{}(std::this_thread::get_id());
-#endif
-    }();
-
     const std::uint64_t timestamp_ticks = detail::ReadLogClockTicks();
 
     // ── lazy-init per-thread SPSC queue ──────────────────────────────────
-    static thread_local std::shared_ptr<ThreadSlot> t_slot;
-    if (!t_slot || t_slot->generation != m_generation.load(std::memory_order_acquire)) [[unlikely]]
-        t_slot = registerThisThread();
+    auto& tls = threadLocalState();
+    const auto generation = m_generation.load(std::memory_order_acquire);
+    if (!tls.slot || tls.slot->generation != generation) [[unlikely]] {
+        tls.retire();
+        tls.slot = registerThisThread();
+    }
+    auto* thread_slot = tls.slot.get();
 
     const std::size_t payload_size = LogEntry::encodedPayloadSize(
         metadata != nullptr, args...);
@@ -634,7 +663,7 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     const std::size_t record_size =
         (sizeof(LogEntry) + payload_size + 7U) & ~std::size_t{7U};
 
-    auto* record = t_slot->queue->tryClaim(record_size);
+    auto* record = thread_slot->queue->tryClaim(record_size);
     if (!record) [[unlikely]] {
         m_dropped_count.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -644,10 +673,10 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     auto* slot = ::new (static_cast<void*>(record)) LogEntry;
     auto& entry = *slot;
     entry.record_size = static_cast<std::uint32_t>(record_size);
-    entry.thread_id = cached_tid;
+    entry.thread_id = thread_slot->thread_id;
     entry.timestamp_ticks = timestamp_ticks;
     entry.level = static_cast<std::uint8_t>(level);
-    auto* rt = RunTime::GetRunTime();
+    auto* rt = thread_slot->runtime;
     entry.msgid = rt->m_msgid;
     entry.method = rt->m_method;
     auto* payload = reinterpret_cast<char*>(record + sizeof(LogEntry));
@@ -659,7 +688,7 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
         entry.setArgs(payload, format, std::forward<Args>(args)...);
     }
 
-    t_slot->queue->publish();
+    thread_slot->queue->publish();
 }
 
 } // namespace rocket
@@ -671,7 +700,7 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
             [&]<typename... RocketLogArgs>(RocketLogArgs&&... rocket_log_args) {               \
                 static constexpr auto rocket_log_metadata =                                   \
                     ::rocket::Logger::makeLogMetadata<RocketLogArgs...>(format, log_level);    \
-                rocket_log_instance.log(                                                      \
+                rocket_log_instance.logEnabled(                                               \
                     &rocket_log_metadata, format,                                              \
                     std::forward<RocketLogArgs>(rocket_log_args)...);                          \
             }(__VA_ARGS__);                                                                   \

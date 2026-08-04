@@ -482,6 +482,53 @@ void testDisabledLogDoesNotEvaluateArguments() {
     require(!evaluated, "disabled log evaluated its arguments");
 }
 
+void testLoggerReusesAndReclaimsThreadQueue() {
+    auto& logger = rocket::Logger::getInstance();
+    logger.stop();
+    rocket::Logger::Options options;
+    options.file_path = "/dev/null";
+    options.level = rocket::LogLevel::Info;
+    logger.start(options);
+
+    std::atomic<bool> producer_ready{false};
+    std::atomic<bool> release_producer{false};
+    std::thread producer([&] {
+        ROCKET_LOG_INFO("literal");
+        ROCKET_LOG_INFO("integer={}", 42);
+        ROCKET_LOG_INFO("double={}", 3.25);
+        ROCKET_LOG_INFO("string={}", std::string{"payload"});
+        producer_ready.store(true, std::memory_order_release);
+        while (!release_producer.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    const auto ready_deadline = std::chrono::steady_clock::now() + 1s;
+    while (!producer_ready.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        std::this_thread::yield();
+    }
+    const bool used_one_queue =
+        producer_ready.load(std::memory_order_acquire) &&
+        logger.getThreadQueueCount() == 1;
+
+    release_producer.store(true, std::memory_order_release);
+    producer.join();
+
+    const auto reclaim_deadline = std::chrono::steady_clock::now() + 1s;
+    while (logger.getThreadQueueCount() != 0 &&
+           std::chrono::steady_clock::now() < reclaim_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const bool reclaimed_queue = logger.getThreadQueueCount() == 0;
+    logger.stop();
+
+    require(used_one_queue,
+            "one producer allocated multiple logger queues by argument type");
+    require(reclaimed_queue,
+            "logger did not reclaim a drained queue after thread exit");
+}
+
 void testTimingWheelKeepsPartialTicks() {
     rocket::TimingWheel wheel;
     std::atomic<bool> fired{false};
@@ -1077,6 +1124,7 @@ int main() {
         testLiteralLogFormatting();
         testTypedLogFormatting();
         testDisabledLogDoesNotEvaluateArguments();
+        testLoggerReusesAndReclaimsThreadQueue();
         testTimingWheelKeepsPartialTicks();
         testTimingWheelEagerlyRemovesLongCancelledTimer();
         testTimingWheelEagerlyRemovesShortCancelledTimer();

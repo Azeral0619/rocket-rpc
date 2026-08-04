@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cstddef>
 #include <cstring>
 #include <csignal>
@@ -116,6 +117,34 @@ void PinCurrentThread(int cpu) noexcept {
 #endif
 }
 
+std::uint64_t CurrentNativeThreadId() noexcept {
+#if defined(__linux__)
+    return static_cast<std::uint64_t>(::syscall(SYS_gettid));
+#elif defined(_WIN32)
+    return static_cast<std::uint64_t>(::GetCurrentThreadId());
+#elif defined(__APPLE__)
+    std::uint64_t tid{0};
+    ::pthread_threadid_np(nullptr, &tid);
+    return tid;
+#else
+    return std::hash<std::thread::id>{}(std::this_thread::get_id());
+#endif
+}
+
+template <typename UInt>
+void AppendUnsigned(std::string& output, UInt value) {
+    char buffer[32];
+    const auto [end, error] =
+        std::to_chars(std::begin(buffer), std::end(buffer), value);
+    if (error == std::errc{}) output.append(buffer, end);
+}
+
+void AppendMilliseconds(std::string& output, int milliseconds) {
+    output.push_back(static_cast<char>('0' + milliseconds / 100));
+    output.push_back(static_cast<char>('0' + (milliseconds / 10) % 10));
+    output.push_back(static_cast<char>('0' + milliseconds % 10));
+}
+
 } // namespace
 
 // ============================================================================
@@ -126,7 +155,9 @@ Logger::SpscByteQueue::SpscByteQueue(std::size_t capacity_bytes) {
     const auto n = NextPow2(std::max<std::size_t>(capacity_bytes, 4096));
     m_capacity = n;
     m_mask = n - 1;
-    m_buffer = std::make_unique<std::byte[]>(n);
+    // The consumer only reads bytes after the producer's release publish, so
+    // eagerly zeroing a newly registered thread's whole queue is unnecessary.
+    m_buffer.reset(new std::byte[n]);
 }
 
 std::byte* Logger::SpscByteQueue::tryClaim(std::size_t record_size) {
@@ -228,6 +259,7 @@ void Logger::start(const Options& opts) {
     if (m_running.load(std::memory_order_acquire)) return;
 
     m_slots.clear();
+    m_thread_queue_count.store(0, std::memory_order_relaxed);
     m_poll_index = 0;
     m_slot_version.fetch_add(1, std::memory_order_release);
     m_generation.fetch_add(1, std::memory_order_release);
@@ -324,13 +356,20 @@ bool Logger::shouldLog(LogLevel level) {
            static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed));
 }
 
+Logger::ThreadLocalState& Logger::threadLocalState() {
+    static thread_local ThreadLocalState state;
+    return state;
+}
+
 std::shared_ptr<Logger::ThreadSlot> Logger::registerThisThread() {
     auto slot = std::make_shared<ThreadSlot>();
     slot->queue = std::make_unique<SpscByteQueue>(m_per_thread_bytes);
-    slot->tid = std::this_thread::get_id();
+    slot->thread_id = CurrentNativeThreadId();
+    slot->runtime = RunTime::GetRunTime();
     slot->generation = m_generation.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lk(m_slot_mutex);
     m_slots.push_back(slot);
+    m_thread_queue_count.fetch_add(1, std::memory_order_relaxed);
     m_slot_version.fetch_add(1, std::memory_order_release);
     return slot;
 }
@@ -352,6 +391,29 @@ void Logger::consumerRun() {
         active_slot_version = m_slot_version.load(std::memory_order_relaxed);
         if (!active_slots.empty()) m_poll_index %= active_slots.size();
         else m_poll_index = 0;
+    };
+
+    auto reclaimDeadSlots = [&] {
+        std::size_t reclaimed = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_slot_mutex);
+            for (auto it = m_slots.begin(); it != m_slots.end();) {
+                auto& slot = *it;
+                if (slot && slot->dead.load(std::memory_order_acquire) &&
+                    slot->queue->empty()) {
+                    it = m_slots.erase(it);
+                    ++reclaimed;
+                } else {
+                    ++it;
+                }
+            }
+            if (reclaimed != 0) {
+                m_thread_queue_count.fetch_sub(reclaimed,
+                                               std::memory_order_relaxed);
+                m_slot_version.fetch_add(1, std::memory_order_release);
+            }
+        }
+        if (reclaimed != 0) refreshActiveSlots(true);
     };
 
     // Second-level cache for localtime_r.
@@ -377,16 +439,28 @@ void Logger::consumerRun() {
                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
             dtc.len = r.size; dtc.last_sec = secs;
         }
-        fmt::format_to(std::back_inserter(wb), "{}.{:03d} [{}] [tid={}]",
-            std::string_view(dtc.buf.data(), dtc.len), ms,
-            LogLevelToString(e.hasStaticMetadata()
-                ? e.metadata->level
-                : static_cast<LogLevel>(e.level)), e.thread_id);
-        if (e.msgid != 0)
-            fmt::format_to(std::back_inserter(wb), " [msgid={}]", e.msgid);
-        if (e.method != nullptr)
-            fmt::format_to(std::back_inserter(wb), " [method={}]",
-                           e.method->full_name());
+        wb.append(dtc.buf.data(), dtc.len);
+        wb.push_back('.');
+        AppendMilliseconds(wb, ms);
+        wb.append(" [");
+        const auto level = LogLevelToString(e.hasStaticMetadata()
+            ? e.metadata->level
+            : static_cast<LogLevel>(e.level));
+        wb.append(level.data(), level.size());
+        wb.append("] [tid=");
+        AppendUnsigned(wb, e.thread_id);
+        wb.push_back(']');
+        if (e.msgid != 0) {
+            wb.append(" [msgid=");
+            AppendUnsigned(wb, e.msgid);
+            wb.push_back(']');
+        }
+        if (e.method != nullptr) {
+            const auto& method_name = e.method->full_name();
+            wb.append(" [method=");
+            wb.append(method_name.data(), method_name.size());
+            wb.push_back(']');
+        }
         wb.push_back(' ');
         e.runFormat(wb, reinterpret_cast<const char*>(std::addressof(e)) +
                             sizeof(LogEntry));
@@ -410,7 +484,7 @@ void Logger::consumerRun() {
         while (!active_slots.empty() && polled < active_slots.size() &&
                total < kMaxDequeuePerRound) {
             auto& slp = active_slots[idx];
-            if (slp && !slp->dead.load(std::memory_order_relaxed)) {
+            if (slp) {
                 while (total < kMaxDequeuePerRound) {
                     auto* entry = slp->queue->front();
                     if (entry == nullptr) break;
@@ -437,11 +511,11 @@ void Logger::consumerRun() {
                 }
             }
 
+            reclaimDeadSlots();
             refreshActiveSlots();
             bool has_data = false;
             for (auto& slp : active_slots) {
-                if (slp && !slp->dead.load(std::memory_order_relaxed) &&
-                    !slp->queue->empty()) {
+                if (slp && !slp->queue->empty()) {
                     has_data = true;
                     break;
                 }
