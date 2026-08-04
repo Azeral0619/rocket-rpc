@@ -202,8 +202,10 @@ void runBenchmark(int thread_count, double nanoseconds_per_tick) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::filesystem::remove("/tmp/rocket_log_hot_path.log");
+
+    const bool pin_backend = argc > 1 && std::string_view(argv[1]) == "pin";
 
     rocket::Logger::Options options;
     options.file_path = "/tmp/rocket_log_hot_path.log";
@@ -212,13 +214,21 @@ int main() {
     // Quill's hot_path_latency benchmark sets BackendOptions::sleep_duration
     // to zero so the measured producer path does not include wake-up costs.
     options.backend_sleep_duration = std::chrono::nanoseconds::zero();
+    if (pin_backend) {
+        // Producers occupy CPUs 1-4. Keep formatting and disk writes on
+        // separate CPUs so they cannot preempt the measured hot path.
+        options.backend_cpu_affinity = 5;
+        options.writer_cpu_affinity = 6;
+    }
 
     auto& logger = rocket::Logger::getInstance();
     logger.start(options);
 
     const double nanoseconds_per_tick = calibrateNanosecondsPerTick();
     std::cout << "Quill-compatible hot-path benchmark"
-              << " ns_per_tick=" << nanoseconds_per_tick << "\n";
+              << " ns_per_tick=" << nanoseconds_per_tick
+              << " backend_affinity=" << (pin_backend ? "5/6" : "off")
+              << "\n";
     runBenchmark(1, nanoseconds_per_tick);
     runBenchmark(4, nanoseconds_per_tick);
 

@@ -24,6 +24,11 @@
 #include <vector>
 #include <fmt/format.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #if defined(__x86_64__) || defined(__i386__)
 #include <emmintrin.h>
 #define cpu_pause() _mm_pause();
@@ -95,6 +100,18 @@ double CalibrateNanosecondsPerLogClockTick() {
 double NanosecondsPerLogClockTick() {
     static const double value = CalibrateNanosecondsPerLogClockTick();
     return value;
+}
+
+void PinCurrentThread(int cpu) noexcept {
+#if defined(__linux__)
+    if (cpu < 0 || cpu >= CPU_SETSIZE) return;
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#else
+    (void)cpu;
+#endif
 }
 
 } // namespace
@@ -176,6 +193,8 @@ void Logger::start(const Options& opts) {
     m_flush_interval_ms = std::max<std::size_t>(1, opts.flush_interval_ms);
     m_backend_sleep_duration = std::max(opts.backend_sleep_duration,
                                         std::chrono::nanoseconds::zero());
+    m_backend_cpu_affinity = opts.backend_cpu_affinity;
+    m_writer_cpu_affinity = opts.writer_cpu_affinity;
     m_max_file_size = std::max<std::size_t>(1, opts.max_file_size);
     m_level.store(opts.level, std::memory_order_release);
     m_dropped_count.store(0, std::memory_order_release);
@@ -267,6 +286,7 @@ std::shared_ptr<Logger::ThreadSlot> Logger::registerThisThread() {
 
 
 void Logger::consumerRun() {
+    PinCurrentThread(m_backend_cpu_affinity);
     closeLogFile(); openLogFile();
     std::string& wb = m_fmt_buf;
     LogEntry entry;
@@ -426,6 +446,7 @@ void Logger::consumerRun() {
 }
 
 void Logger::writeThreadRun() {
+    PinCurrentThread(m_writer_cpu_affinity);
     std::string buf;
     buf.reserve(kWriteBufferReserve);
     auto last_flush = std::chrono::steady_clock::now();

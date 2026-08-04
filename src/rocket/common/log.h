@@ -308,6 +308,10 @@ class Logger final : public Singleton<Logger> {
         // How long the backend waits between empty queue polls. Zero enables
         // busy polling for latency benchmarks and dedicated logging cores.
         std::chrono::nanoseconds backend_sleep_duration{kDefaultBackendSleepDuration};
+        // Linux-only optional CPU affinity. Negative values leave scheduling
+        // to the OS, which remains the production default.
+        int backend_cpu_affinity{-1};
+        int writer_cpu_affinity{-1};
         std::size_t max_file_size{kDefaultMaxFileSize};
         LogLevel level{LogLevel::Debug};
     };
@@ -394,6 +398,8 @@ class Logger final : public Singleton<Logger> {
     std::filesystem::path m_file_path;
     std::size_t m_flush_interval_ms{kDefaultFlushIntervalMs};
     std::chrono::nanoseconds m_backend_sleep_duration{kDefaultBackendSleepDuration};
+    int m_backend_cpu_affinity{-1};
+    int m_writer_cpu_affinity{-1};
     std::size_t m_max_file_size{kDefaultMaxFileSize};
     std::atomic<bool> m_running{false};
     std::atomic<LogLevel> m_level{LogLevel::Debug};
