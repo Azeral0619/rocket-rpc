@@ -440,8 +440,13 @@ void testLiteralLogFormatting() {
 void testTypedLogFormatting() {
     rocket::Logger::LogEntry entry;
     const std::string large(96, 'x');
-    entry.setArgs(
+    static constexpr auto metadata = rocket::Logger::makeLogMetadata<
+        int, unsigned, std::int64_t, std::uint64_t, unsigned, double, bool,
+        char, const std::string&, std::string_view>(
         "i={} u={} i64={} u64={} hex={:02x} d={:.2f} b={} c={} s={} sv={}",
+        rocket::LogLevel::Info);
+    entry.setArgs(
+        &metadata,
         -7, 9U, std::int64_t{-11}, std::uint64_t{13}, 0x0aU, 3.25,
         true, 'z', large, std::string_view{"tail"});
     std::string output;

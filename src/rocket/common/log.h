@@ -91,8 +91,10 @@ class Logger final : public Singleton<Logger> {
     static constexpr std::size_t kDefaultMaxFileSize = 1024ULL * 1024ULL * 1024ULL;
 
     struct LogMetadata {
+        using FormatFn = void (*)(std::string&, fmt::string_view, const char*);
         fmt::string_view format;
         LogLevel level;
+        FormatFn format_fn;
     };
 
     struct LogEntry {
@@ -107,7 +109,7 @@ class Logger final : public Singleton<Logger> {
 
         template <typename... Args>
         void setArgs(fmt::string_view fmt, Args&&... args) {
-            metadata = nullptr;
+            has_static_metadata = false;
             fmt_ptr = fmt.data();
             fmt_len = static_cast<std::uint16_t>(fmt.size());
             encodeArgs(std::forward<Args>(args)...);
@@ -115,12 +117,13 @@ class Logger final : public Singleton<Logger> {
 
         template <typename... Args>
         void setArgs(const LogMetadata* static_metadata, Args&&... args) {
+            has_static_metadata = true;
             metadata = static_metadata;
-            encodeArgs(std::forward<Args>(args)...);
+            encodeStaticArgs(std::forward<Args>(args)...);
         }
 
         void runFormat(std::string& out) {
-            const auto format = metadata != nullptr
+            const auto format = has_static_metadata
                 ? metadata->format
                 : fmt::string_view(fmt_ptr, fmt_len);
             if (num_args == 0) {
@@ -129,22 +132,38 @@ class Logger final : public Singleton<Logger> {
             }
             auto* data = heap_allocated ? arg_data : fmt_data;
             const int n = static_cast<int>(num_args);
-            const auto* tags = reinterpret_cast<const uint8_t*>(data);
-            const char* p = alignPtr(data + n, 8);
+            if (has_static_metadata) {
+                metadata->format_fn(out, format, data);
+            } else {
+                const auto* tags = reinterpret_cast<const uint8_t*>(data);
+                const char* p = alignPtr(data + n, 8);
 
-            fmt::basic_format_arg<fmt::format_context> decoded[15];
-            for (int i = 0; i < n; ++i)
-                p = decodeOneArg(p, static_cast<ArgType>(tags[i]), decoded[i]);
+                fmt::basic_format_arg<fmt::format_context> decoded[15];
+                for (int i = 0; i < n; ++i)
+                    p = decodeOneArg(p, static_cast<ArgType>(tags[i]), decoded[i]);
 
-            fmt::basic_format_args<fmt::format_context> fargs(decoded, n);
-            fmt::vformat_to(std::back_inserter(out),
-                format, fargs);
+                fmt::basic_format_args<fmt::format_context> fargs(decoded, n);
+                fmt::vformat_to(std::back_inserter(out), format, fargs);
+            }
 
             if (heap_allocated) {
                 delete[] arg_data;
                 arg_data = fmt_data;
                 heap_allocated = false;
             }
+        }
+
+        template <typename... Args>
+        static void runStaticFormat(std::string& out, fmt::string_view format,
+                                    const char* data) {
+            constexpr std::size_t count = sizeof...(Args);
+            std::array<fmt::basic_format_arg<fmt::format_context>, count> decoded;
+            const char* p = data;
+            std::size_t index = 0;
+            ((p = decodeTypedArg<Args>(p, decoded[index++])), ...);
+            fmt::basic_format_args<fmt::format_context> fargs(decoded.data(),
+                                                               count);
+            fmt::vformat_to(std::back_inserter(out), format, fargs);
         }
 
       private:
@@ -326,6 +345,34 @@ class Logger final : public Singleton<Logger> {
             (encodeOneArg(p, std::forward<Args>(args)), ...);
         }
 
+        template <typename... Args>
+        void encodeStaticArgs(Args&&... args) {
+            constexpr std::size_t count = sizeof...(Args);
+            static_assert(count <= 15, "async logger supports at most 15 arguments");
+            num_args = static_cast<std::uint8_t>(count);
+            heap_allocated = false;
+            arg_data = fmt_data;
+            if constexpr (count == 0) return;
+
+            std::size_t total = 0;
+            ((total += encodedSize(args)), ...);
+            char* dst = fmt_data;
+            if (total > kFmtStorageSize) {
+                heap_allocated = true;
+                dst = new char[total];
+                arg_data = dst;
+            }
+            char* p = dst;
+            (encodeOneArg(p, std::forward<Args>(args)), ...);
+        }
+
+        template <typename T>
+        static const char* decodeTypedArg(
+            const char* p,
+            fmt::basic_format_arg<fmt::format_context>& out) {
+            return decodeOneArg(p, argType<T>(), out);
+        }
+
         static const char* decodeOneArg(const char* p, ArgType tag,
                                         fmt::basic_format_arg<fmt::format_context>& out) {
             switch (tag) {
@@ -353,7 +400,10 @@ class Logger final : public Singleton<Logger> {
         }
 
       public:
-        const LogMetadata* metadata{nullptr};
+        union {
+            const LogMetadata* metadata{nullptr};
+            const char* fmt_ptr;
+        };
         std::uint64_t thread_id{0};
         std::uint64_t timestamp_ticks{0};
         std::uint8_t level{0};
@@ -362,11 +412,18 @@ class Logger final : public Singleton<Logger> {
         std::string method_name;
         std::uint8_t num_args{0};
         bool heap_allocated{false};
-        const char* fmt_ptr{nullptr};
+        bool has_static_metadata{false};
         std::uint16_t fmt_len{0};
         char* arg_data{fmt_data};
         alignas(std::max_align_t) char fmt_data[kFmtStorageSize];
     };
+
+    template <typename... Args>
+    static constexpr LogMetadata makeLogMetadata(fmt::string_view format,
+                                                  LogLevel level) {
+        return LogMetadata{format, level,
+                           &LogEntry::template runStaticFormat<Args...>};
+    }
 
     struct Options {
         std::filesystem::path file_path{"./rocket_rpc.log"};
@@ -591,9 +648,13 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     do {                                                                                      \
         auto& rocket_log_instance = ::rocket::Logger::getInstance();                          \
         if (rocket_log_instance.shouldLog(log_level)) {                                       \
-            static constexpr ::rocket::Logger::LogMetadata rocket_log_metadata{               \
-                format, log_level};                                                           \
-            rocket_log_instance.log(&rocket_log_metadata, format, ##__VA_ARGS__);              \
+            [&]<typename... RocketLogArgs>(RocketLogArgs&&... rocket_log_args) {               \
+                static constexpr auto rocket_log_metadata =                                   \
+                    ::rocket::Logger::makeLogMetadata<RocketLogArgs...>(format, log_level);    \
+                rocket_log_instance.log(                                                      \
+                    &rocket_log_metadata, format,                                              \
+                    std::forward<RocketLogArgs>(rocket_log_args)...);                          \
+            }(__VA_ARGS__);                                                                   \
         }                                                                                     \
     } while (false)
 

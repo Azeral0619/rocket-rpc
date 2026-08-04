@@ -329,7 +329,7 @@ void Logger::consumerRun() {
         }
         fmt::format_to(std::back_inserter(wb), "{}.{:03d} [{}] [tid={}]",
             std::string_view(dtc.buf.data(), dtc.len), ms,
-            LogLevelToString(e.metadata != nullptr
+            LogLevelToString(e.has_static_metadata
                 ? e.metadata->level
                 : static_cast<LogLevel>(e.level)), e.thread_id);
         if (e.msgid != 0)
