@@ -205,7 +205,14 @@ void runBenchmark(int thread_count, double nanoseconds_per_tick) {
 int main(int argc, char** argv) {
     std::filesystem::remove("/tmp/rocket_log_hot_path.log");
 
-    const bool pin_backend = argc > 1 && std::string_view(argv[1]) == "pin";
+    bool pin_backend = false;
+    int selected_threads = 0;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg{argv[i]};
+        if (arg == "pin") pin_backend = true;
+        else if (arg == "1") selected_threads = 1;
+        else if (arg == "4") selected_threads = 4;
+    }
 
     rocket::Logger::Options options;
     options.file_path = "/tmp/rocket_log_hot_path.log";
@@ -229,8 +236,10 @@ int main(int argc, char** argv) {
               << " ns_per_tick=" << nanoseconds_per_tick
               << " backend_affinity=" << (pin_backend ? "5/6" : "off")
               << "\n";
-    runBenchmark(1, nanoseconds_per_tick);
-    runBenchmark(4, nanoseconds_per_tick);
+    if (selected_threads == 0 || selected_threads == 1)
+        runBenchmark(1, nanoseconds_per_tick);
+    if (selected_threads == 0 || selected_threads == 4)
+        runBenchmark(4, nanoseconds_per_tick);
 
     logger.stop();
     std::filesystem::remove("/tmp/rocket_log_hot_path.log");
