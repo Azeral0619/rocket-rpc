@@ -2,11 +2,8 @@
 
 namespace rocket {
 
-RunTime* RunTime::GetRunTime() {
-    static thread_local RunTime runtime;
-    return &runtime;
+RpcInterface* RunTime::getRpcInterface() const noexcept {
+    return m_rpc_interface;
 }
-
-RpcInterface* RunTime::getRpcInterface() const { return m_rpc_interface; }
 
 } // namespace rocket

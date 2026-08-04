@@ -11,10 +11,12 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fmt/base.h>
+#include <google/protobuf/descriptor.h>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -117,53 +119,104 @@ void PinCurrentThread(int cpu) noexcept {
 } // namespace
 
 // ============================================================================
-// SPSC Bounded Queue
+// Variable-length SPSC byte ring
 // ============================================================================
 
-template <typename T>
-Logger::SpscBoundedQueue<T>::SpscBoundedQueue(std::size_t cap) {
-    auto n = NextPow2(std::max<std::size_t>(cap, 2));
-    m_capacity = n; m_mask = n - 1;
-    m_buffer.reset(new Cell[n]);
-    for (std::size_t i = 0; i < n; ++i)
-        m_buffer[i].sequence.store(i, std::memory_order_relaxed);
+Logger::SpscByteQueue::SpscByteQueue(std::size_t capacity_bytes) {
+    const auto n = NextPow2(std::max<std::size_t>(capacity_bytes, 4096));
+    m_capacity = n;
+    m_mask = n - 1;
+    m_buffer = std::make_unique<std::byte[]>(n);
 }
 
-template <typename T>
-T* Logger::SpscBoundedQueue<T>::tryClaim() {
-    std::size_t pos = m_pos;
-    Cell& c = m_buffer[pos & m_mask];
-    if (static_cast<std::intptr_t>(c.sequence.load(std::memory_order_acquire)) < static_cast<std::intptr_t>(pos))
+Logger::LogEntry* Logger::SpscByteQueue::tryClaim(std::size_t record_size) {
+    record_size = (record_size + 7U) & ~std::size_t{7U};
+    if (record_size < sizeof(LogEntry) ||
+        record_size > m_capacity) {
         return nullptr;
-    m_pos = pos + 1;
-    return &c.storage;
+    }
+
+    const std::size_t offset = m_write & m_mask;
+    const std::size_t bytes_to_end = m_capacity - offset;
+    const std::size_t padding = record_size > bytes_to_end ? bytes_to_end : 0;
+    const std::size_t required = padding + record_size;
+
+    std::size_t free_bytes = m_capacity - (m_write - m_cached_read);
+    if (required > free_bytes) {
+        m_cached_read = m_published_read.load(std::memory_order_acquire);
+        free_bytes = m_capacity - (m_write - m_cached_read);
+    }
+
+    if (padding >= sizeof(Prefix)) {
+        if (padding > free_bytes) return nullptr;
+
+        auto* prefix = ::new (static_cast<void*>(m_buffer.get() + offset))
+            Prefix;
+        prefix->record_size = static_cast<std::uint32_t>(padding);
+        prefix->reserved = 0;
+        prefix->level = 0;
+        prefix->record_tag = kPaddingRecord;
+
+        // A nearly queue-sized record can require more than one ring's worth
+        // of logical space when the tail padding is included. Publish just the
+        // padding so the consumer can advance to offset zero; this record is
+        // dropped, but following records are not permanently wedged there.
+        if (required > free_bytes) {
+            m_write += padding;
+            m_published_write.store(m_write, std::memory_order_release);
+            return nullptr;
+        }
+    } else if (required > free_bytes) {
+        return nullptr;
+    }
+
+    const std::size_t record_offset = (m_write + padding) & m_mask;
+    auto* entry = ::new (static_cast<void*>(m_buffer.get() + record_offset))
+        LogEntry;
+    m_pending_write = m_write + required;
+    return entry;
 }
 
-template <typename T>
-void Logger::SpscBoundedQueue<T>::publish() {
-    std::size_t pos = m_pos - 1;
-    m_buffer[pos & m_mask].sequence.store(pos + 1, std::memory_order_release);
+void Logger::SpscByteQueue::publish() {
+    m_write = m_pending_write;
+    m_published_write.store(m_write, std::memory_order_release);
 }
 
-template <typename T>
-bool Logger::SpscBoundedQueue<T>::tryDequeue(T& out) {
-    std::size_t pos = m_dq;
-    Cell& c = m_buffer[pos & m_mask];
-    auto diff = static_cast<std::intptr_t>(c.sequence.load(std::memory_order_acquire))
-              - static_cast<std::intptr_t>(pos + 1);
-    if (diff < 0) return false;
-    out = std::move(c.storage);
-    c.sequence.store(pos + m_capacity, std::memory_order_release);
-    m_dq = pos + 1;
-    return true;
+Logger::LogEntry* Logger::SpscByteQueue::front() {
+    for (;;) {
+        if (m_read == m_cached_write) {
+            m_cached_write =
+                m_published_write.load(std::memory_order_acquire);
+            if (m_read == m_cached_write) return nullptr;
+        }
+
+        const std::size_t offset = m_read & m_mask;
+        const auto* prefix = reinterpret_cast<const Prefix*>(
+            m_buffer.get() + offset);
+        if (prefix->record_tag == kPaddingRecord) {
+            m_read += prefix->record_size;
+            m_published_read.store(m_read, std::memory_order_release);
+            continue;
+        }
+
+        auto* entry = reinterpret_cast<LogEntry*>(m_buffer.get() + offset);
+        if (entry->record_size < sizeof(LogEntry) ||
+            entry->record_size > m_capacity - offset ||
+            entry->record_size > m_cached_write - m_read) [[unlikely]] {
+            return nullptr;
+        }
+        return entry;
+    }
 }
 
-template <typename T>
-bool Logger::SpscBoundedQueue<T>::empty() const noexcept {
-    return m_buffer[m_dq & m_mask].sequence.load(std::memory_order_acquire) != m_dq + 1;
+void Logger::SpscByteQueue::pop(const LogEntry& entry) {
+    m_read += entry.record_size;
+    m_published_read.store(m_read, std::memory_order_release);
 }
 
-template class Logger::SpscBoundedQueue<Logger::LogEntry>;
+bool Logger::SpscByteQueue::empty() const noexcept {
+    return m_read == m_published_write.load(std::memory_order_acquire);
+}
 
 // ============================================================================
 // Logger
@@ -275,7 +328,7 @@ bool Logger::shouldLog(LogLevel level) {
 
 std::shared_ptr<Logger::ThreadSlot> Logger::registerThisThread() {
     auto slot = std::make_shared<ThreadSlot>();
-    slot->queue = std::make_unique<SpscBoundedQueue<LogEntry>>(m_per_thread_bytes / sizeof(LogEntry));
+    slot->queue = std::make_unique<SpscByteQueue>(m_per_thread_bytes);
     slot->tid = std::this_thread::get_id();
     slot->generation = m_generation.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lk(m_slot_mutex);
@@ -289,7 +342,6 @@ void Logger::consumerRun() {
     PinCurrentThread(m_backend_cpu_affinity);
     closeLogFile(); openLogFile();
     std::string& wb = m_fmt_buf;
-    LogEntry entry;
     std::vector<std::shared_ptr<ThreadSlot>> active_slots;
     std::uint64_t active_slot_version = std::numeric_limits<std::uint64_t>::max();
 
@@ -311,7 +363,7 @@ void Logger::consumerRun() {
         std::size_t len{0};
     } dtc;
 
-    auto formatLine = [&](LogEntry& e) {
+    auto formatLine = [&](const LogEntry& e) {
         constexpr std::uint64_t NS = 1'000'000'000ULL;
         const auto elapsed_ticks = e.timestamp_ticks - m_base_clock_ticks;
         const auto timestamp_ns = m_epoch_ns + static_cast<std::uint64_t>(
@@ -329,13 +381,14 @@ void Logger::consumerRun() {
         }
         fmt::format_to(std::back_inserter(wb), "{}.{:03d} [{}] [tid={}]",
             std::string_view(dtc.buf.data(), dtc.len), ms,
-            LogLevelToString(e.has_static_metadata
+            LogLevelToString(e.hasStaticMetadata()
                 ? e.metadata->level
                 : static_cast<LogLevel>(e.level)), e.thread_id);
         if (e.msgid != 0)
             fmt::format_to(std::back_inserter(wb), " [msgid={}]", e.msgid);
-        if (!e.method_name.empty())
-            fmt::format_to(std::back_inserter(wb), " [method={}]", e.method_name);
+        if (e.method != nullptr)
+            fmt::format_to(std::back_inserter(wb), " [method={}]",
+                           e.method->full_name());
         wb.push_back(' ');
         e.runFormat(wb);
         wb.push_back('\n');
@@ -350,8 +403,6 @@ void Logger::consumerRun() {
         }
     };
 
-    auto batch = std::make_unique<LogEntry[]>(kMaxDequeuePerRound);
-
     while (m_running.load(std::memory_order_acquire)) {
         refreshActiveSlots();
         std::size_t total = 0;
@@ -361,8 +412,11 @@ void Logger::consumerRun() {
                total < kMaxDequeuePerRound) {
             auto& slp = active_slots[idx];
             if (slp && !slp->dead.load(std::memory_order_relaxed)) {
-                while (total < kMaxDequeuePerRound &&
-                       slp->queue->tryDequeue(batch[total])) {
+                while (total < kMaxDequeuePerRound) {
+                    auto* entry = slp->queue->front();
+                    if (entry == nullptr) break;
+                    formatLine(*entry);
+                    slp->queue->pop(*entry);
                     ++total;
                 }
             }
@@ -370,9 +424,6 @@ void Logger::consumerRun() {
             ++polled;
         }
         m_poll_index = idx;
-
-        for (std::size_t i = 0; i < total; ++i)
-            formatLine(batch[i]);
 
         if (total > 0) swapBuffer();
 
@@ -432,9 +483,14 @@ void Logger::consumerRun() {
         if (!slp) continue;
         for (;;) {
             std::size_t n = 0;
-            while (n < kMaxDequeuePerRound && slp->queue->tryDequeue(batch[n])) ++n;
+            while (n < kMaxDequeuePerRound) {
+                auto* entry = slp->queue->front();
+                if (entry == nullptr) break;
+                formatLine(*entry);
+                slp->queue->pop(*entry);
+                ++n;
+            }
             if (n == 0) break;
-            for (std::size_t i = 0; i < n; ++i) formatLine(batch[i]);
         }
     }
     {

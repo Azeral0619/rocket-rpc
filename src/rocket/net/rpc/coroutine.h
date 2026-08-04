@@ -48,9 +48,9 @@ struct CoCallState {
     std::string err_info;
     RpcController controller;
 
-    // Saved RunTime context (msgid + method_name) captured before the call.
+    // Saved RunTime context (msgid + stable descriptor) captured before the call.
     std::uint64_t saved_msgid{0};
-    std::string saved_method_name;
+    const google::protobuf::MethodDescriptor* saved_method{nullptr};
 };
 
 } // namespace detail
@@ -77,7 +77,7 @@ class CoCallAwaitable {
         auto* rt = RunTime::GetRunTime();
         if (rt) {
             m_state->saved_msgid = rt->m_msgid;
-            m_state->saved_method_name = rt->m_method_name;
+            m_state->saved_method = rt->m_method;
         }
 
         m_state->controller.SetTimeout(m_timeout_ms);
@@ -90,11 +90,8 @@ class CoCallAwaitable {
                 : state(std::move(s)) {}
             void Run() override {
                 std::unique_ptr<ResumeClosure> self(this);
-                auto* rt = RunTime::GetRunTime();
-                if (rt) {
-                    rt->m_msgid = std::move(state->saved_msgid);
-                    rt->m_method_name = std::move(state->saved_method_name);
-                }
+                RunTimeScope runtime_scope(state->saved_msgid,
+                                           state->saved_method);
                 if (state->handle) {
                     auto handle = state->handle;
                     state->handle = nullptr;

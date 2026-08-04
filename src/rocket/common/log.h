@@ -14,6 +14,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fmt/base.h>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -98,9 +99,10 @@ class Logger final : public Singleton<Logger> {
     };
 
     struct LogEntry {
-        // Per-arg codec: encode arguments with type tag + compact value inline.
-        // Consumer reconstructs fmt::format_args via a switch.  No fmt internals.
-        static constexpr std::size_t kFmtStorageSize = 80;
+        // The entry is the fixed header of a variable-length byte-ring record.
+        // Encoded arguments follow it immediately in the queue.
+        static constexpr std::uint8_t kStaticMetadataFlag = 0x80;
+        static constexpr std::uint8_t kArgumentCountMask = 0x0f;
 
         enum class ArgType : std::uint8_t {
             Int = 0, Uint, Int64, Uint64, Double, LongDouble, Bool,
@@ -109,30 +111,50 @@ class Logger final : public Singleton<Logger> {
 
         template <typename... Args>
         void setArgs(fmt::string_view fmt, Args&&... args) {
-            has_static_metadata = false;
             fmt_ptr = fmt.data();
             fmt_len = static_cast<std::uint16_t>(fmt.size());
-            encodeArgs(std::forward<Args>(args)...);
+            encodeArgs(false, std::forward<Args>(args)...);
         }
 
         template <typename... Args>
         void setArgs(const LogMetadata* static_metadata, Args&&... args) {
-            has_static_metadata = true;
             metadata = static_metadata;
-            encodeStaticArgs(std::forward<Args>(args)...);
+            fmt_len = 0;
+            encodeArgs(true, std::forward<Args>(args)...);
         }
 
-        void runFormat(std::string& out) {
-            const auto format = has_static_metadata
+        template <typename... Args>
+        static std::size_t encodedPayloadSize(bool static_metadata,
+                                              const Args&... args) {
+            constexpr std::size_t count = sizeof...(Args);
+            static_assert(count <= kArgumentCountMask,
+                          "async logger supports at most 15 arguments");
+            std::size_t total = static_metadata ? 0 : ((count + 7U) & ~std::size_t{7U});
+            ((total += encodedSize(args)), ...);
+            return total;
+        }
+
+        [[nodiscard]] bool hasStaticMetadata() const noexcept {
+            return (record_tag & kStaticMetadataFlag) != 0;
+        }
+
+        [[nodiscard]] std::uint8_t argumentCount() const noexcept {
+            return record_tag & kArgumentCountMask;
+        }
+
+        void runFormat(std::string& out) const {
+            const bool static_metadata = hasStaticMetadata();
+            const auto format = static_metadata
                 ? metadata->format
                 : fmt::string_view(fmt_ptr, fmt_len);
+            const auto num_args = argumentCount();
             if (num_args == 0) {
                 out.append(format.data(), format.size());
                 return;
             }
-            auto* data = heap_allocated ? arg_data : fmt_data;
+            const auto* data = payload();
             const int n = static_cast<int>(num_args);
-            if (has_static_metadata) {
+            if (static_metadata) {
                 metadata->format_fn(out, format, data);
             } else {
                 const auto* tags = reinterpret_cast<const uint8_t*>(data);
@@ -144,12 +166,6 @@ class Logger final : public Singleton<Logger> {
 
                 fmt::basic_format_args<fmt::format_context> fargs(decoded, n);
                 fmt::vformat_to(std::back_inserter(out), format, fargs);
-            }
-
-            if (heap_allocated) {
-                delete[] arg_data;
-                arg_data = fmt_data;
-                heap_allocated = false;
             }
         }
 
@@ -319,50 +335,22 @@ class Logger final : public Singleton<Logger> {
         }
 
         template <typename... Args>
-        void encodeArgs(Args&&... args) {
+        void encodeArgs(bool static_metadata, Args&&... args) {
             constexpr std::size_t count = sizeof...(Args);
-            static_assert(count <= 15, "async logger supports at most 15 arguments");
-            num_args = static_cast<std::uint8_t>(count);
-            heap_allocated = false;
-            arg_data = fmt_data;
+            static_assert(count <= kArgumentCountMask,
+                          "async logger supports at most 15 arguments");
+            record_tag = static_cast<std::uint8_t>(count) |
+                         (static_metadata ? kStaticMetadataFlag : 0);
             if constexpr (count == 0) return;
 
-            std::size_t total = count;
-            total = (total + 7U) & ~std::size_t{7U};
-            ((total += encodedSize(args)), ...);
-
-            char* dst = fmt_data;
-            if (total > kFmtStorageSize) {
-                heap_allocated = true;
-                dst = new char[total];
-                arg_data = dst;
-            }
-
-            const std::array<ArgType, count> tags{argType<Args>()...};
-            for (std::size_t i = 0; i < count; ++i)
-                dst[i] = static_cast<char>(tags[i]);
-            char* p = alignPtr(dst + count, 8);
-            (encodeOneArg(p, std::forward<Args>(args)), ...);
-        }
-
-        template <typename... Args>
-        void encodeStaticArgs(Args&&... args) {
-            constexpr std::size_t count = sizeof...(Args);
-            static_assert(count <= 15, "async logger supports at most 15 arguments");
-            num_args = static_cast<std::uint8_t>(count);
-            heap_allocated = false;
-            arg_data = fmt_data;
-            if constexpr (count == 0) return;
-
-            std::size_t total = 0;
-            ((total += encodedSize(args)), ...);
-            char* dst = fmt_data;
-            if (total > kFmtStorageSize) {
-                heap_allocated = true;
-                dst = new char[total];
-                arg_data = dst;
-            }
+            char* dst = payload();
             char* p = dst;
+            if (!static_metadata) {
+                const std::array<ArgType, count> tags{argType<Args>()...};
+                for (std::size_t i = 0; i < count; ++i)
+                    dst[i] = static_cast<char>(tags[i]);
+                p = alignPtr(dst + count, 8);
+            }
             (encodeOneArg(p, std::forward<Args>(args)), ...);
         }
 
@@ -400,23 +388,32 @@ class Logger final : public Singleton<Logger> {
         }
 
       public:
+        [[nodiscard]] char* payload() noexcept {
+            return reinterpret_cast<char*>(this + 1);
+        }
+        [[nodiscard]] const char* payload() const noexcept {
+            return reinterpret_cast<const char*>(this + 1);
+        }
+
+        // Keep these first eight bytes stable: the queue only needs this prefix
+        // to skip a wrap-padding record.
+        std::uint32_t record_size;
+        std::uint16_t fmt_len;
+        std::uint8_t level;
+        std::uint8_t record_tag;
         union {
-            const LogMetadata* metadata{nullptr};
+            const LogMetadata* metadata;
             const char* fmt_ptr;
         };
-        std::uint64_t thread_id{0};
-        std::uint64_t timestamp_ticks{0};
-        std::uint8_t level{0};
+        std::uint64_t thread_id;
+        std::uint64_t timestamp_ticks;
         // Numeric message IDs stay allocation-free in the async log record.
-        std::uint64_t msgid{0};
-        std::string method_name;
-        std::uint8_t num_args{0};
-        bool heap_allocated{false};
-        bool has_static_metadata{false};
-        std::uint16_t fmt_len{0};
-        char* arg_data{fmt_data};
-        alignas(std::max_align_t) char fmt_data[kFmtStorageSize];
+        std::uint64_t msgid;
+        const google::protobuf::MethodDescriptor* method;
     };
+
+    static_assert(sizeof(LogEntry) == 48,
+                  "LogEntry header size is part of the byte-ring layout");
 
     template <typename... Args>
     static constexpr LogMetadata makeLogMetadata(fmt::string_view format,
@@ -476,32 +473,47 @@ class Logger final : public Singleton<Logger> {
     }
 
   private:
-    // ── SPSC bounded ring queue (one per thread, single producer, no CAS) ──
-    template <typename T>
-    class SpscBoundedQueue {
+    // ── Variable-length SPSC byte ring (one per producer thread) ────────
+    class SpscByteQueue {
       public:
         static constexpr std::size_t kCacheLine = 64;
-        explicit SpscBoundedQueue(std::size_t cap);
-        [[nodiscard]] T* tryClaim();
+        explicit SpscByteQueue(std::size_t capacity_bytes);
+        [[nodiscard]] LogEntry* tryClaim(std::size_t record_size);
         void publish();
-        [[nodiscard]] bool tryDequeue(T& out);
+        [[nodiscard]] LogEntry* front();
+        void pop(const LogEntry& entry);
         [[nodiscard]] bool empty() const noexcept;
       private:
-        struct alignas(kCacheLine) Cell {
-            std::atomic<std::size_t> sequence;
-            T storage;
-            Cell() noexcept : sequence(0), storage() {}
-            Cell(Cell&&) = delete;
+        struct Prefix {
+            std::uint32_t record_size;
+            std::uint16_t reserved;
+            std::uint8_t level;
+            std::uint8_t record_tag;
         };
-        std::size_t m_mask, m_capacity;
-        std::unique_ptr<Cell[]> m_buffer;
-        std::size_t m_pos{0};              // producer only
-        alignas(kCacheLine) std::size_t m_dq{0};  // consumer only, no atomic needed
+        static_assert(sizeof(Prefix) == 8);
+        static constexpr std::uint8_t kPaddingRecord = 0xff;
+
+        std::size_t m_mask{0};
+        std::size_t m_capacity{0};
+        std::unique_ptr<std::byte[]> m_buffer;
+
+        // Producer-owned state. The completed record is made visible by one
+        // release store to published_write.
+        alignas(kCacheLine) std::size_t m_write{0};
+        std::size_t m_pending_write{0};
+        std::size_t m_cached_read{0};
+        std::atomic<std::size_t> m_published_write{0};
+
+        // Consumer-owned position. The producer refreshes published_read only
+        // when its cached free-space calculation says the ring may be full.
+        alignas(kCacheLine) std::size_t m_read{0};
+        std::size_t m_cached_write{0};
+        std::atomic<std::size_t> m_published_read{0};
     };
 
     // ── Per-thread state ────────────────────────────────────────────────
     struct ThreadSlot {
-        std::unique_ptr<SpscBoundedQueue<LogEntry>> queue;
+        std::unique_ptr<SpscByteQueue> queue;
         std::thread::id tid;
         std::uint64_t generation{0};
         std::atomic<bool> dead{false};
@@ -617,7 +629,17 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     if (!t_slot || t_slot->generation != m_generation.load(std::memory_order_acquire)) [[unlikely]]
         t_slot = registerThisThread();
 
-    auto slot = t_slot->queue->tryClaim();
+    const std::size_t payload_size = LogEntry::encodedPayloadSize(
+        metadata != nullptr, args...);
+    if (payload_size >
+        std::numeric_limits<std::uint32_t>::max() - sizeof(LogEntry) - 7U) [[unlikely]] {
+        m_dropped_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const std::size_t record_size =
+        (sizeof(LogEntry) + payload_size + 7U) & ~std::size_t{7U};
+
+    auto* slot = t_slot->queue->tryClaim(record_size);
     if (!slot) [[unlikely]] {
         m_dropped_count.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -625,12 +647,13 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
 
     // ── capture metadata ───────────────────────────────────────────────
     auto& entry = *slot;
+    entry.record_size = static_cast<std::uint32_t>(record_size);
     entry.thread_id = cached_tid;
     entry.timestamp_ticks = timestamp_ticks;
     entry.level = static_cast<std::uint8_t>(level);
     auto* rt = RunTime::GetRunTime();
     entry.msgid = rt->m_msgid;
-    entry.method_name = rt->m_method_name;
+    entry.method = rt->m_method;
 
     // ── deferred format: consumer calls this to emit the user message ───
     if (metadata != nullptr) {

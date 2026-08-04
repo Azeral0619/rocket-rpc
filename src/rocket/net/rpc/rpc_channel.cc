@@ -42,6 +42,7 @@ struct RpcChannel::RequestState {
     TcpClient::s_ptr client;
     TimerEvent::s_ptr timer;
     std::atomic<MessageId> msg_id{kInvalidMessageId};
+    const google::protobuf::MethodDescriptor* method{nullptr};
 };
 
 RpcChannel::RpcChannel(NetAddr::s_ptr peer_addr)
@@ -93,6 +94,8 @@ bool RpcChannel::finishRpc(const std::shared_ptr<RequestState>& state,
         state->client->cancelRead(msg_id);
     }
 
+    RunTimeScope runtime_scope(
+        msg_id == kInvalidMessageId ? 0 : msg_id, state->method);
     if (before_done) before_done();
 
     // Keep shared Init() closures alive across re-entrant calls.  Standard
@@ -133,6 +136,7 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
     state->controller = my_controller;
     state->response = response;
     state->done = done;
+    state->method = method;
 
     if (m_is_init.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lk(m_request_mutex);
@@ -235,7 +239,6 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
     }
 
     req_protocol->m_method_name = method->full_name();
-    RunTime::GetRunTime()->m_method_name = req_protocol->m_method_name;
 
     const bool direct_encode =
         m_pool && client->getLoop()->isInLoopThread() &&
@@ -319,9 +322,6 @@ std::shared_ptr<RpcChannel::RequestState> RpcChannel::callMethodInternal(
                 state->msg_id.store(msg_id, std::memory_order_release);
                 state->controller->SetMsgId(msg_id);
 
-                auto* runtime = RunTime::GetRunTime();
-                runtime->m_msgid = msg_id;
-                runtime->m_method_name = req_protocol->m_method_name;
                 ROCKET_LOG_DEBUG("{} | call method name [{}]", msg_id,
                                  req_protocol->m_method_name);
                 return !state->finished.load(std::memory_order_acquire);

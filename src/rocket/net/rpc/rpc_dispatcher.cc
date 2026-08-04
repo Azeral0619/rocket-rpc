@@ -99,9 +99,7 @@ class ServerCallState final : public google::protobuf::Closure {
     }
 
     void invoke() {
-        auto* runtime = RunTime::GetRunTime();
-        runtime->m_msgid = m_request_protocol->m_msg_id;
-        runtime->m_method_name = m_method->name();
+        RunTimeScope runtime_scope(m_request_protocol->m_msg_id, m_method);
 
         // CallMethod may complete synchronously and delete this through Run().
         // Do not access members after the call returns.
@@ -110,6 +108,7 @@ class ServerCallState final : public google::protobuf::Closure {
     }
 
     void Run() override {
+        RunTimeScope runtime_scope(m_request_protocol->m_msg_id, m_method);
         std::unique_ptr<ServerCallState> self(this);
         finishInFlight();
 
