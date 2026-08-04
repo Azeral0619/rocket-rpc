@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <deque>
 
 #include <fmt/format.h>
@@ -89,126 +90,61 @@ class Logger final : public Singleton<Logger> {
     static constexpr std::chrono::nanoseconds kDefaultBackendSleepDuration{100'000};
     static constexpr std::size_t kDefaultMaxFileSize = 1024ULL * 1024ULL * 1024ULL;
 
+    struct LogMetadata {
+        fmt::string_view format;
+        LogLevel level;
+    };
+
     struct LogEntry {
         // Per-arg codec: encode arguments with type tag + compact value inline.
         // Consumer reconstructs fmt::format_args via a switch.  No fmt internals.
         static constexpr std::size_t kFmtStorageSize = 80;
 
         enum class ArgType : std::uint8_t {
-            Int = 0, Uint, Int64, Uint64, Double, Bool,
-            Cstring, StringView, Ptr
+            Int = 0, Uint, Int64, Uint64, Double, LongDouble, Bool,
+            Char, String, Ptr
         };
 
         template <typename... Args>
         void setArgs(fmt::string_view fmt, Args&&... args) {
-            constexpr int N = static_cast<int>(sizeof...(Args));
-            num_args = static_cast<std::uint8_t>(N);
+            metadata = nullptr;
             fmt_ptr = fmt.data();
             fmt_len = static_cast<std::uint16_t>(fmt.size());
+            encodeArgs(std::forward<Args>(args)...);
+        }
 
-            if constexpr (N == 0) return;
-
-            auto store = fmt::make_format_args(args...);
-            auto fargs = fmt::format_args(store);
-
-            // ── Pass 1: measure total size ──────────────────────────
-            // Layout: [num_args=1B] [N×tag] [values…] [string data…]
-            uint8_t tags[15];
-            const char* str_datas[16];
-            size_t str_sizes[16];
-            int nf = 0;
-            size_t total = 1 + static_cast<size_t>(N);          // header + tags
-            total = (total + 7) & ~static_cast<size_t>(7);      // align values to 8B
-
-            for (int i = 0; i < N; ++i) {
-                ArgType tag = ArgType::Int;
-                fargs.get(i).visit([&](auto val) {
-                    using T = std::decay_t<decltype(val)>;
-                    if constexpr (std::is_same_v<T, int>) {
-                        tag = ArgType::Int; total += 4;
-                    } else if constexpr (std::is_same_v<T, unsigned int>) {
-                        tag = ArgType::Uint; total += 4;
-                    } else if constexpr (std::is_same_v<T, long long>) {
-                        tag = ArgType::Int64; total += 8;
-                    } else if constexpr (std::is_same_v<T, unsigned long long>) {
-                        tag = ArgType::Uint64; total += 8;
-                    } else if constexpr (std::is_same_v<T, double>) {
-                        tag = ArgType::Double; total += 8;
-                    } else if constexpr (std::is_same_v<T, bool>) {
-                        tag = ArgType::Bool; total += 1;
-                    } else if constexpr (std::is_same_v<T, const char*>) {
-                        tag = ArgType::Cstring;
-                        total += 2;  // offset
-                        if (val) {
-                            str_datas[nf] = val;
-                            str_sizes[nf] = strlen(val) + 1;
-                            total += str_sizes[nf];
-                            ++nf;
-                        }
-                    } else if constexpr (std::is_same_v<T, fmt::string_view>) {
-                        tag = ArgType::StringView;
-                        total += 2 + 8;  // offset + size
-                        str_datas[nf] = val.data();
-                        str_sizes[nf] = val.size();
-                        total += str_sizes[nf];
-                        ++nf;
-                    } else {
-                        tag = ArgType::Ptr;
-                        total += sizeof(val);
-                    }
-                });
-                tags[i] = static_cast<uint8_t>(tag);
-            }
-
-            // ── Allocate (inline or heap) ──────────────────────────
-            char* dst;
-            if (total <= kFmtStorageSize) {
-                heap_allocated = false;
-                dst = fmt_data;
-            } else {
-                heap_allocated = true;
-                dst = new char[total];
-                arg_data = dst;
-            }
-
-            // ── Pass 2: encode ─────────────────────────────────────
-            dst[0] = static_cast<char>(N);
-            for (int i = 0; i < N; ++i) dst[1 + i] = static_cast<char>(tags[i]);
-            char* p = dst + 1 + N;
-            p = alignPtr(p, 8);
-
-            uint16_t* off_buf[16];
-            nf = 0;
-            for (int i = 0; i < N; ++i) {
-                encodeOneArg(p, fargs.get(i), str_datas, str_sizes, off_buf, nf);
-            }
-            for (int j = 0; j < nf; ++j) {
-                *off_buf[j] = static_cast<uint16_t>(p - dst);
-                memcpy(p, str_datas[j], str_sizes[j]);
-                p += str_sizes[j];
-            }
+        template <typename... Args>
+        void setArgs(const LogMetadata* static_metadata, Args&&... args) {
+            metadata = static_metadata;
+            encodeArgs(std::forward<Args>(args)...);
         }
 
         void runFormat(std::string& out) {
+            const auto format = metadata != nullptr
+                ? metadata->format
+                : fmt::string_view(fmt_ptr, fmt_len);
             if (num_args == 0) {
-                out.append(fmt_ptr, fmt_len);
+                out.append(format.data(), format.size());
                 return;
             }
             auto* data = heap_allocated ? arg_data : fmt_data;
-            auto* base = data;
-            int n = static_cast<int>(*data++);
+            const int n = static_cast<int>(num_args);
             const auto* tags = reinterpret_cast<const uint8_t*>(data);
             const char* p = alignPtr(data + n, 8);
 
             fmt::basic_format_arg<fmt::format_context> decoded[15];
             for (int i = 0; i < n; ++i)
-                p = decodeOneArg(base, p, static_cast<ArgType>(tags[i]), decoded[i]);
+                p = decodeOneArg(p, static_cast<ArgType>(tags[i]), decoded[i]);
 
             fmt::basic_format_args<fmt::format_context> fargs(decoded, n);
             fmt::vformat_to(std::back_inserter(out),
-                fmt::string_view(fmt_ptr, fmt_len), fargs);
+                format, fargs);
 
-            if (heap_allocated) delete[] arg_data;
+            if (heap_allocated) {
+                delete[] arg_data;
+                arg_data = fmt_data;
+                heap_allocated = false;
+            }
         }
 
       private:
@@ -221,43 +157,176 @@ class Logger final : public Singleton<Logger> {
             return reinterpret_cast<char*>((v + a - 1) & ~static_cast<uintptr_t>(a - 1));
         }
 
-        static ArgType encodeOneArg(char*& p, fmt::basic_format_arg<fmt::format_context> arg,
-                                    const char* datas[], size_t sizes[], uint16_t* offs[], int& nf) {
-            ArgType tag = ArgType::Int;
-            arg.visit([&](auto val) {
-                using T = std::decay_t<decltype(val)>;
-                if constexpr (std::is_same_v<T, int>) {
-                    tag = ArgType::Int; memcpy(p, &val, 4); p += 4;
-                } else if constexpr (std::is_same_v<T, unsigned int>) {
-                    tag = ArgType::Uint; memcpy(p, &val, 4); p += 4;
-                } else if constexpr (std::is_same_v<T, long long>) {
-                    tag = ArgType::Int64; memcpy(p, &val, 8); p += 8;
-                } else if constexpr (std::is_same_v<T, unsigned long long>) {
-                    tag = ArgType::Uint64; memcpy(p, &val, 8); p += 8;
-                } else if constexpr (std::is_same_v<T, double>) {
-                    tag = ArgType::Double; memcpy(p, &val, 8); p += 8;
-                } else if constexpr (std::is_same_v<T, bool>) {
-                    tag = ArgType::Bool; *p++ = val ? 1 : 0;
-                } else if constexpr (std::is_same_v<T, const char*>) {
-                    tag = ArgType::Cstring;
-                    offs[nf] = reinterpret_cast<uint16_t*>(p); p += 2;
-                    if (val) { datas[nf] = val; sizes[nf] = strlen(val) + 1; ++nf; }
-                } else if constexpr (std::is_same_v<T, fmt::string_view>) {
-                    tag = ArgType::StringView;
-                    offs[nf] = reinterpret_cast<uint16_t*>(p); p += 2;
-                    reinterpret_cast<size_t*>(p)[0] = val.size(); p += 8;
-                    datas[nf] = val.data(); sizes[nf] = val.size(); ++nf;
-                } else if constexpr (std::is_same_v<T, const void*>) {
-                    tag = ArgType::Ptr; memcpy(p, &val, 8); p += 8;
-                } else {
-                    tag = ArgType::Ptr; // fallback
-                    memcpy(p, &val, sizeof(val)); p += sizeof(val);
-                }
-            });
-            return tag;
+        template <typename>
+        static constexpr bool kAlwaysFalse = false;
+
+        template <typename T>
+        static constexpr bool kCharArray =
+            std::is_array_v<std::remove_cvref_t<T>> &&
+            std::is_same_v<std::remove_cv_t<
+                std::remove_extent_t<std::remove_cvref_t<T>>>, char>;
+
+        template <typename T>
+        static constexpr bool kCharPointer =
+            std::is_pointer_v<std::remove_cvref_t<T>> &&
+            std::is_same_v<std::remove_cv_t<std::remove_pointer_t<
+                std::remove_cvref_t<T>>>, char>;
+
+        template <typename T>
+        static constexpr bool kStringLike =
+            kCharArray<T> || kCharPointer<T> ||
+            std::is_same_v<std::remove_cvref_t<T>, std::string> ||
+            std::is_same_v<std::remove_cvref_t<T>, std::string_view> ||
+            std::is_same_v<std::remove_cvref_t<T>, fmt::string_view>;
+
+        template <typename T>
+        static constexpr ArgType argType() {
+            using U = std::remove_cvref_t<T>;
+            if constexpr (std::is_same_v<U, bool>) {
+                return ArgType::Bool;
+            } else if constexpr (std::is_same_v<U, char>) {
+                return ArgType::Char;
+            } else if constexpr (std::is_enum_v<U>) {
+                return argType<std::underlying_type_t<U>>();
+            } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U>) {
+                return sizeof(U) <= sizeof(int) ? ArgType::Int : ArgType::Int64;
+            } else if constexpr (std::is_integral_v<U> && std::is_unsigned_v<U>) {
+                return sizeof(U) <= sizeof(unsigned) ? ArgType::Uint : ArgType::Uint64;
+            } else if constexpr (std::is_same_v<U, long double>) {
+                return ArgType::LongDouble;
+            } else if constexpr (std::is_floating_point_v<U>) {
+                return ArgType::Double;
+            } else if constexpr (kStringLike<U>) {
+                return ArgType::String;
+            } else if constexpr (std::is_same_v<U, std::thread::id>) {
+                // The log prefix already carries the native TID. Encode an
+                // explicitly logged std::thread::id as its stable hash rather
+                // than retaining a fmt custom-type handle into producer memory.
+                return ArgType::Uint64;
+            } else if constexpr (std::is_pointer_v<U> ||
+                                 std::is_same_v<U, std::nullptr_t>) {
+                return ArgType::Ptr;
+            } else {
+                static_assert(kAlwaysFalse<U>, "unsupported async log argument type");
+            }
         }
 
-        static const char* decodeOneArg(const char* base, const char* p, ArgType tag,
+        template <typename T>
+        static std::string_view asStringView(const T& value) {
+            using U = std::remove_cvref_t<T>;
+            if constexpr (kCharArray<U>) {
+                return std::string_view(value, std::char_traits<char>::length(value));
+            } else if constexpr (kCharPointer<U>) {
+                return value == nullptr ? std::string_view{} : std::string_view(value);
+            } else if constexpr (std::is_same_v<U, std::string>) {
+                return std::string_view(value);
+            } else if constexpr (std::is_same_v<U, std::string_view>) {
+                return value;
+            } else {
+                return std::string_view(value.data(), value.size());
+            }
+        }
+
+        template <typename T>
+        static std::size_t encodedSize(const T& value) {
+            using U = std::remove_cvref_t<T>;
+            if constexpr (std::is_enum_v<U>) {
+                return encodedSize(static_cast<std::underlying_type_t<U>>(value));
+            } else if constexpr (kStringLike<U>) {
+                return sizeof(std::size_t) + asStringView(value).size();
+            } else if constexpr (std::is_same_v<U, bool> ||
+                                 std::is_same_v<U, char>) {
+                return 1;
+            } else if constexpr (std::is_integral_v<U>) {
+                return sizeof(U) <= sizeof(int) ? sizeof(int) : sizeof(std::uint64_t);
+            } else if constexpr (std::is_same_v<U, long double>) {
+                return sizeof(long double);
+            } else if constexpr (std::is_floating_point_v<U>) {
+                return sizeof(double);
+            } else {
+                return sizeof(std::uint64_t);
+            }
+        }
+
+        template <typename T>
+        static void encodeOneArg(char*& p, T&& value) {
+            using U = std::remove_cvref_t<T>;
+            if constexpr (std::is_same_v<U, bool>) {
+                *p++ = value ? 1 : 0;
+            } else if constexpr (std::is_same_v<U, char>) {
+                *p++ = value;
+            } else if constexpr (std::is_enum_v<U>) {
+                encodeOneArg(p, static_cast<std::underlying_type_t<U>>(value));
+            } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U>) {
+                if constexpr (sizeof(U) <= sizeof(int)) {
+                    const int encoded = static_cast<int>(value);
+                    memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+                } else {
+                    const std::int64_t encoded = static_cast<std::int64_t>(value);
+                    memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+                }
+            } else if constexpr (std::is_integral_v<U> && std::is_unsigned_v<U>) {
+                if constexpr (sizeof(U) <= sizeof(unsigned)) {
+                    const unsigned encoded = static_cast<unsigned>(value);
+                    memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+                } else {
+                    const std::uint64_t encoded = static_cast<std::uint64_t>(value);
+                    memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+                }
+            } else if constexpr (std::is_same_v<U, long double>) {
+                memcpy(p, &value, sizeof(value)); p += sizeof(value);
+            } else if constexpr (std::is_floating_point_v<U>) {
+                const double encoded = static_cast<double>(value);
+                memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+            } else if constexpr (kStringLike<U>) {
+                const auto view = asStringView(value);
+                const std::size_t size = view.size();
+                memcpy(p, &size, sizeof(size)); p += sizeof(size);
+                if (size != 0) memcpy(p, view.data(), size);
+                p += size;
+            } else if constexpr (std::is_same_v<U, std::thread::id>) {
+                const auto encoded = static_cast<std::uint64_t>(
+                    std::hash<std::thread::id>{}(value));
+                memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+            } else if constexpr (std::is_same_v<U, std::nullptr_t>) {
+                const void* encoded = nullptr;
+                memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+            } else if constexpr (std::is_pointer_v<U>) {
+                const void* encoded = reinterpret_cast<const void*>(value);
+                memcpy(p, &encoded, sizeof(encoded)); p += sizeof(encoded);
+            } else {
+                static_assert(kAlwaysFalse<U>, "unsupported async log argument type");
+            }
+        }
+
+        template <typename... Args>
+        void encodeArgs(Args&&... args) {
+            constexpr std::size_t count = sizeof...(Args);
+            static_assert(count <= 15, "async logger supports at most 15 arguments");
+            num_args = static_cast<std::uint8_t>(count);
+            heap_allocated = false;
+            arg_data = fmt_data;
+            if constexpr (count == 0) return;
+
+            std::size_t total = count;
+            total = (total + 7U) & ~std::size_t{7U};
+            ((total += encodedSize(args)), ...);
+
+            char* dst = fmt_data;
+            if (total > kFmtStorageSize) {
+                heap_allocated = true;
+                dst = new char[total];
+                arg_data = dst;
+            }
+
+            const std::array<ArgType, count> tags{argType<Args>()...};
+            for (std::size_t i = 0; i < count; ++i)
+                dst[i] = static_cast<char>(tags[i]);
+            char* p = alignPtr(dst + count, 8);
+            (encodeOneArg(p, std::forward<Args>(args)), ...);
+        }
+
+        static const char* decodeOneArg(const char* p, ArgType tag,
                                         fmt::basic_format_arg<fmt::format_context>& out) {
             switch (tag) {
             case ArgType::Int:    { int v; memcpy(&v, p, 4); p += 4; out = farg(v); break; }
@@ -265,15 +334,12 @@ class Logger final : public Singleton<Logger> {
             case ArgType::Int64:  { long long v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
             case ArgType::Uint64: { unsigned long long v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
             case ArgType::Double: { double v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
+            case ArgType::LongDouble: { long double v; memcpy(&v, p, sizeof(v)); p += sizeof(v); out = farg(v); break; }
             case ArgType::Bool:   { bool v = *p++; out = farg(v); break; }
-            case ArgType::Cstring:{
-                uint16_t off; memcpy(&off, p, 2); p += 2;
-                out = farg(off ? reinterpret_cast<const char*>(base + off) : ""); break;
-            }
-            case ArgType::StringView: {
-                uint16_t off; memcpy(&off, p, 2); p += 2;
-                size_t sz; memcpy(&sz, p, 8); p += 8;
-                out = farg(fmt::string_view(reinterpret_cast<const char*>(base + off), sz)); break;
+            case ArgType::Char:   { char v = *p++; out = farg(v); break; }
+            case ArgType::String: {
+                std::size_t size; memcpy(&size, p, sizeof(size)); p += sizeof(size);
+                out = farg(fmt::string_view(p, size)); p += size; break;
             }
             case ArgType::Ptr:    { const void* v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
             default:              { const void* v; memcpy(&v, p, 8); p += 8; out = farg(v); break; }
@@ -287,6 +353,7 @@ class Logger final : public Singleton<Logger> {
         }
 
       public:
+        const LogMetadata* metadata{nullptr};
         std::uint64_t thread_id{0};
         std::uint64_t timestamp_ticks{0};
         std::uint8_t level{0};
@@ -327,6 +394,10 @@ class Logger final : public Singleton<Logger> {
 
     template <typename... Args>
     void log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args);
+
+    template <typename... Args>
+    void log(const LogMetadata* metadata, fmt::format_string<Args...> fmt,
+             Args&&... args);
 
     void flush();
 
@@ -390,6 +461,10 @@ class Logger final : public Singleton<Logger> {
     void closeLogFile();
     void rotateIfNeeded();
 
+    template <typename... Args>
+    void enqueue(LogLevel level, const LogMetadata* metadata,
+                 fmt::string_view format, Args&&... args);
+
     static constexpr std::size_t kMaxDequeuePerRound = 1024;       // ~150KB per round
     static constexpr std::size_t kWriteThreshold = 256ULL * 1024;  // batch to this size before ::write
     static constexpr std::size_t kWriteBufferReserve = 256ULL * 1024;
@@ -443,6 +518,18 @@ class Logger final : public Singleton<Logger> {
 
 template <typename... Args>
 void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args) {
+    enqueue(level, nullptr, fmt.str, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+void Logger::log(const LogMetadata* metadata, fmt::format_string<Args...> fmt,
+                 Args&&... args) {
+    enqueue(metadata->level, metadata, fmt.str, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
+                     fmt::string_view format, Args&&... args) {
     if (static_cast<std::uint8_t>(level) < static_cast<std::uint8_t>(m_level.load(std::memory_order_relaxed)))
         return;
     if (!m_running.load(std::memory_order_acquire)) [[unlikely]] {
@@ -489,50 +576,48 @@ void Logger::log(LogLevel level, fmt::format_string<Args...> fmt, Args&&... args
     entry.method_name = rt->m_method_name;
 
     // ── deferred format: consumer calls this to emit the user message ───
-    entry.setArgs(fmt.str, std::forward<Args>(args)...);
+    if (metadata != nullptr) {
+        entry.setArgs(metadata, std::forward<Args>(args)...);
+    } else {
+        entry.setArgs(format, std::forward<Args>(args)...);
+    }
 
     t_slot->queue->publish();
 }
 
 } // namespace rocket
 
-#if ROCKET_MIN_LOG_LEVEL <= 0
-#define ROCKET_LOG_DEBUG(fmt, ...)                                                            \
+#define ROCKET_LOG_IMPL(log_level, format, ...)                                               \
     do {                                                                                      \
-        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Debug))             \
-            ::rocket::Logger::getInstance().log(                                              \
-                ::rocket::LogLevel::Debug, fmt, ##__VA_ARGS__);                               \
+        auto& rocket_log_instance = ::rocket::Logger::getInstance();                          \
+        if (rocket_log_instance.shouldLog(log_level)) {                                       \
+            static constexpr ::rocket::Logger::LogMetadata rocket_log_metadata{               \
+                format, log_level};                                                           \
+            rocket_log_instance.log(&rocket_log_metadata, format, ##__VA_ARGS__);              \
+        }                                                                                     \
     } while (false)
+
+#if ROCKET_MIN_LOG_LEVEL <= 0
+#define ROCKET_LOG_DEBUG(format, ...)                                                          \
+    ROCKET_LOG_IMPL(::rocket::LogLevel::Debug, format, ##__VA_ARGS__)
 #else
-#define ROCKET_LOG_DEBUG(fmt, ...) (void)0
+#define ROCKET_LOG_DEBUG(format, ...) (void)0
 #endif
 #if ROCKET_MIN_LOG_LEVEL <= 1
-#define ROCKET_LOG_INFO(fmt, ...)                                                             \
-    do {                                                                                      \
-        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Info))              \
-            ::rocket::Logger::getInstance().log(                                              \
-                ::rocket::LogLevel::Info, fmt, ##__VA_ARGS__);                                \
-    } while (false)
+#define ROCKET_LOG_INFO(format, ...)                                                           \
+    ROCKET_LOG_IMPL(::rocket::LogLevel::Info, format, ##__VA_ARGS__)
 #else
-#define ROCKET_LOG_INFO(fmt, ...) (void)0
+#define ROCKET_LOG_INFO(format, ...) (void)0
 #endif
 #if ROCKET_MIN_LOG_LEVEL <= 2
-#define ROCKET_LOG_WARN(fmt, ...)                                                             \
-    do {                                                                                      \
-        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Warn))              \
-            ::rocket::Logger::getInstance().log(                                              \
-                ::rocket::LogLevel::Warn, fmt, ##__VA_ARGS__);                                \
-    } while (false)
+#define ROCKET_LOG_WARN(format, ...)                                                           \
+    ROCKET_LOG_IMPL(::rocket::LogLevel::Warn, format, ##__VA_ARGS__)
 #else
-#define ROCKET_LOG_WARN(fmt, ...) (void)0
+#define ROCKET_LOG_WARN(format, ...) (void)0
 #endif
 #if ROCKET_MIN_LOG_LEVEL <= 3
-#define ROCKET_LOG_ERROR(fmt, ...)                                                            \
-    do {                                                                                      \
-        if (::rocket::Logger::getInstance().shouldLog(::rocket::LogLevel::Error))             \
-            ::rocket::Logger::getInstance().log(                                              \
-                ::rocket::LogLevel::Error, fmt, ##__VA_ARGS__);                               \
-    } while (false)
+#define ROCKET_LOG_ERROR(format, ...)                                                          \
+    ROCKET_LOG_IMPL(::rocket::LogLevel::Error, format, ##__VA_ARGS__)
 #else
-#define ROCKET_LOG_ERROR(fmt, ...) (void)0
+#define ROCKET_LOG_ERROR(format, ...) (void)0
 #endif

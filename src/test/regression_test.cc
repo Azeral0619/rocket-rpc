@@ -35,6 +35,7 @@
 #include <poll.h>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -434,6 +435,26 @@ void testLiteralLogFormatting() {
     std::string output;
     entry.runFormat(output);
     require(output == "literal log message", "literal log message was dropped");
+}
+
+void testTypedLogFormatting() {
+    rocket::Logger::LogEntry entry;
+    const std::string large(96, 'x');
+    entry.setArgs(
+        "i={} u={} i64={} u64={} hex={:02x} d={:.2f} b={} c={} s={} sv={}",
+        -7, 9U, std::int64_t{-11}, std::uint64_t{13}, 0x0aU, 3.25,
+        true, 'z', large, std::string_view{"tail"});
+    std::string output;
+    entry.runFormat(output);
+    const std::string expected =
+        "i=-7 u=9 i64=-11 u64=13 hex=0a d=3.25 b=true c=z s=" +
+        large + " sv=tail";
+    require(output == expected, "typed async log codec changed formatting");
+
+    output.clear();
+    entry.setArgs("reuse={}", 42);
+    entry.runFormat(output);
+    require(output == "reuse=42", "heap-backed log entry was not reusable");
 }
 
 void testDisabledLogDoesNotEvaluateArguments() {
@@ -1046,6 +1067,7 @@ int main() {
         testBoundedConnectionWriteQueueHandlesConcurrentProducers();
         testAcceptorDrainsWithoutBlocking();
         testLiteralLogFormatting();
+        testTypedLogFormatting();
         testDisabledLogDoesNotEvaluateArguments();
         testTimingWheelKeepsPartialTicks();
         testTimingWheelEagerlyRemovesLongCancelledTimer();
