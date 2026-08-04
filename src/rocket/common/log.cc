@@ -129,7 +129,7 @@ Logger::SpscByteQueue::SpscByteQueue(std::size_t capacity_bytes) {
     m_buffer = std::make_unique<std::byte[]>(n);
 }
 
-Logger::LogEntry* Logger::SpscByteQueue::tryClaim(std::size_t record_size) {
+std::byte* Logger::SpscByteQueue::tryClaim(std::size_t record_size) {
     record_size = (record_size + 7U) & ~std::size_t{7U};
     if (record_size < sizeof(LogEntry) ||
         record_size > m_capacity) {
@@ -171,10 +171,8 @@ Logger::LogEntry* Logger::SpscByteQueue::tryClaim(std::size_t record_size) {
     }
 
     const std::size_t record_offset = (m_write + padding) & m_mask;
-    auto* entry = ::new (static_cast<void*>(m_buffer.get() + record_offset))
-        LogEntry;
     m_pending_write = m_write + required;
-    return entry;
+    return m_buffer.get() + record_offset;
 }
 
 void Logger::SpscByteQueue::publish() {
@@ -390,7 +388,8 @@ void Logger::consumerRun() {
             fmt::format_to(std::back_inserter(wb), " [method={}]",
                            e.method->full_name());
         wb.push_back(' ');
-        e.runFormat(wb);
+        e.runFormat(wb, reinterpret_cast<const char*>(std::addressof(e)) +
+                            sizeof(LogEntry));
         wb.push_back('\n');
     };
 

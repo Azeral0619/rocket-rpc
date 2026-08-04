@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -110,17 +111,18 @@ class Logger final : public Singleton<Logger> {
         };
 
         template <typename... Args>
-        void setArgs(fmt::string_view fmt, Args&&... args) {
+        void setArgs(char* payload, fmt::string_view fmt, Args&&... args) {
             fmt_ptr = fmt.data();
             fmt_len = static_cast<std::uint16_t>(fmt.size());
-            encodeArgs(false, std::forward<Args>(args)...);
+            encodeArgs(payload, false, std::forward<Args>(args)...);
         }
 
         template <typename... Args>
-        void setArgs(const LogMetadata* static_metadata, Args&&... args) {
+        void setArgs(char* payload, const LogMetadata* static_metadata,
+                     Args&&... args) {
             metadata = static_metadata;
             fmt_len = 0;
-            encodeArgs(true, std::forward<Args>(args)...);
+            encodeArgs(payload, true, std::forward<Args>(args)...);
         }
 
         template <typename... Args>
@@ -142,7 +144,7 @@ class Logger final : public Singleton<Logger> {
             return record_tag & kArgumentCountMask;
         }
 
-        void runFormat(std::string& out) const {
+        void runFormat(std::string& out, const char* payload) const {
             const bool static_metadata = hasStaticMetadata();
             const auto format = static_metadata
                 ? metadata->format
@@ -152,7 +154,7 @@ class Logger final : public Singleton<Logger> {
                 out.append(format.data(), format.size());
                 return;
             }
-            const auto* data = payload();
+            const auto* data = payload;
             const int n = static_cast<int>(num_args);
             if (static_metadata) {
                 metadata->format_fn(out, format, data);
@@ -335,7 +337,7 @@ class Logger final : public Singleton<Logger> {
         }
 
         template <typename... Args>
-        void encodeArgs(bool static_metadata, Args&&... args) {
+        void encodeArgs(char* payload, bool static_metadata, Args&&... args) {
             constexpr std::size_t count = sizeof...(Args);
             static_assert(count <= kArgumentCountMask,
                           "async logger supports at most 15 arguments");
@@ -343,7 +345,7 @@ class Logger final : public Singleton<Logger> {
                          (static_metadata ? kStaticMetadataFlag : 0);
             if constexpr (count == 0) return;
 
-            char* dst = payload();
+            char* dst = payload;
             char* p = dst;
             if (!static_metadata) {
                 const std::array<ArgType, count> tags{argType<Args>()...};
@@ -388,13 +390,6 @@ class Logger final : public Singleton<Logger> {
         }
 
       public:
-        [[nodiscard]] char* payload() noexcept {
-            return reinterpret_cast<char*>(this + 1);
-        }
-        [[nodiscard]] const char* payload() const noexcept {
-            return reinterpret_cast<const char*>(this + 1);
-        }
-
         // Keep these first eight bytes stable: the queue only needs this prefix
         // to skip a wrap-padding record.
         std::uint32_t record_size;
@@ -478,7 +473,7 @@ class Logger final : public Singleton<Logger> {
       public:
         static constexpr std::size_t kCacheLine = 64;
         explicit SpscByteQueue(std::size_t capacity_bytes);
-        [[nodiscard]] LogEntry* tryClaim(std::size_t record_size);
+        [[nodiscard]] std::byte* tryClaim(std::size_t record_size);
         void publish();
         [[nodiscard]] LogEntry* front();
         void pop(const LogEntry& entry);
@@ -639,13 +634,14 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     const std::size_t record_size =
         (sizeof(LogEntry) + payload_size + 7U) & ~std::size_t{7U};
 
-    auto* slot = t_slot->queue->tryClaim(record_size);
-    if (!slot) [[unlikely]] {
+    auto* record = t_slot->queue->tryClaim(record_size);
+    if (!record) [[unlikely]] {
         m_dropped_count.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     // ── capture metadata ───────────────────────────────────────────────
+    auto* slot = ::new (static_cast<void*>(record)) LogEntry;
     auto& entry = *slot;
     entry.record_size = static_cast<std::uint32_t>(record_size);
     entry.thread_id = cached_tid;
@@ -654,12 +650,13 @@ void Logger::enqueue(LogLevel level, const LogMetadata* metadata,
     auto* rt = RunTime::GetRunTime();
     entry.msgid = rt->m_msgid;
     entry.method = rt->m_method;
+    auto* payload = reinterpret_cast<char*>(record + sizeof(LogEntry));
 
     // ── deferred format: consumer calls this to emit the user message ───
     if (metadata != nullptr) {
-        entry.setArgs(metadata, std::forward<Args>(args)...);
+        entry.setArgs(payload, metadata, std::forward<Args>(args)...);
     } else {
-        entry.setArgs(format, std::forward<Args>(args)...);
+        entry.setArgs(payload, format, std::forward<Args>(args)...);
     }
 
     t_slot->queue->publish();

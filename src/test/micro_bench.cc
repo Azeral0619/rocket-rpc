@@ -1,6 +1,7 @@
 // Micro-benchmark to isolate Logger hot-path costs
 #include "rocket/common/log.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -16,12 +17,14 @@ namespace {
 // Measure just the setArgs + runFormat round-trip (no queue, no I/O)
 uint64_t benchFormatRoundtrip(int iters) {
     rocket::Logger::LogEntry entry;
+    std::array<char, 256> payload{};
     std::string buf;
     auto t0 = steady_clock::now();
     for (int i = 0; i < iters; ++i) {
         buf.clear();
-        entry.setArgs("test {} int={} double={} str={}", i, i*42, 3.14159*i, "hello");
-        entry.runFormat(buf);
+        entry.setArgs(payload.data(), "test {} int={} double={} str={}",
+                      i, i*42, 3.14159*i, "hello");
+        entry.runFormat(buf, payload.data());
     }
     auto t1 = steady_clock::now();
     return duration_cast<nanoseconds>(t1 - t0).count() / iters;
@@ -30,6 +33,7 @@ uint64_t benchFormatRoundtrip(int iters) {
 // Profile breakdown by varying number of format args
 void profileArgCounts() {
     rocket::Logger::LogEntry entry;
+    std::array<char, 256> payload{};
     std::string buf;
 
     printf("\n=== Format round-trip latency (setArgs + runFormat) ===\n");
@@ -68,8 +72,8 @@ void profileArgCounts() {
         auto t0 = steady_clock::now();
         for (int i = 0; i < n; ++i) {
             buf.clear();
-            entry.setArgs("plain message");
-            entry.runFormat(buf);
+            entry.setArgs(payload.data(), "plain message");
+            entry.runFormat(buf, payload.data());
         }
         auto t1 = steady_clock::now();
         auto ns = duration_cast<nanoseconds>(t1 - t0).count() / n;
@@ -83,8 +87,8 @@ void profileArgCounts() {
         auto t0 = steady_clock::now();
         for (int i = 0; i < n; ++i) {
             buf.clear();
-            entry.setArgs("val={}", i);
-            entry.runFormat(buf);
+            entry.setArgs(payload.data(), "val={}", i);
+            entry.runFormat(buf, payload.data());
         }
         auto t1 = steady_clock::now();
         auto ns = duration_cast<nanoseconds>(t1 - t0).count() / n;
@@ -98,8 +102,8 @@ void profileArgCounts() {
         auto t0 = steady_clock::now();
         for (int i = 0; i < n; ++i) {
             buf.clear();
-            entry.setArgs("val={} int={}", i, i*42);
-            entry.runFormat(buf);
+            entry.setArgs(payload.data(), "val={} int={}", i, i*42);
+            entry.runFormat(buf, payload.data());
         }
         auto t1 = steady_clock::now();
         auto ns = duration_cast<nanoseconds>(t1 - t0).count() / n;
@@ -113,8 +117,9 @@ void profileArgCounts() {
         auto t0 = steady_clock::now();
         for (int i = 0; i < n; ++i) {
             buf.clear();
-            entry.setArgs("val={} int={} dbl={}", i, i*42, 3.14159*i);
-            entry.runFormat(buf);
+            entry.setArgs(payload.data(), "val={} int={} dbl={}",
+                          i, i*42, 3.14159*i);
+            entry.runFormat(buf, payload.data());
         }
         auto t1 = steady_clock::now();
         auto ns = duration_cast<nanoseconds>(t1 - t0).count() / n;
@@ -128,8 +133,10 @@ void profileArgCounts() {
         auto t0 = steady_clock::now();
         for (int i = 0; i < n; ++i) {
             buf.clear();
-            entry.setArgs("test {} int={} double={} str={}", i, i*42, 3.14159*i, "hello");
-            entry.runFormat(buf);
+            entry.setArgs(payload.data(),
+                          "test {} int={} double={} str={}",
+                          i, i*42, 3.14159*i, "hello");
+            entry.runFormat(buf, payload.data());
         }
         auto t1 = steady_clock::now();
         auto ns = duration_cast<nanoseconds>(t1 - t0).count() / n;
@@ -143,8 +150,10 @@ void profileArgCounts() {
         auto t0 = steady_clock::now();
         for (int i = 0; i < n; ++i) {
             buf.clear();
-            entry.setArgs("{} {} {} {} {} {} {} {}", i, i*1, i*2LL, i*3.0, true, "a", "b", (void*)nullptr);
-            entry.runFormat(buf);
+            entry.setArgs(payload.data(), "{} {} {} {} {} {} {} {}",
+                          i, i*1, i*2LL, i*3.0, true, "a", "b",
+                          (void*)nullptr);
+            entry.runFormat(buf, payload.data());
         }
         auto t1 = steady_clock::now();
         auto ns = duration_cast<nanoseconds>(t1 - t0).count() / n;

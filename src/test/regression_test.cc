@@ -19,6 +19,7 @@
 #include "rocket/net/timing_wheel.h"
 
 #include <arpa/inet.h>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -431,14 +432,16 @@ void testAcceptorDrainsWithoutBlocking() {
 
 void testLiteralLogFormatting() {
     rocket::Logger::LogEntry entry;
-    entry.setArgs("literal log message");
+    std::array<char, 1> payload{};
+    entry.setArgs(payload.data(), "literal log message");
     std::string output;
-    entry.runFormat(output);
+    entry.runFormat(output, payload.data());
     require(output == "literal log message", "literal log message was dropped");
 }
 
 void testTypedLogFormatting() {
     rocket::Logger::LogEntry entry;
+    std::array<char, 512> payload{};
     const std::string large(96, 'x');
     static constexpr auto metadata = rocket::Logger::makeLogMetadata<
         int, unsigned, std::int64_t, std::uint64_t, unsigned, double, bool,
@@ -446,20 +449,20 @@ void testTypedLogFormatting() {
         "i={} u={} i64={} u64={} hex={:02x} d={:.2f} b={} c={} s={} sv={}",
         rocket::LogLevel::Info);
     entry.setArgs(
-        &metadata,
+        payload.data(), &metadata,
         -7, 9U, std::int64_t{-11}, std::uint64_t{13}, 0x0aU, 3.25,
         true, 'z', large, std::string_view{"tail"});
     std::string output;
-    entry.runFormat(output);
+    entry.runFormat(output, payload.data());
     const std::string expected =
         "i=-7 u=9 i64=-11 u64=13 hex=0a d=3.25 b=true c=z s=" +
         large + " sv=tail";
     require(output == expected, "typed async log codec changed formatting");
 
     output.clear();
-    entry.setArgs("reuse={}", 42);
-    entry.runFormat(output);
-    require(output == "reuse=42", "heap-backed log entry was not reusable");
+    entry.setArgs(payload.data(), "reuse={}", 42);
+    entry.runFormat(output, payload.data());
+    require(output == "reuse=42", "variable log entry was not reusable");
 }
 
 void testDisabledLogDoesNotEvaluateArguments() {
